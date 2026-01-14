@@ -1,0 +1,389 @@
+services:
+  # --- Infrastructure ---
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  keycloak-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak_pw}
+    volumes:
+      - keycloak-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak_pw}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # Make issuer stable for local dev
+      KC_HOSTNAME_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8081}
+      KC_HOSTNAME_STRICT: "false"
+      KC_PROXY_HEADERS: "xforwarded"
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./keycloak/realm-hubcrm.json:/opt/keycloak/data/import/realm-hubcrm.json:ro
+
+  cases-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cases
+      POSTGRES_USER: cases
+      POSTGRES_PASSWORD: ${CASES_DB_PASSWORD:-cases_pw}
+    ports:
+      - "5434:5432"
+    volumes:
+      - cases-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cases"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  registry-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: registry
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: ${REGISTRY_DB_PASSWORD:-registry_pw}
+    ports:
+      - "5435:5432"
+    volumes:
+      - registry-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  accounting-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: accounting
+      POSTGRES_USER: accounting
+      POSTGRES_PASSWORD: ${ACCOUNTING_DB_PASSWORD:-accounting_pw}
+    ports:
+      - "5436:5432"
+    volumes:
+      - accounting-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U accounting"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  documents-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: documents
+      POSTGRES_USER: documents
+      POSTGRES_PASSWORD: ${DOCUMENTS_DB_PASSWORD:-documents_pw}
+    ports:
+      - "5437:5432"
+    volumes:
+      - documents-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U documents"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  contacts-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: contacts
+      POSTGRES_USER: contacts
+      POSTGRES_PASSWORD: ${CONTACTS_DB_PASSWORD:-contacts_pw}
+    ports:
+      - "5438:5432"
+    volumes:
+      - contacts-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U contacts"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  orders-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: ${ORDERS_DB_PASSWORD:-orders_pw}
+    ports:
+      - "5439:5432"
+    volumes:
+      - orders-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  ai-memory-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ai_memory
+      POSTGRES_USER: ai_memory
+      POSTGRES_PASSWORD: ${AI_MEMORY_DB_PASSWORD:-ai_memory_pw}
+    ports:
+      - "5440:5432"
+    volumes:
+      - ai-memory-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_memory"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- Core Services ---
+
+  core-cases:
+    build: ./core-cases
+    environment:
+      DATABASE_URL: postgresql://cases:${CASES_DB_PASSWORD:-cases_pw}@cases-db:5432/cases
+      REDIS_URL: redis://redis:6379/0
+      EVENTS_STREAM: ${EVENTS_STREAM:-case_events}
+    depends_on:
+      cases-db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8002:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  plugin-registry:
+    build: ./plugin-registry
+    environment:
+      DATABASE_URL: postgresql://registry:${REGISTRY_DB_PASSWORD:-registry_pw}@registry-db:5432/registry
+    depends_on:
+      registry-db:
+        condition: service_healthy
+    ports:
+      - "8003:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # --- Business Services (Extensions) ---
+  accounting:
+    build: ./accounting
+    environment:
+      DATABASE_URL: postgresql://accounting:${ACCOUNTING_DB_PASSWORD:-accounting_pw}@accounting-db:5432/accounting
+      REDIS_URL: redis://redis:6379/0
+      EVENTS_STREAM: ${EVENTS_STREAM:-case_events}
+      EVENTS_CONSUMER_GROUP: accounting
+      SERVICE_NAME: accounting
+    depends_on:
+      accounting-db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8004:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  documents:
+    build: ./documents
+    environment:
+      DATABASE_URL: postgresql://documents:${DOCUMENTS_DB_PASSWORD:-documents_pw}@documents-db:5432/documents
+    depends_on:
+      documents-db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8006:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  contacts:
+    build: ./contacts
+    environment:
+      DATABASE_URL: postgresql://contacts:${CONTACTS_DB_PASSWORD:-contacts_pw}@contacts-db:5432/contacts
+    depends_on:
+      contacts-db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8007:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  orders:
+    build: ./orders
+    environment:
+      DATABASE_URL: postgresql://orders:${ORDERS_DB_PASSWORD:-orders_pw}@orders-db:5432/orders
+    depends_on:
+      orders-db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8008:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # --- Knowledge layer ---
+  ai-memory:
+    build: ./ai-memory
+    environment:
+      DATABASE_URL: postgresql://ai_memory:${AI_MEMORY_DB_PASSWORD:-ai_memory_pw}@ai-memory-db:5432/ai_memory
+    depends_on:
+      ai-memory-db:
+        condition: service_healthy
+    ports:
+      - "8005:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # --- Analytics ---
+  analytics-consumer:
+    build: ./analytics-consumer
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      EVENTS_STREAM: ${EVENTS_STREAM:-case_events}
+      EVENTS_CONSUMER_GROUP: analytics
+      SERVICE_NAME: analytics-consumer
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT:-8123}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-analytics}
+    depends_on:
+      redis:
+        condition: service_started
+      clickhouse:
+        condition: service_started
+    restart: unless-stopped
+
+  # --- Gateway + UI ---
+  gateway:
+    build: ./gateway
+    environment:
+      # OIDC / Keycloak
+      KEYCLOAK_INTERNAL_URL: http://keycloak:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-hubcrm-ui}
+      # used for issuer validation; should match token "iss"
+      OIDC_ISSUER: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8081}/realms/${KEYCLOAK_REALM:-hubcrm}
+      # if empty, audience is not verified (dev-friendly)
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      CASES_BASE_URL: http://core-cases:8000
+      REGISTRY_BASE_URL: http://plugin-registry:8000
+      ACCOUNTING_BASE_URL: http://accounting:8000
+      DOCUMENTS_BASE_URL: http://documents:8000
+      CONTACTS_BASE_URL: http://contacts:8000
+      ORDERS_BASE_URL: http://orders:8000
+      AI_MEMORY_BASE_URL: http://ai-memory:8000
+    depends_on:
+      keycloak:
+        condition: service_started
+      core-cases:
+        condition: service_healthy
+      plugin-registry:
+        condition: service_healthy
+    ports:
+      - "8080:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  ui-shell:
+    build:
+      context: ./ui-shell
+      args:
+        NEXT_PUBLIC_GATEWAY_URL: http://localhost:8080
+        NEXT_PUBLIC_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8081}
+        NEXT_PUBLIC_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
+        NEXT_PUBLIC_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-hubcrm-ui}
+    environment:
+      NEXT_PUBLIC_GATEWAY_URL: http://localhost:8080
+      NEXT_PUBLIC_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8081}
+      NEXT_PUBLIC_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
+      NEXT_PUBLIC_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-hubcrm-ui}
+    depends_on:
+      gateway:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
+volumes:
+  redis-data:
+  clickhouse-data:
+  keycloak-db-data:
+  cases-db-data:
+  registry-db-data:
+  accounting-db-data:
+  documents-db-data:
+  contacts-db-data:
+  orders-db-data:
+  ai-memory-db-data:

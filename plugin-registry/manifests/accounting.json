@@ -1,0 +1,24 @@
+{
+  "name": "accounting",
+  "bounded_context": "accounting",
+  "version": "1.0.0",
+  "events": {
+    "subscribes": ["case.created"],
+    "publishes": ["price.set"]
+  },
+  "ui": {
+    "case_create": {
+      "fields": [
+        { "name": "price", "type": "number", "required": true }
+      ]
+    },
+    "case_tabs": [
+      { "id": "accounting", "title": "Оплата" }
+    ]
+  },
+  "api": {
+    "base_url": "http://accounting:8000"
+  }
+}
+
+

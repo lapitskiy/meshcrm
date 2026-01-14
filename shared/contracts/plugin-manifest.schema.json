@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Plugin Manifest",
+  "type": "object",
+  "required": ["name", "bounded_context", "version", "events", "api"],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "bounded_context": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "minLength": 1 },
+    "events": {
+      "type": "object",
+      "required": ["subscribes", "publishes"],
+      "properties": {
+        "subscribes": { "type": "array", "items": { "type": "string" } },
+        "publishes": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "ui": { "$ref": "ui-extension.schema.json" },
+    "api": {
+      "type": "object",
+      "required": ["base_url"],
+      "properties": {
+        "base_url": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
+
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Plugin Manifest",
+  "type": "object",
+  "required": ["name", "bounded_context", "version", "events", "api"],
+  "properties": {
+    "name": { "type": "string" },
+    "bounded_context": { "type": "string" },
+    "version": { "type": "string" },
+    "events": {
+      "type": "object",
+      "required": ["subscribes", "publishes"],
+      "properties": {
+        "subscribes": { "type": "array", "items": { "type": "string" } },
+        "publishes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "ui": { "type": "object" },
+    "api": {
+      "type": "object",
+      "required": ["base_url"],
+      "properties": {
+        "base_url": { "type": "string" }
+      }
+    }
+  }
+}
+
+
