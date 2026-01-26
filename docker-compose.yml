@@ -170,6 +170,22 @@ services:
       timeout: 5s
       retries: 5
 
+  marketplaces-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: marketplaces
+      POSTGRES_USER: marketplaces
+      POSTGRES_PASSWORD: ${MARKETPLACES_DB_PASSWORD:-marketplaces_pw}
+    ports:
+      - "5441:5432"
+    volumes:
+      - marketplaces-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marketplaces"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   # --- Core Services ---
 
   core-cases:
@@ -302,6 +318,22 @@ services:
       retries: 3
       start_period: 10s
 
+  marketplaces:
+    build: ./marketplaces
+    environment:
+      DATABASE_URL: postgresql://marketplaces:${MARKETPLACES_DB_PASSWORD:-marketplaces_pw}@marketplaces-db:5432/marketplaces
+    depends_on:
+      marketplaces-db:
+        condition: service_healthy
+    ports:
+      - "8009:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   # --- Analytics ---
   analytics-consumer:
     build: ./analytics-consumer
@@ -341,12 +373,15 @@ services:
       CONTACTS_BASE_URL: http://contacts:8000
       ORDERS_BASE_URL: http://orders:8000
       AI_MEMORY_BASE_URL: http://ai-memory:8000
+      MARKETPLACES_BASE_URL: http://marketplaces:8000
     depends_on:
       keycloak:
         condition: service_started
       core-cases:
         condition: service_healthy
       plugin-registry:
+        condition: service_healthy
+      marketplaces:
         condition: service_healthy
     ports:
       - "8080:8000"
@@ -387,3 +422,4 @@ volumes:
   contacts-db-data:
   orders-db-data:
   ai-memory-db-data:
+  marketplaces-db-data:

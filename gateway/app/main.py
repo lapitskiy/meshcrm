@@ -33,6 +33,7 @@ DOCUMENTS_URL = env("DOCUMENTS_BASE_URL", os.getenv("DOCUMENTS_URL", "http://doc
 CONTACTS_URL = env("CONTACTS_BASE_URL", os.getenv("CONTACTS_URL", "http://contacts:8000"))
 ORDERS_URL = env("ORDERS_BASE_URL", os.getenv("ORDERS_URL", "http://orders:8000"))
 AI_MEMORY_URL = env("AI_MEMORY_BASE_URL", os.getenv("AI_MEMORY_URL", "http://ai-memory:8000"))
+MARKETPLACES_URL = env("MARKETPLACES_BASE_URL", os.getenv("MARKETPLACES_URL", "http://marketplaces:8000"))
 
 
 HOP_BY_HOP_HEADERS = {
@@ -197,3 +198,7 @@ async def ai_memory_proxy(request: Request, rest: str) -> Response:
     return await proxy(request, AI_MEMORY_URL, upstream_path)
 
 
+@app.api_route("/marketplaces{rest:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
+async def marketplaces_proxy(request: Request, rest: str) -> Response:
+    upstream_path = rest if rest else "/"
+    return await proxy(request, MARKETPLACES_URL, upstream_path)
