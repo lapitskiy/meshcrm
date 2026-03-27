@@ -14,10 +14,9 @@ export default function KeycloakGate({ children }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const kc = getKeycloak();
-
     (async () => {
       try {
+        const kc = await getKeycloak();
         const authenticated = await kc.init({
           onLoad: "login-required",
           pkceMethod: "S256",

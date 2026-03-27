@@ -7,9 +7,19 @@ import React from "react";
 
 export default function SignInForm() {
   const onLogin = async () => {
-    const kc = getKeycloak();
+    const kc = await getKeycloak();
+    // keycloak-js expects init() before using login()/logout() (adapter is set up there).
+    try {
+      await kc.init({
+        onLoad: "check-sso",
+        pkceMethod: "S256",
+        checkLoginIframe: false,
+      });
+    } catch {
+      // If init fails, still try to proceed with login() to show a proper error/redirect.
+    }
     await kc.login({
-      redirectUri: "http://localhost:3000/",
+      redirectUri: `${window.location.origin}/`,
     });
   };
 

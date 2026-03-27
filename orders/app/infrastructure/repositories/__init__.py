@@ -1,0 +1,3 @@
+from app.infrastructure.repositories.psycopg_service_category_repository import PsycopgServiceCategoryRepository
+
+__all__ = ["PsycopgServiceCategoryRepository"]

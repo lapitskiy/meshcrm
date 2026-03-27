@@ -4,6 +4,7 @@ from typing import Iterable, Any
 import httpx
 import jwt
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 
 
 def env(name: str, default: str | None = None) -> str:
@@ -34,6 +35,8 @@ CONTACTS_URL = env("CONTACTS_BASE_URL", os.getenv("CONTACTS_URL", "http://contac
 ORDERS_URL = env("ORDERS_BASE_URL", os.getenv("ORDERS_URL", "http://orders:8000"))
 AI_MEMORY_URL = env("AI_MEMORY_BASE_URL", os.getenv("AI_MEMORY_URL", "http://ai-memory:8000"))
 MARKETPLACES_URL = env("MARKETPLACES_BASE_URL", os.getenv("MARKETPLACES_URL", "http://marketplaces:8000"))
+FINANCE_URL = env("FINANCE_BASE_URL", os.getenv("FINANCE_URL", "http://finance:8000"))
+WAREHOUSES_URL = env("WAREHOUSES_BASE_URL", os.getenv("WAREHOUSES_URL", "http://warehouses:8000"))
 
 
 HOP_BY_HOP_HEADERS = {
@@ -46,6 +49,27 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+
+def extract_roles(payload: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for role in payload.get("realm_access", {}).get("roles", []) or []:
+        role_s = str(role).strip()
+        if role_s and role_s not in seen:
+            seen.add(role_s)
+            out.append(role_s)
+
+    resource_access = payload.get("resource_access", {}) or {}
+    for client_data in resource_access.values():
+        if not isinstance(client_data, dict):
+            continue
+        for role in client_data.get("roles", []) or []:
+            role_s = str(role).strip()
+            if role_s and role_s not in seen:
+                seen.add(role_s)
+                out.append(role_s)
+    return out
 
 
 def is_public(request: Request) -> bool:
@@ -100,14 +124,18 @@ def filtered_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
 
 async def proxy(request: Request, upstream_base: str, upstream_path: str) -> Response:
     user_uuid = None
+    user_roles: list[str] = []
     if not is_public(request):
         payload = verify_jwt(request)
         user_uuid = str(payload.get("sub"))
+        user_roles = extract_roles(payload)
 
     url = f"{upstream_base}{upstream_path}"
     headers = filtered_headers(request.headers.items())
     if user_uuid:
         headers["x-user-uuid"] = user_uuid
+    if user_roles:
+        headers["x-user-roles"] = ",".join(user_roles)
 
     body = await request.body()
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -123,6 +151,15 @@ async def proxy(request: Request, upstream_base: str, upstream_path: str) -> Res
 
 
 app = FastAPI(title="gateway", version="0.1.0")
+
+cors_raw = os.getenv("CORS_ALLOW_ORIGINS", "*")
+cors_origins = ["*"] if cors_raw.strip() == "*" else [o.strip() for o in cors_raw.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
@@ -202,3 +239,15 @@ async def ai_memory_proxy(request: Request, rest: str) -> Response:
 async def marketplaces_proxy(request: Request, rest: str) -> Response:
     upstream_path = rest if rest else "/"
     return await proxy(request, MARKETPLACES_URL, upstream_path)
+
+
+@app.api_route("/finance{rest:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
+async def finance_proxy(request: Request, rest: str) -> Response:
+    upstream_path = rest if rest else "/"
+    return await proxy(request, FINANCE_URL, upstream_path)
+
+
+@app.api_route("/warehouses{rest:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
+async def warehouses_proxy(request: Request, rest: str) -> Response:
+    upstream_path = rest if rest else "/"
+    return await proxy(request, WAREHOUSES_URL, upstream_path)

@@ -3,11 +3,43 @@ alwaysApply: true
 ---
 RULES FOR ASSISTANT (FLEXIBLE MODE):
 
-Суть причины очень коротко
+Весь вывод коротко
+
+Суть причины в конце очень коротко
 
 я сижу через ssh на ubuntu, и весь проект на докере, потому не надо предлагать компилить
 
 curl запросы если делаешь, то через докер, у меня все проекты в контейнерах
+
+названия контейнеров которые я испорльзую
+  clickhouse
+  keycloak-db
+  keycloak
+  keycloak-https
+  cases-db
+  registry-db
+  accounting-db
+  documents-db
+  contacts-db
+  orders-db
+  ai-memory-db
+  marketplaces-db
+  core-cases
+  plugin-registry
+  accounting
+  documents
+  contacts
+  orders-
+  ai-memory
+  marketplaces
+  analytics-consumer:
+  gateway
+  ui-shell:
+  ui-shell-https
+
+перезапускай нужные контейнеры сам после внесения правок
+
+не надо делать фаллбеков, задача должна решаться конкретно ингаче выводит ошибку или сообщение о не рабочем методе
 
 1) Always follow the user's instructions exactly, unless they conflict with these rules.
 

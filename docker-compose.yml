@@ -47,7 +47,7 @@ services:
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
       # Make issuer stable for local dev
-      KC_HOSTNAME_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8081}
+      KC_HOSTNAME_URL: ${KEYCLOAK_PUBLIC_URL:-https://192.168.0.21:8083}
       KC_HOSTNAME_STRICT: "false"
       KC_PROXY_HEADERS: "xforwarded"
     depends_on:
@@ -57,6 +57,16 @@ services:
       - "8081:8080"
     volumes:
       - ./keycloak/realm-hubcrm.json:/opt/keycloak/data/import/realm-hubcrm.json:ro
+
+  keycloak-https:
+    image: nginx:1.27-alpine
+    depends_on:
+      - keycloak
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./nginx/keycloak.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
 
   cases-db:
     image: postgres:16-alpine
@@ -186,6 +196,38 @@ services:
       timeout: 5s
       retries: 5
 
+  warehouses-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: warehouses
+      POSTGRES_USER: warehouses
+      POSTGRES_PASSWORD: ${WAREHOUSES_DB_PASSWORD:-warehouses_pw}
+    ports:
+      - "5443:5432"
+    volumes:
+      - warehouses-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U warehouses"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  finance-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: finance
+      POSTGRES_USER: finance
+      POSTGRES_PASSWORD: ${FINANCE_DB_PASSWORD:-finance_pw}
+    ports:
+      - "5442:5432"
+    volumes:
+      - finance-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finance"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   # --- Core Services ---
 
   core-cases:
@@ -199,6 +241,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+    volumes:
+      - ./core-cases/app:/app/app
     ports:
       - "8002:8000"
     healthcheck:
@@ -215,6 +259,9 @@ services:
     depends_on:
       registry-db:
         condition: service_healthy
+    volumes:
+      - ./plugin-registry/app:/app/app
+      - ./plugin-registry/manifests:/app/manifests
     ports:
       - "8003:8000"
     healthcheck:
@@ -238,6 +285,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+    volumes:
+      - ./accounting/app:/app/app
     ports:
       - "8004:8000"
     healthcheck:
@@ -256,6 +305,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+    volumes:
+      - ./documents/app:/app/app
     ports:
       - "8006:8000"
     healthcheck:
@@ -274,6 +325,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+    volumes:
+      - ./contacts/app:/app/app
     ports:
       - "8007:8000"
     healthcheck:
@@ -292,6 +345,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+    volumes:
+      - ./orders/app:/app/app
     ports:
       - "8008:8000"
     healthcheck:
@@ -309,6 +364,8 @@ services:
     depends_on:
       ai-memory-db:
         condition: service_healthy
+    volumes:
+      - ./ai-memory/app:/app/app
     ports:
       - "8005:8000"
     healthcheck:
@@ -325,8 +382,50 @@ services:
     depends_on:
       marketplaces-db:
         condition: service_healthy
+    volumes:
+      - ./marketplaces/app:/app/app
     ports:
       - "8009:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  finance:
+    build: ./finance
+    environment:
+      DATABASE_URL: postgresql://finance:${FINANCE_DB_PASSWORD:-finance_pw}@finance-db:5432/finance
+    depends_on:
+      finance-db:
+        condition: service_healthy
+    volumes:
+      - ./finance/app:/app/app
+    ports:
+      - "8010:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  warehouses:
+    build: ./warehouses
+    environment:
+      DATABASE_URL: postgresql://warehouses:${WAREHOUSES_DB_PASSWORD:-warehouses_pw}@warehouses-db:5432/warehouses
+      KEYCLOAK_INTERNAL_URL: http://keycloak:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    depends_on:
+      warehouses-db:
+        condition: service_healthy
+    volumes:
+      - ./warehouses/app:/app/app
+    ports:
+      - "8011:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -337,6 +436,8 @@ services:
   # --- Analytics ---
   analytics-consumer:
     build: ./analytics-consumer
+    volumes:
+      - ./analytics-consumer/app:/app/app
     environment:
       REDIS_URL: redis://redis:6379/0
       EVENTS_STREAM: ${EVENTS_STREAM:-case_events}
@@ -357,13 +458,15 @@ services:
   # --- Gateway + UI ---
   gateway:
     build: ./gateway
+    volumes:
+      - ./gateway/app:/app/app
     environment:
       # OIDC / Keycloak
       KEYCLOAK_INTERNAL_URL: http://keycloak:8080
       KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
       KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-hubcrm-ui}
       # used for issuer validation; should match token "iss"
-      OIDC_ISSUER: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8081}/realms/${KEYCLOAK_REALM:-hubcrm}
+      OIDC_ISSUER: ${KEYCLOAK_PUBLIC_URL:-https://192.168.0.21:8083}/realms/${KEYCLOAK_REALM:-hubcrm}
       # if empty, audience is not verified (dev-friendly)
       OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
       CASES_BASE_URL: http://core-cases:8000
@@ -374,6 +477,8 @@ services:
       ORDERS_BASE_URL: http://orders:8000
       AI_MEMORY_BASE_URL: http://ai-memory:8000
       MARKETPLACES_BASE_URL: http://marketplaces:8000
+      FINANCE_BASE_URL: http://finance:8000
+      WAREHOUSES_BASE_URL: http://warehouses:8000
     depends_on:
       keycloak:
         condition: service_started
@@ -382,6 +487,10 @@ services:
       plugin-registry:
         condition: service_healthy
       marketplaces:
+        condition: service_healthy
+      finance:
+        condition: service_healthy
+      warehouses:
         condition: service_healthy
     ports:
       - "8080:8000"
@@ -392,24 +501,45 @@ services:
       retries: 3
       start_period: 10s
 
+  gateway-https:
+    image: nginx:1.27-alpine
+    depends_on:
+      - gateway
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+
   ui-shell:
-    build:
-      context: ./ui-shell
-      args:
-        NEXT_PUBLIC_GATEWAY_URL: http://localhost:8080
-        NEXT_PUBLIC_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8081}
-        NEXT_PUBLIC_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
-        NEXT_PUBLIC_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-hubcrm-ui}
+    image: node:20-alpine
+    working_dir: /app
+    command: >
+      sh -lc "if [ ! -x node_modules/.bin/next ]; then npm install --no-audit --no-fund; fi &&
+      npm run dev -- --hostname 0.0.0.0 --port 3000"
     environment:
       NEXT_PUBLIC_GATEWAY_URL: http://localhost:8080
-      NEXT_PUBLIC_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8081}
+      NEXT_PUBLIC_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-https://192.168.0.21:8083}
       NEXT_PUBLIC_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
       NEXT_PUBLIC_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-hubcrm-ui}
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - ./ui-shell:/app
+      - ui-shell-node-modules:/app/node_modules
     depends_on:
       gateway:
         condition: service_healthy
+    # UI доступен через nginx-https, наружу порт не публикуем
+
+  ui-shell-https:
+    image: nginx:1.27-alpine
+    depends_on:
+      - ui-shell
     ports:
       - "3000:3000"
+    volumes:
+      - ./nginx/ui-shell.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
 
 volumes:
   redis-data:
@@ -423,3 +553,6 @@ volumes:
   orders-db-data:
   ai-memory-db-data:
   marketplaces-db-data:
+  finance-db-data:
+  warehouses-db-data:
+  ui-shell-node-modules:

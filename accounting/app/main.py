@@ -28,6 +28,14 @@ REDIS_URL = env("REDIS_URL", "redis://redis:6379/0")
 EVENTS_STREAM = env("EVENTS_STREAM", "case_events")
 CONSUMER_GROUP = env("EVENTS_CONSUMER_GROUP", "accounting")
 SERVICE_NAME = env("SERVICE_NAME", "accounting")
+MANIFEST = {
+    "name": "accounting",
+    "bounded_context": "accounting",
+    "version": "1.0.0",
+    "events": {"subscribes": ["case.created"], "publishes": ["price.set"]},
+    "ui": {"menu": {"title": "Бухгалтерия", "items": []}},
+    "api": {"base_url": "http://accounting:8000"},
+}
 
 
 def db() -> psycopg.Connection:
@@ -175,6 +183,11 @@ def _shutdown() -> None:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/manifest")
+def manifest() -> dict:
+    return MANIFEST
 
 
 @app.post("/accounting/price", response_model=PriceOut)

@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} - {{ block.super }}{% endblock %}
+{% block sidebar %}
+    {% include 'include/_sidebar_owm.html' %}
+{% endblock %}
+{% block content %}
+    {% if settings == False %}
+        <h1> Укажите api настройки для продолжения работы или обновите страницу, если api уже указаны</h1>
+{% else %}
+    <h1>Настройки автообнолвение остатков O W M</h1><br><br>
+
+
+<form action="#" method="POST" class="update-form">
+        {% csrf_token %}
+    <br><br>
+<div class="form-check form-switch">
+  <input class="form-check-input" type="checkbox" id="flexSwitchCheckDefault"
+         {% if active_ozon %}checked="checked"{% endif %} name="sync_checkbox_ozon">
+  <label class="form-check-label" for="flexSwitchCheckDefault">
+    <b>Синхронизация Ozon</b>
+  </label>
+</div>
+    <br><br>
+<div class="form-check form-switch">
+  <input class="form-check-input" type="checkbox" id="flexSwitchCheckDefault"
+         {% if active_wb %}checked="checked"{% endif %} name="sync_checkbox_wb">
+  <label class="form-check-label" for="flexSwitchCheckDefault">
+    <b>Синхронизация WB</b>
+  </label>
+</div>
+    <br><br>
+<div class="form-check form-switch">
+  <input class="form-check-input" type="checkbox" id="flexSwitchCheckDefault"
+         {% if active_yandex %}checked="checked"{% endif %} name="sync_checkbox_yandex">
+  <label class="form-check-label" for="flexSwitchCheckDefault">
+    <b>Синхронизация Yandex</b>
+  </label>
+</div>
+    <br><br>
+        <button type="submit" class="btn btn-primary btn-block" name="form_type" value="save_settings">Сохранить</button>
+    </form>
+    <hr>
+    <h1>Синхронизация</h1>
+
+    <form action="#" method="POST" class="update-form">
+        {% csrf_token %}
+
+    <div class="alert alert-primary d-flex align-items-center p-5">
+    <!--begin::Icon-->
+    <i class="ki-duotone ki-shield-tick fs-2hx text-success me-4"><span class="path1"></span><span class="path2"></span></i>
+    <!--end::Icon-->
+
+    <!--begin::Wrapper-->
+    <div class="d-flex flex-column">
+            {% if sync_update %}
+            <div class="alert alert-primary d-flex align-items-center p-5">
+                <!--begin::Icon-->
+                <i class="ki-duotone ki-shield-tick fs-2hx text-success me-4"><span class="path1"></span><span class="path2"></span></i>
+                <!--end::Icon-->
+
+                <!--begin::Wrapper-->
+                <div class="d-flex flex-column">
+                    <!--begin::Title-->
+                    <h4 class="mb-1 text-dark">Обновлено</h4>
+                    <!--end::Title-->
+
+                    <!--begin::Content-->
+                    <span>
+
+                     <h2>WB</h2>
+                        {% if update_data.wb.code == 204 %}
+                            <p>Данные обновлены успешно</p>
+                        {% elif update_data.wb.code == 200 %}
+                            <p>Данные обновлены с результатами:</p>
+                            <pre>{{ update_data.wb.json|json_script }}</pre> <!-- Важно! Используем json_script -->
+                        {% else %}
+                            <p>Ошибка обновления: код {{ update_data.wb.code }} - {{ update_data.wb.json|escape }}</p>
+                        <!-- Используйте escape, чтобы избежать XSS -->
+                            {% if update_data.wb.json|length > 0 %}
+                                <pre>{{ update_data.wb.json|json_script }}</pre>
+                            {% endif %}
+                        {% endif %}
+                     <h2>OZON</h2>
+                     {{ update_data.ozon }}<br><br>
+                     <h2>YANDEX</h2>
+                     {{ update_data.yandex }}<br><br>
+                    <!--end::Content-->
+                </div>
+
+                <!--end::Wrapper-->
+            </div>
+    {% endif %}
+
+
+
+        <!--begin::Content-->
+            <span>При синхронизации, последние остатки на мойсклад отправляются на все указанные маркетплейсы.<br><br>
+
+                Обратите внимание, что если заказы уже сущесвтуют на маркетплейсе, то они нек учтуться ()
+                Перед обновлением остатков они сначала вычтутся из того, что есть на складе, а потом остатки обновятся.)</span>
+        <!--end::Content--><br>
+            <span>
+
+            <u>Без синхронизации не запустится автообновление</u></span>
+    <br>
+        <button type="submit" class="btn btn-primary btn-block" name="form_type" value="sync_start" style="max-width: 150px; width: 100%;">Ручная синхронизация</button>
+    </div>
+
+
+    <!--end::Wrapper-->
+</div>
+
+    </form>
+{% endif %}
+{% endblock %}
+
+<script>
+    const syncUpdate = {{ sync_update|safe }};
+
+    if (syncUpdate) {
+        Swal.fire({
+            text: "Here's a basic example of SweetAlert!",
+            icon: "success",
+            buttonsStyling: false,
+            confirmButtonText: "Ok, got it!",
+            customClass: {
+                confirmButton: "btn btn-primary"
+            }
+        });
+    }
+</script>
+
+
+

@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} - {{ block.super }}{% endblock %}
+{% block sidebar %}
+    {% include 'include/_sidebar_owm.html' %}
+{% endblock %}
+{% block content %}
+    <h1>Автообновление и синхронизация</h1>
+
+    {% if error %}
+        <div class="alert alert-danger" role="alert">
+            {{ error }}
+        </div>
+    {% elif message %}
+        <div class="alert alert-info" role="alert">
+            {{ message }}
+        </div>
+    {% elif task_history %}
+        <div class="accordion" id="taskHistoryAccordion">
+            {% for task in task_history %}
+                <div class="accordion-item">
+                    <h2 class="accordion-header" id="heading{{ forloop.counter }}">
+                        <button class="accordion-button {% if not forloop.first %}collapsed{% endif %} fs-4 fw-semibold"
+                                type="button" data-bs-toggle="collapse" data-bs-target="#collapse{{ forloop.counter }}"
+                                aria-expanded="{% if forloop.first %}true{% else %}false{% endif %}" aria-controls="collapse{{ forloop.counter }}">
+                            Задача #{{ forloop.counter }}: ID - {{ task.task_id[:8] }}... (Статус: {{ task.status }}) - {{ task.start_time|date:"d.m.Y H:i:s" }}
+                        </button>
+                    </h2>
+                    <div id="collapse{{ forloop.counter }}" class="accordion-collapse collapse {% if forloop.first %}show{% endif %}"
+                         aria-labelledby="heading{{ forloop.counter }}" data-bs-parent="#taskHistoryAccordion">
+                        <div class="accordion-body">
+                            <p><strong>ID Задачи:</strong> {{ task.task_id }}</p>
+                            <p><strong>ID Crontab:</strong> {{ task.cron_id }}</p>
+                            <p><strong>Статус:</strong> {{ task.status }}</p>
+                            <p><strong>Начало:</strong> {{ task.start_time|date:"d.m.Y H:i:s" }}</p>
+                            <p><strong>Окончание:</strong> {{ task.end_time|date:"d.m.Y H:i:s" }}</p>
+                            {% if task.error_message %}
+                                <div class="alert alert-danger"><strong>Ошибка:</strong> {{ task.error_message }}</div>
+                            {% endif %}
+                            {% if task.result %}
+                                <h4>Результат:</h4>
+                                {% if task.result.items %}
+                                    <ul class="list-group">
+                                        {% for key, value in task.result.items %}
+                                            <li class="list-group-item">
+                                                <strong>{{ key }}:</strong>
+                                                {% if value.code and value.text %}
+                                                    Код: {{ value.code }}, Сообщение: {{ value.text }}
+                                                {% else %}
+                                                    {{ value }}
+                                                {% endif %}
+                                            </li>
+                                        {% endfor %}
+                                    </ul>
+                                {% else %}
+                                    <p>{{ task.result }}</p>
+                                {% endif %}
+                            {% else %}
+                                <p>Результаты задачи отсутствуют.</p>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+            {% endfor %}
+        </div>
+    {% else %}
+        <p>История задач синхронизации пока отсутствует.</p>
+    {% endif %}
+
+{% endblock %}

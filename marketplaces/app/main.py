@@ -1,9 +1,15 @@
 import os
+import base64
+import json
+import urllib.request
+import datetime
 import uuid
+from collections import defaultdict
+from typing import Any
 
 import psycopg
 from fastapi import FastAPI
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Query
 from pydantic import BaseModel
 
 
@@ -19,6 +25,23 @@ DATABASE_URL = env(
     "DATABASE_URL",
     "postgresql://marketplaces:marketplaces_pw@marketplaces-db:5432/marketplaces",
 )
+MANIFEST = {
+    "name": "marketplaces",
+    "bounded_context": "marketplaces",
+    "version": "1.0.0",
+    "events": {"subscribes": [], "publishes": []},
+    "ui": {
+        "menu": {
+            "title": "Маркетплейсы",
+            "items": [
+                {"id": "ozon", "title": "Ozon"},
+                {"id": "wb", "title": "WB"},
+                {"id": "yandex", "title": "Yandex"},
+            ],
+        }
+    },
+    "api": {"base_url": "http://marketplaces:8000"},
+}
 
 app = FastAPI(title="marketplaces", version="0.1.0")
 
@@ -43,6 +66,89 @@ def init_db() -> None:
             );
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS marketplace_provider_settings (
+              user_uuid UUID NOT NULL,
+              provider TEXT NOT NULL,
+              enabled BOOLEAN NOT NULL DEFAULT FALSE,
+              api_key TEXT NOT NULL DEFAULT '',
+              client_id TEXT NOT NULL DEFAULT '',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (user_uuid, provider)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS moysklad_contragents_settings (
+              user_uuid UUID PRIMARY KEY,
+              organization_id TEXT NOT NULL DEFAULT '',
+              organization_name TEXT NOT NULL DEFAULT '',
+              ozon_id TEXT NOT NULL DEFAULT '',
+              ozon_name TEXT NOT NULL DEFAULT '',
+              wb_id TEXT NOT NULL DEFAULT '',
+              wb_name TEXT NOT NULL DEFAULT '',
+              yandex_id TEXT NOT NULL DEFAULT '',
+              yandex_name TEXT NOT NULL DEFAULT '',
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS moysklad_storage_settings (
+              user_uuid UUID PRIMARY KEY,
+              ozon_store_id TEXT NOT NULL DEFAULT '',
+              ozon_store_name TEXT NOT NULL DEFAULT '',
+              wb_store_id TEXT NOT NULL DEFAULT '',
+              wb_store_name TEXT NOT NULL DEFAULT '',
+              yandex_store_id TEXT NOT NULL DEFAULT '',
+              yandex_store_name TEXT NOT NULL DEFAULT '',
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS moysklad_status_settings (
+              user_uuid UUID PRIMARY KEY,
+              awaiting_id TEXT NOT NULL DEFAULT '',
+              awaiting_name TEXT NOT NULL DEFAULT '',
+              shipped_id TEXT NOT NULL DEFAULT '',
+              shipped_name TEXT NOT NULL DEFAULT '',
+              completed_id TEXT NOT NULL DEFAULT '',
+              completed_name TEXT NOT NULL DEFAULT '',
+              cancelled_id TEXT NOT NULL DEFAULT '',
+              cancelled_name TEXT NOT NULL DEFAULT '',
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ozon_promo_product_settings (
+              user_uuid UUID NOT NULL,
+              offer_id TEXT NOT NULL,
+              yourprice INT NOT NULL DEFAULT 0,
+              minprice INT NOT NULL DEFAULT 0,
+              min_price_fbs INT NOT NULL DEFAULT 0,
+              min_price_limit_count INT NOT NULL DEFAULT 0,
+              min_price_promo INT NOT NULL DEFAULT 0,
+              min_price_discount INT NOT NULL DEFAULT 0,
+              limit_count_value INT NOT NULL DEFAULT 1,
+              use_fbs BOOLEAN NOT NULL DEFAULT FALSE,
+              use_limit_count BOOLEAN NOT NULL DEFAULT FALSE,
+              use_promo BOOLEAN NOT NULL DEFAULT FALSE,
+              autoupdate_promo BOOLEAN NOT NULL DEFAULT FALSE,
+              auto_update_days_limit_promo BOOLEAN NOT NULL DEFAULT FALSE,
+              use_discount BOOLEAN NOT NULL DEFAULT FALSE,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (user_uuid, offer_id)
+            );
+            """
+        )
 
 
 @app.on_event("startup")
@@ -58,6 +164,61 @@ class ApiSettingsIn(BaseModel):
     ozon_api: str = ""
 
 
+class ProviderSettingsIn(BaseModel):
+    enabled: bool = False
+    api_key: str = ""
+    client_id: str = ""
+
+class MsOption(BaseModel):
+    id: str
+    name: str
+
+
+class MoyskladContragentsIn(BaseModel):
+    organization_id: str = ""
+    organization_name: str = ""
+    ozon_id: str = ""
+    ozon_name: str = ""
+    wb_id: str = ""
+    wb_name: str = ""
+    yandex_id: str = ""
+    yandex_name: str = ""
+
+class MoyskladStorageIn(BaseModel):
+    ozon_store_id: str = ""
+    ozon_store_name: str = ""
+    wb_store_id: str = ""
+    wb_store_name: str = ""
+    yandex_store_id: str = ""
+    yandex_store_name: str = ""
+
+class MoyskladStatusIn(BaseModel):
+    awaiting_id: str = ""
+    awaiting_name: str = ""
+    shipped_id: str = ""
+    shipped_name: str = ""
+    completed_id: str = ""
+    completed_name: str = ""
+    cancelled_id: str = ""
+    cancelled_name: str = ""
+
+class OzonPromoProductSettingsIn(BaseModel):
+    offer_id: str
+    yourprice: int = 0
+    minprice: int = 0
+    min_price_fbs: int = 0
+    min_price_limit_count: int = 0
+    min_price_promo: int = 0
+    min_price_discount: int = 0
+    limit_count_value: int = 1
+    use_fbs: bool = False
+    use_limit_count: bool = False
+    use_promo: bool = False
+    autoupdate_promo: bool = False
+    auto_update_days_limit_promo: bool = False
+    use_discount: bool = False
+
+
 def _user_uuid(x_user_uuid: str | None) -> uuid.UUID:
     if not x_user_uuid:
         raise HTTPException(status_code=401, detail="missing x-user-uuid")
@@ -66,6 +227,468 @@ def _user_uuid(x_user_uuid: str | None) -> uuid.UUID:
     except ValueError as e:
         raise HTTPException(status_code=400, detail="invalid x-user-uuid") from e
 
+
+def _get_provider_settings(provider: str, user_uuid_val: uuid.UUID) -> ProviderSettingsIn:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT enabled, api_key, client_id
+            FROM marketplace_provider_settings
+            WHERE user_uuid=%s AND provider=%s
+            """,
+            (user_uuid_val, provider),
+        )
+        row = cur.fetchone()
+    if not row:
+        return ProviderSettingsIn()
+    return ProviderSettingsIn(enabled=row[0], api_key=row[1], client_id=row[2])
+
+
+def _save_provider_settings(
+    provider: str, user_uuid_val: uuid.UUID, body: ProviderSettingsIn
+) -> None:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO marketplace_provider_settings (user_uuid, provider, enabled, api_key, client_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_uuid, provider) DO UPDATE SET
+              enabled=EXCLUDED.enabled,
+              api_key=EXCLUDED.api_key,
+              client_id=EXCLUDED.client_id,
+              updated_at=NOW()
+            """,
+            (user_uuid_val, provider, body.enabled, body.api_key, body.client_id),
+        )
+
+def _moysklad_auth_header(raw_api_key: str) -> str:
+    api_key = (raw_api_key or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="moysklad api_key is empty")
+    if ":" in api_key:
+        b64 = base64.b64encode(api_key.encode("utf-8")).decode("ascii")
+        return f"Basic {b64}"
+    return f"Bearer {api_key}"
+
+
+def _moysklad_get(token: str, url: str) -> dict[str, Any]:
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", _moysklad_auth_header(token))
+    req.add_header("Accept-Encoding", "gzip, deflate")
+    req.add_header("Accept", "*/*")
+    req.add_header("Connection", "keep-alive")
+    try:
+        import gzip as _gzip
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                raw = _gzip.decompress(raw)
+            return json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            msg = e.read().decode("utf-8")
+        except Exception:
+            msg = str(e)
+        raise HTTPException(status_code=502, detail=f"moysklad upstream error: {msg}") from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail="moysklad upstream error") from e
+
+
+def _ozon_headers(user_uuid_val: uuid.UUID) -> dict[str, str]:
+    s = _get_provider_settings("ozon", user_uuid_val)
+    if not s.api_key or not s.client_id:
+        raise HTTPException(status_code=400, detail="ozon api_key/client_id not configured")
+    return {
+        "Client-Id": s.client_id,
+        "Api-Key": s.api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def _ozon_post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            return json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            msg = e.read().decode("utf-8")
+        except Exception:
+            msg = str(e)
+        raise HTTPException(status_code=502, detail=f"ozon upstream error: {msg}") from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail="ozon upstream error") from e
+
+
+def _ozon_get_products(ozon_hdrs: dict[str, str]) -> dict[str, Any]:
+    # list offer_ids
+    resp = _ozon_post_json(
+        "https://api-seller.ozon.ru/v3/product/list",
+        ozon_hdrs,
+        {"filter": {"visibility": "ALL"}, "last_id": "", "limit": 1000},
+    )
+    offer_list = [x.get("offer_id") for x in (resp.get("result", {}) or {}).get("items", []) if x.get("offer_id")]
+    if not offer_list:
+        return {"items": []}
+    # resolve sku via sources
+    return _ozon_post_json(
+        "https://api-seller.ozon.ru/v3/product/info/list",
+        ozon_hdrs,
+        {"offer_id": offer_list},
+    )
+
+
+def _moysklad_opt_prices(user_uuid_val: uuid.UUID) -> dict[str, int]:
+    token = _get_moysklad_token(user_uuid_val)
+    data = _moysklad_get(token, "https://api.moysklad.ru/api/remap/1.2/entity/product?limit=1000")
+    out: dict[str, int] = {}
+    for row in data.get("rows") or []:
+        article = row.get("article")
+        if not article:
+            continue
+        buy = (row.get("buyPrice") or {}).get("value")
+        try:
+            out[str(article)] = int(float(buy) / 100) if buy is not None else 0
+        except Exception:
+            out[str(article)] = 0
+    return out
+
+
+def _month_range_utc_months_ago(
+    now: datetime.datetime, months_ago: int
+) -> tuple[str, str, datetime.date, datetime.date]:
+    if months_ago < 1:
+        raise HTTPException(status_code=400, detail="months_ago must be >= 1")
+    if months_ago > 24:
+        raise HTTPException(status_code=400, detail="months_ago too large (max 24)")
+
+    first_day_this_month = datetime.date(now.year, now.month, 1)
+    base_total = first_day_this_month.year * 12 + (first_day_this_month.month - 1)
+    target_total = base_total - months_ago
+    ty = target_total // 12
+    tm = (target_total % 12) + 1
+    target_first = datetime.date(ty, tm, 1)
+
+    next_total = target_total + 1
+    ny = next_total // 12
+    nm = (next_total % 12) + 1
+    next_first = datetime.date(ny, nm, 1)
+    target_last = next_first - datetime.timedelta(days=1)
+
+    from_iso = f"{target_first.isoformat()}T00:00:00.000Z"
+    to_iso = f"{target_last.isoformat()}T23:59:59.999Z"
+    return from_iso, to_iso, target_first, target_last
+
+
+def _ru_month_name_nominative(month: int) -> str:
+    names = [
+        "Январь",
+        "Февраль",
+        "Март",
+        "Апрель",
+        "Май",
+        "Июнь",
+        "Июль",
+        "Август",
+        "Сентябрь",
+        "Октябрь",
+        "Ноябрь",
+        "Декабрь",
+    ]
+    return names[month - 1] if 1 <= month <= 12 else str(month)
+
+def _get_moysklad_token(user_uuid_val: uuid.UUID) -> str:
+    s = _get_provider_settings("moysklad", user_uuid_val)
+    if not s.api_key:
+        raise HTTPException(status_code=400, detail="moysklad api_key not configured")
+    return s.api_key
+
+
+def _get_moysklad_contragents(user_uuid_val: uuid.UUID) -> MoyskladContragentsIn:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT organization_id, organization_name, ozon_id, ozon_name, wb_id, wb_name, yandex_id, yandex_name
+            FROM moysklad_contragents_settings
+            WHERE user_uuid=%s
+            """,
+            (user_uuid_val,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return MoyskladContragentsIn()
+    return MoyskladContragentsIn(
+        organization_id=row[0],
+        organization_name=row[1],
+        ozon_id=row[2],
+        ozon_name=row[3],
+        wb_id=row[4],
+        wb_name=row[5],
+        yandex_id=row[6],
+        yandex_name=row[7],
+    )
+
+def _get_moysklad_storage(user_uuid_val: uuid.UUID) -> MoyskladStorageIn:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ozon_store_id, ozon_store_name, wb_store_id, wb_store_name, yandex_store_id, yandex_store_name
+            FROM moysklad_storage_settings
+            WHERE user_uuid=%s
+            """,
+            (user_uuid_val,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return MoyskladStorageIn()
+    return MoyskladStorageIn(
+        ozon_store_id=row[0],
+        ozon_store_name=row[1],
+        wb_store_id=row[2],
+        wb_store_name=row[3],
+        yandex_store_id=row[4],
+        yandex_store_name=row[5],
+    )
+
+
+def _save_moysklad_contragents(user_uuid_val: uuid.UUID, body: MoyskladContragentsIn) -> None:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO moysklad_contragents_settings (
+              user_uuid,
+              organization_id, organization_name,
+              ozon_id, ozon_name,
+              wb_id, wb_name,
+              yandex_id, yandex_name
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (user_uuid) DO UPDATE SET
+              organization_id=EXCLUDED.organization_id,
+              organization_name=EXCLUDED.organization_name,
+              ozon_id=EXCLUDED.ozon_id,
+              ozon_name=EXCLUDED.ozon_name,
+              wb_id=EXCLUDED.wb_id,
+              wb_name=EXCLUDED.wb_name,
+              yandex_id=EXCLUDED.yandex_id,
+              yandex_name=EXCLUDED.yandex_name,
+              updated_at=NOW()
+            """,
+            (
+                user_uuid_val,
+                body.organization_id,
+                body.organization_name,
+                body.ozon_id,
+                body.ozon_name,
+                body.wb_id,
+                body.wb_name,
+                body.yandex_id,
+                body.yandex_name,
+            ),
+        )
+
+def _save_moysklad_storage(user_uuid_val: uuid.UUID, body: MoyskladStorageIn) -> None:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO moysklad_storage_settings (
+              user_uuid,
+              ozon_store_id, ozon_store_name,
+              wb_store_id, wb_store_name,
+              yandex_store_id, yandex_store_name
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (user_uuid) DO UPDATE SET
+              ozon_store_id=EXCLUDED.ozon_store_id,
+              ozon_store_name=EXCLUDED.ozon_store_name,
+              wb_store_id=EXCLUDED.wb_store_id,
+              wb_store_name=EXCLUDED.wb_store_name,
+              yandex_store_id=EXCLUDED.yandex_store_id,
+              yandex_store_name=EXCLUDED.yandex_store_name,
+              updated_at=NOW()
+            """,
+            (
+                user_uuid_val,
+                body.ozon_store_id,
+                body.ozon_store_name,
+                body.wb_store_id,
+                body.wb_store_name,
+                body.yandex_store_id,
+                body.yandex_store_name,
+            ),
+        )
+
+def _get_moysklad_status(user_uuid_val: uuid.UUID) -> MoyskladStatusIn:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT awaiting_id, awaiting_name, shipped_id, shipped_name, completed_id, completed_name, cancelled_id, cancelled_name
+            FROM moysklad_status_settings
+            WHERE user_uuid=%s
+            """,
+            (user_uuid_val,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return MoyskladStatusIn()
+    return MoyskladStatusIn(
+        awaiting_id=row[0],
+        awaiting_name=row[1],
+        shipped_id=row[2],
+        shipped_name=row[3],
+        completed_id=row[4],
+        completed_name=row[5],
+        cancelled_id=row[6],
+        cancelled_name=row[7],
+    )
+
+
+def _save_moysklad_status(user_uuid_val: uuid.UUID, body: MoyskladStatusIn) -> None:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO moysklad_status_settings (
+              user_uuid,
+              awaiting_id, awaiting_name,
+              shipped_id, shipped_name,
+              completed_id, completed_name,
+              cancelled_id, cancelled_name
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (user_uuid) DO UPDATE SET
+              awaiting_id=EXCLUDED.awaiting_id,
+              awaiting_name=EXCLUDED.awaiting_name,
+              shipped_id=EXCLUDED.shipped_id,
+              shipped_name=EXCLUDED.shipped_name,
+              completed_id=EXCLUDED.completed_id,
+              completed_name=EXCLUDED.completed_name,
+              cancelled_id=EXCLUDED.cancelled_id,
+              cancelled_name=EXCLUDED.cancelled_name,
+              updated_at=NOW()
+            """,
+            (
+                user_uuid_val,
+                body.awaiting_id,
+                body.awaiting_name,
+                body.shipped_id,
+                body.shipped_name,
+                body.completed_id,
+                body.completed_name,
+                body.cancelled_id,
+                body.cancelled_name,
+            ),
+        )
+
+def _get_ozon_promo_settings(user_uuid_val: uuid.UUID) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT offer_id, yourprice, minprice, min_price_fbs, min_price_limit_count, min_price_promo,
+                   min_price_discount, limit_count_value,
+                   use_fbs, use_limit_count, use_promo, autoupdate_promo, auto_update_days_limit_promo, use_discount
+            FROM ozon_promo_product_settings
+            WHERE user_uuid=%s
+            """,
+            (user_uuid_val,),
+        )
+        rows = cur.fetchall() or []
+    for r in rows:
+        out[str(r[0])] = {
+            "offer_id": str(r[0]),
+            "yourprice": int(r[1] or 0),
+            "minprice": int(r[2] or 0),
+            "min_price_fbs": int(r[3] or 0),
+            "min_price_limit_count": int(r[4] or 0),
+            "min_price_promo": int(r[5] or 0),
+            "min_price_discount": int(r[6] or 0),
+            "limit_count_value": int(r[7] or 1),
+            "use_fbs": bool(r[8]),
+            "use_limit_count": bool(r[9]),
+            "use_promo": bool(r[10]),
+            "autoupdate_promo": bool(r[11]),
+            "auto_update_days_limit_promo": bool(r[12]),
+            "use_discount": bool(r[13]),
+        }
+    return out
+
+
+def _save_ozon_promo_settings(user_uuid_val: uuid.UUID, body: OzonPromoProductSettingsIn) -> None:
+    offer_id = (body.offer_id or "").strip()
+    if not offer_id:
+        raise HTTPException(status_code=400, detail="offer_id is required")
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO ozon_promo_product_settings (
+              user_uuid, offer_id,
+              yourprice, minprice,
+              min_price_fbs, min_price_limit_count, min_price_promo, min_price_discount,
+              limit_count_value,
+              use_fbs, use_limit_count, use_promo, autoupdate_promo, auto_update_days_limit_promo, use_discount
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (user_uuid, offer_id) DO UPDATE SET
+              yourprice=EXCLUDED.yourprice,
+              minprice=EXCLUDED.minprice,
+              min_price_fbs=EXCLUDED.min_price_fbs,
+              min_price_limit_count=EXCLUDED.min_price_limit_count,
+              min_price_promo=EXCLUDED.min_price_promo,
+              min_price_discount=EXCLUDED.min_price_discount,
+              limit_count_value=EXCLUDED.limit_count_value,
+              use_fbs=EXCLUDED.use_fbs,
+              use_limit_count=EXCLUDED.use_limit_count,
+              use_promo=EXCLUDED.use_promo,
+              autoupdate_promo=EXCLUDED.autoupdate_promo,
+              auto_update_days_limit_promo=EXCLUDED.auto_update_days_limit_promo,
+              use_discount=EXCLUDED.use_discount,
+              updated_at=NOW()
+            """,
+            (
+                user_uuid_val,
+                offer_id,
+                body.yourprice,
+                body.minprice,
+                body.min_price_fbs,
+                body.min_price_limit_count,
+                body.min_price_promo,
+                body.min_price_discount,
+                body.limit_count_value,
+                body.use_fbs,
+                body.use_limit_count,
+                body.use_promo,
+                body.autoupdate_promo,
+                body.auto_update_days_limit_promo,
+                body.use_discount,
+            ),
+        )
+
+
+def _ozon_finance_realization(ozon_hdrs: dict[str, str], year: int, month: int) -> dict[str, Any]:
+    return _ozon_post_json(
+        "https://api-seller.ozon.ru/v2/finance/realization",
+        ozon_hdrs,
+        {"year": int(year), "month": int(month)},
+    )
+
+
+def _profit_color(percent: float) -> str:
+    try:
+        p = float(percent)
+    except Exception:
+        p = 0.0
+    if p < 30:
+        return "red"
+    if p < 60:
+        return "yellow"
+    return "green"
 
 @app.get("/api-settings")
 def get_api_settings(x_user_uuid: str | None = Header(default=None)) -> ApiSettingsIn:
@@ -121,8 +744,512 @@ def save_api_settings(body: ApiSettingsIn, x_user_uuid: str | None = Header(defa
     return {"status": "ok"}
 
 
+@app.get("/ozon/settings")
+def get_ozon_settings(x_user_uuid: str | None = Header(default=None)) -> ProviderSettingsIn:
+    return _get_provider_settings("ozon", _user_uuid(x_user_uuid))
+
+
+@app.post("/ozon/settings")
+def save_ozon_settings(body: ProviderSettingsIn, x_user_uuid: str | None = Header(default=None)) -> dict[str, str]:
+    _save_provider_settings("ozon", _user_uuid(x_user_uuid), body)
+    return {"status": "ok"}
+
+
+@app.get("/wb/settings")
+def get_wb_settings(x_user_uuid: str | None = Header(default=None)) -> ProviderSettingsIn:
+    return _get_provider_settings("wb", _user_uuid(x_user_uuid))
+
+
+@app.post("/wb/settings")
+def save_wb_settings(body: ProviderSettingsIn, x_user_uuid: str | None = Header(default=None)) -> dict[str, str]:
+    _save_provider_settings("wb", _user_uuid(x_user_uuid), body)
+    return {"status": "ok"}
+
+
+@app.get("/yandex/settings")
+def get_yandex_settings(x_user_uuid: str | None = Header(default=None)) -> ProviderSettingsIn:
+    return _get_provider_settings("yandex", _user_uuid(x_user_uuid))
+
+
+@app.post("/yandex/settings")
+def save_yandex_settings(body: ProviderSettingsIn, x_user_uuid: str | None = Header(default=None)) -> dict[str, str]:
+    _save_provider_settings("yandex", _user_uuid(x_user_uuid), body)
+    return {"status": "ok"}
+
+
+@app.get("/ozon/finances")
+def ozon_finances(
+    x_user_uuid: str | None = Header(default=None),
+    months_ago: int = Query(default=1, ge=1, le=24),
+) -> dict[str, Any]:
+    user_uuid_val = _user_uuid(x_user_uuid)
+    ozon_hdrs = _ozon_headers(user_uuid_val)
+
+    # dependencies: Ozon products list + MoySklad opt prices
+    prod = _ozon_get_products(ozon_hdrs)
+    sku_offer_id: dict[str, str] = {}
+    for item in prod.get("items") or []:
+        offer_id = item.get("offer_id")
+        if not offer_id:
+            continue
+        for src in item.get("sources") or []:
+            sku = src.get("sku")
+            if sku is None:
+                continue
+            sku_offer_id[str(sku)] = str(offer_id)
+
+    ms_opt = _moysklad_opt_prices(user_uuid_val)
+
+    now = datetime.datetime.utcnow()
+    from_iso, to_iso, start_date, stop_date = _month_range_utc_months_ago(now, months_ago)
+
+    # https://docs.ozon.ru/api/seller/#operation/FinanceAPI_FinanceTransactionListV3
+    url = "https://api-seller.ozon.ru/v3/finance/transaction/list"
+    page = 1
+    page_size = 1000
+    all_operations: list[dict[str, Any]] = []
+    while True:
+        payload = {
+            "filter": {
+                "date": {"from": from_iso, "to": to_iso},
+                "operation_type": [],
+                "posting_number": "",
+                "transaction_type": "all",
+            },
+            "page": page,
+            "page_size": page_size,
+        }
+        resp = _ozon_post_json(url, ozon_hdrs, payload)
+        result = resp.get("result") or {}
+        operations = result.get("operations") or []
+        if not operations:
+            break
+        all_operations.extend(operations)
+        page_count = int(result.get("page_count") or 0)
+        if page >= page_count:
+            break
+        page += 1
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in all_operations:
+        pn = (entry.get("posting") or {}).get("posting_number") or "unknown"
+        grouped[str(pn)].append(entry)
+
+    report: dict[str, list[dict[str, Any]]] = {}
+    total_payoff = 0
+    all_return_total = 0
+
+    for posting_number, items in grouped.items():
+        sale_price = 0.0
+        payoff = 0.0
+        sku_val: str | None = None
+        offer_id: str | None = None
+        opt = 0
+
+        for item in items:
+            item_s = item.get("items") or []
+            if item_s and not sku_val:
+                sku_raw = item_s[0].get("sku")
+                if sku_raw is not None:
+                    sku_val = str(sku_raw)
+                    offer_id = sku_offer_id.get(sku_val)
+                    if offer_id:
+                        opt = int(ms_opt.get(offer_id) or 0)
+
+            accruals = float(item.get("accruals_for_sale") or 0)
+            if accruals != 0:
+                sale_price += accruals
+
+            payoff += float(item.get("amount") or 0)
+
+        service_fees = sale_price - payoff
+        total_payoff += int(payoff)
+
+        # returns are usually negative amounts without a sale_price
+        if payoff < 0:
+            all_return_total += abs(int(payoff))
+
+        if not offer_id or opt == 0 or sale_price == 0:
+            continue
+
+        net_profit = int(payoff) - int(opt)
+        posttax_profit = int(net_profit - (int(payoff) * 0.06))
+        net_profit_perc = int((net_profit / int(opt)) * 100) if int(opt) else 0
+        posttax_profit_perc = int((posttax_profit / int(opt)) * 100) if int(opt) else 0
+
+        new_entry = {
+            "quantity": 1,
+            "name": posting_number,
+            "product_id": int(sku_val) if sku_val and sku_val.isdigit() else 0,
+            "sale_price": int(sale_price),
+            "opt": int(opt),
+            "fees": int(service_fees),
+            "payoff": int(payoff),
+            "net_profit": int(net_profit),
+            "net_profit_perc": int(net_profit_perc),
+            "posttax_profit": int(posttax_profit),
+            "posttax_profit_perc": int(posttax_profit_perc),
+        }
+        report.setdefault(offer_id, []).append(new_entry)
+
+    # summed totals per offer_id
+    summed_totals: dict[str, Any] = {}
+    for offer_id, entries in report.items():
+        total_quantity = sum(int(e.get("quantity") or 0) for e in entries) or 0
+        payoff_sum = sum(int(e.get("payoff") or 0) for e in entries)
+        net_profit_sum = sum(int(e.get("net_profit") or 0) for e in entries)
+        posttax_profit_sum = sum(int(e.get("posttax_profit") or 0) for e in entries)
+        avg_sales_price = int(payoff_sum / total_quantity) if total_quantity else 0
+        avg_percent_posttax = int(
+            (sum(int(e.get("posttax_profit_perc") or 0) for e in entries) / len(entries)) if entries else 0
+        )
+        summed_totals[offer_id] = {
+            "payoff": int(payoff_sum),
+            "net_profit_sum": int(net_profit_sum),
+            "posttax_profit_sum": int(posttax_profit_sum),
+            "average_sales_price": int(avg_sales_price),
+            "average_percent_posttax": int(avg_percent_posttax),
+            "total_quantity": int(total_quantity),
+        }
+
+    all_totals_raw: dict[str, Any] = {
+        "all_total_price_sum": int(total_payoff),
+        "all_net_profit_sum": sum(v["net_profit_sum"] for v in summed_totals.values()),
+        "all_posttax_profit_sum": sum(v["posttax_profit_sum"] for v in summed_totals.values()),
+        "all_quantity": sum(v["total_quantity"] for v in summed_totals.values()),
+        "all_return_total": int(all_return_total),
+    }
+    all_totals = {k: (f"{v:,}" if isinstance(v, (int, float)) else v) for k, v in all_totals_raw.items()}
+
+    header_data = {
+        "start_date": start_date.isoformat(),
+        "stop_date": stop_date.isoformat(),
+        "month": _ru_month_name_nominative(start_date.month),
+        "day_delta": int((stop_date - start_date).days),
+    }
+
+    # stable ordering for UI
+    sorted_report = dict(sorted(report.items(), key=lambda kv: kv[0]))
+
+    return {
+        "report": sorted_report,
+        "summed_totals": summed_totals,
+        "all_totals": all_totals,
+        "header_data": header_data,
+    }
+
+
+@app.get("/ozon/promotions")
+def ozon_promotions(
+    x_user_uuid: str | None = Header(default=None),
+    percent_color: str | None = Query(default=None),
+) -> dict[str, Any]:
+    user_uuid_val = _user_uuid(x_user_uuid)
+    ozon_hdrs = _ozon_headers(user_uuid_val)
+
+    # opt prices from MoySklad: article == offer_id
+    ms_opt = _moysklad_opt_prices(user_uuid_val)
+
+    # realization stats for last month
+    now = datetime.datetime.utcnow()
+    from_iso, to_iso, start_date, stop_date = _month_range_utc_months_ago(now, 1)
+    _ = (from_iso, to_iso)  # unused, keep range derivation consistent
+    real = _ozon_finance_realization(ozon_hdrs, start_date.year, start_date.month)
+    rows = ((real.get("result") or {}).get("rows") or []) if isinstance(real, dict) else []
+
+    realization: dict[str, Any] = {}
+    price_groups: dict[str, list[float]] = {}
+    price_acc: dict[str, Any] = {}
+    for it in rows:
+        offer_id = ((it.get("item") or {}).get("offer_id")) if isinstance(it, dict) else None
+        if not offer_id:
+            continue
+        offer_id = str(offer_id)
+        qty = 0
+        try:
+            qty = int(((it.get("delivery_commission") or {}).get("quantity")) or 0)
+        except Exception:
+            qty = 0
+        realization.setdefault(offer_id, {"sale_qty": 0, "avg_seller_price": 0, "avg_list": []})
+        realization[offer_id]["sale_qty"] = int(realization[offer_id].get("sale_qty") or 0) + qty
+
+        seller_price = it.get("seller_price_per_instance")
+        if seller_price is not None:
+            try:
+                sp = float(seller_price)
+                price_acc.setdefault(offer_id, {"total": 0.0, "count": 0})
+                price_acc[offer_id]["total"] += sp * qty
+                price_acc[offer_id]["count"] += qty
+                price_groups.setdefault(offer_id, []).extend([sp] * max(qty, 0))
+            except Exception:
+                pass
+
+    for offer_id, acc in price_acc.items():
+        c = int(acc.get("count") or 0)
+        avg = int((float(acc.get("total") or 0) / c) if c else 0)
+        realization.setdefault(offer_id, {"sale_qty": 0})
+        realization[offer_id]["avg_seller_price"] = avg
+
+    # group prices by +-10% like OWM (simplified same algo)
+    for offer_id, prices in price_groups.items():
+        if not prices:
+            realization.setdefault(offer_id, {})["avg_list"] = []
+            continue
+        sorted_prices = sorted(prices)
+        used = [False] * len(sorted_prices)
+        groups: list[list[float]] = []
+        i = 0
+        while i < len(sorted_prices):
+            if used[i]:
+                i += 1
+                continue
+            group = [sorted_prices[i]]
+            used[i] = True
+            for j in range(i + 1, len(sorted_prices)):
+                if not used[j] and abs(sorted_prices[j] - group[0]) / group[0] <= 0.1:
+                    group.append(sorted_prices[j])
+                    used[j] = True
+            groups.append(group)
+            i += 1
+        avg_list = [{"count": len(g), "avg_price": int(sum(g) / len(g))} for g in groups if g]
+        realization.setdefault(offer_id, {})["avg_list"] = avg_list
+
+    # prices + commissions
+    prices_resp = _ozon_post_json(
+        "https://api-seller.ozon.ru/v5/product/info/prices",
+        ozon_hdrs,
+        {"filter": {"visibility": "ALL"}, "last_id": "", "limit": 1000},
+    )
+    items = prices_resp.get("items") or []
+
+    settings = _get_ozon_promo_settings(user_uuid_val)
+
+    out_items: list[dict[str, Any]] = []
+    for item in items:
+        offer_id = str(item.get("offer_id") or "")
+        if not offer_id:
+            continue
+        if offer_id not in ms_opt:
+            continue
+        opt_price_value = int(ms_opt.get(offer_id) or 0)
+        if offer_id not in realization:
+            realization[offer_id] = {"sale_qty": 0, "avg_seller_price": 0, "avg_list": []}
+
+        price_block = item.get("price") or {}
+        marketing_seller_price = float(price_block.get("marketing_seller_price") or 0)
+        price = float(price_block.get("price") or 0)
+        min_price = float(price_block.get("min_price") or 0)
+        commissions = item.get("commissions") or {}
+
+        acquiring = 2.0
+        sales_percent_fbs = float(commissions.get("sales_percent_fbs") or 0)
+        fbs_deliv_to_customer_amount = float(commissions.get("fbs_deliv_to_customer_amount") or 0)
+        fbs_direct_flow_trans_max_amount = float(commissions.get("fbs_direct_flow_trans_max_amount") or 0)
+        fbs_direct_flow_trans_min_amount = float(commissions.get("fbs_direct_flow_trans_min_amount") or 0)
+        fbs_first_mile_max_amount = float(commissions.get("fbs_first_mile_max_amount") or 0)
+
+        fbo_deliv_to_customer_amount = float(commissions.get("fbo_deliv_to_customer_amount") or 0)
+        fbo_direct_flow_trans_max_amount = float(commissions.get("fbo_direct_flow_trans_max_amount") or 0)
+        fbo_direct_flow_trans_min_amount = float(commissions.get("fbo_direct_flow_trans_min_amount") or 0)
+        sales_percent_fbo = float(commissions.get("sales_percent_fbo") or 0)
+
+        fbs_direct_flow_trans = (fbs_direct_flow_trans_max_amount + fbs_direct_flow_trans_min_amount) / 2.0
+        fbo_direct_flow_trans = (fbo_direct_flow_trans_max_amount + fbo_direct_flow_trans_min_amount) / 2.0
+        fbs_first_mile_avg = fbs_first_mile_max_amount
+
+        fbo_delivery_total = (
+            marketing_seller_price * (sales_percent_fbo / 100.0)
+            + marketing_seller_price * (acquiring / 100.0)
+            + fbo_direct_flow_trans
+            + fbo_deliv_to_customer_amount
+        )
+        fbs_delivery_total = (
+            marketing_seller_price * (sales_percent_fbs / 100.0)
+            + marketing_seller_price * (acquiring / 100.0)
+            + fbs_direct_flow_trans
+            + fbs_deliv_to_customer_amount
+            + fbs_first_mile_avg
+        )
+
+        profit_price_fbo = int(marketing_seller_price) - int(fbo_delivery_total) - opt_price_value
+        profit_price_fbs = int(marketing_seller_price) - int(fbs_delivery_total) - opt_price_value
+        profit_percent_fbo = (profit_price_fbo / opt_price_value * 100.0) if opt_price_value else 0.0
+        profit_percent_fbs = (profit_price_fbs / opt_price_value * 100.0) if opt_price_value else 0.0
+
+        color = _profit_color(profit_percent_fbs)
+        if percent_color and percent_color in ("green", "yellow", "red") and color != percent_color:
+            continue
+
+        # enrich avg_list with delivery/profit like OWM
+        avg_list_out: list[dict[str, Any]] = []
+        for avg in realization[offer_id].get("avg_list") or []:
+            avg_price = float(avg.get("avg_price") or 0)
+            avg_fbo_delivery_total = (
+                avg_price * (sales_percent_fbo / 100.0)
+                + avg_price * (acquiring / 100.0)
+                + fbo_direct_flow_trans
+                + fbo_deliv_to_customer_amount
+            )
+            avg_fbs_delivery_total = (
+                avg_price * (sales_percent_fbs / 100.0)
+                + avg_price * (acquiring / 100.0)
+                + fbs_direct_flow_trans
+                + fbs_deliv_to_customer_amount
+                + fbs_first_mile_avg
+            )
+            avg_profit_price_fbo = int(avg_price) - int(avg_fbo_delivery_total) - opt_price_value
+            avg_profit_price_fbs = int(avg_price) - int(avg_fbs_delivery_total) - opt_price_value
+            avg_profit_percent_fbo = (avg_profit_price_fbo / opt_price_value * 100.0) if opt_price_value else 0.0
+            avg_profit_percent_fbs = (avg_profit_price_fbs / opt_price_value * 100.0) if opt_price_value else 0.0
+            avg_list_out.append(
+                {
+                    "count": int(avg.get("count") or 0),
+                    "avg_price": int(avg_price),
+                    "fbo_delivery_total": int(avg_fbo_delivery_total),
+                    "fbs_delivery_total": int(avg_fbs_delivery_total),
+                    "profit_price_fbo": int(avg_profit_price_fbo),
+                    "profit_price_fbs": int(avg_profit_price_fbs),
+                    "profit_percent_fbo": int(avg_profit_percent_fbo),
+                    "profit_percent_fbs": int(avg_profit_percent_fbs),
+                }
+            )
+
+        out_items.append(
+            {
+                "offer_id": offer_id,
+                "product_id": int(float(item.get("product_id") or 0)),
+                "price": int(price),
+                "min_price": int(min_price),
+                "marketing_seller_price": int(marketing_seller_price),
+                "opt_price": int(opt_price_value),
+                "sale_qty": int(realization[offer_id].get("sale_qty") or 0),
+                "avg_seller_price": int(realization[offer_id].get("avg_seller_price") or 0),
+                "avg_list": avg_list_out,
+                "profit_price_fbo": int(profit_price_fbo),
+                "profit_price_fbs": int(profit_price_fbs),
+                "profit_percent_fbo": int(profit_percent_fbo),
+                "profit_percent_fbs": int(profit_percent_fbs),
+                "fbs_delivery_total": int(fbs_delivery_total),
+                "fbo_delivery_total": int(fbo_delivery_total),
+                "acquiring": 2,
+                "sales_percent_fbs": sales_percent_fbs,
+                "sales_percent_fbo": sales_percent_fbo,
+                "fbs_deliv_to_customer_amount": fbs_deliv_to_customer_amount,
+                "fbs_direct_flow_trans": fbs_direct_flow_trans,
+                "fbs_first_mile_avg": fbs_first_mile_avg,
+                "fbo_deliv_to_customer_amount": fbo_deliv_to_customer_amount,
+                "fbo_direct_flow_trans": fbo_direct_flow_trans,
+                "color": color,
+                "settings": settings.get(offer_id) or {},
+            }
+        )
+
+    out_items.sort(key=lambda x: x.get("offer_id") or "")
+    return {"items": out_items, "period": {"year": start_date.year, "month": start_date.month}}
+
+
+@app.get("/ozon/promotions/settings")
+def get_ozon_promotions_settings(x_user_uuid: str | None = Header(default=None)) -> dict[str, Any]:
+    return _get_ozon_promo_settings(_user_uuid(x_user_uuid))
+
+
+@app.post("/ozon/promotions/settings")
+def save_ozon_promotions_settings(
+    body: OzonPromoProductSettingsIn, x_user_uuid: str | None = Header(default=None)
+) -> dict[str, str]:
+    _save_ozon_promo_settings(_user_uuid(x_user_uuid), body)
+    return {"status": "ok"}
+
+
+@app.get("/moysklad/settings")
+def get_moysklad_settings(x_user_uuid: str | None = Header(default=None)) -> ProviderSettingsIn:
+    return _get_provider_settings("moysklad", _user_uuid(x_user_uuid))
+
+
+@app.post("/moysklad/settings")
+def save_moysklad_settings(body: ProviderSettingsIn, x_user_uuid: str | None = Header(default=None)) -> dict[str, str]:
+    _save_provider_settings("moysklad", _user_uuid(x_user_uuid), body)
+    return {"status": "ok"}
+
+@app.get("/moysklad/organizations")
+def list_moysklad_organizations(x_user_uuid: str | None = Header(default=None)) -> list[MsOption]:
+    user_uuid_val = _user_uuid(x_user_uuid)
+    token = _get_moysklad_token(user_uuid_val)
+    data = _moysklad_get(token, "https://api.moysklad.ru/api/remap/1.2/entity/organization/")
+    rows = data.get("rows") or []
+    return [MsOption(id=str(x.get("id") or ""), name=str(x.get("name") or "")) for x in rows if x.get("id")]
+
+
+@app.get("/moysklad/agents")
+def list_moysklad_agents(x_user_uuid: str | None = Header(default=None)) -> list[MsOption]:
+    user_uuid_val = _user_uuid(x_user_uuid)
+    token = _get_moysklad_token(user_uuid_val)
+    data = _moysklad_get(token, "https://api.moysklad.ru/api/remap/1.2/entity/counterparty/")
+    rows = data.get("rows") or []
+    return [MsOption(id=str(x.get("id") or ""), name=str(x.get("name") or "")) for x in rows if x.get("id")]
+
+@app.get("/moysklad/storages")
+def list_moysklad_storages(x_user_uuid: str | None = Header(default=None)) -> list[MsOption]:
+    user_uuid_val = _user_uuid(x_user_uuid)
+    token = _get_moysklad_token(user_uuid_val)
+    data = _moysklad_get(token, "https://api.moysklad.ru/api/remap/1.2/entity/store")
+    rows = data.get("rows") or []
+    return [MsOption(id=str(x.get("id") or ""), name=str(x.get("name") or "")) for x in rows if x.get("id")]
+
+@app.get("/moysklad/statuses")
+def list_moysklad_statuses(x_user_uuid: str | None = Header(default=None)) -> list[MsOption]:
+    user_uuid_val = _user_uuid(x_user_uuid)
+    token = _get_moysklad_token(user_uuid_val)
+    data = _moysklad_get(token, "https://api.moysklad.ru/api/remap/1.2/entity/customerorder/metadata")
+    states = data.get("states") or []
+    return [MsOption(id=str(x.get("id") or ""), name=str(x.get("name") or "")) for x in states if x.get("id")]
+
+
+@app.get("/moysklad/contragents")
+def get_moysklad_contragents(x_user_uuid: str | None = Header(default=None)) -> MoyskladContragentsIn:
+    return _get_moysklad_contragents(_user_uuid(x_user_uuid))
+
+
+@app.post("/moysklad/contragents")
+def save_moysklad_contragents(
+    body: MoyskladContragentsIn, x_user_uuid: str | None = Header(default=None)
+) -> dict[str, str]:
+    _save_moysklad_contragents(_user_uuid(x_user_uuid), body)
+    return {"status": "ok"}
+
+@app.get("/moysklad/storages-settings")
+def get_moysklad_storages_settings(x_user_uuid: str | None = Header(default=None)) -> MoyskladStorageIn:
+    return _get_moysklad_storage(_user_uuid(x_user_uuid))
+
+
+@app.post("/moysklad/storages-settings")
+def save_moysklad_storages_settings(
+    body: MoyskladStorageIn, x_user_uuid: str | None = Header(default=None)
+) -> dict[str, str]:
+    _save_moysklad_storage(_user_uuid(x_user_uuid), body)
+    return {"status": "ok"}
+
+
+@app.get("/moysklad/statuses-settings")
+def get_moysklad_statuses_settings(x_user_uuid: str | None = Header(default=None)) -> MoyskladStatusIn:
+    return _get_moysklad_status(_user_uuid(x_user_uuid))
+
+
+@app.post("/moysklad/statuses-settings")
+def save_moysklad_statuses_settings(
+    body: MoyskladStatusIn, x_user_uuid: str | None = Header(default=None)
+) -> dict[str, str]:
+    _save_moysklad_status(_user_uuid(x_user_uuid), body)
+    return {"status": "ok"}
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/manifest")
+def manifest() -> dict:
+    return MANIFEST
 
 

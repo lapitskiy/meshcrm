@@ -1,0 +1,16 @@
+from typing import Protocol
+from uuid import UUID
+
+from app.domain.statuses.entity import Status
+
+
+class StatusRepository(Protocol):
+    def create(self, name: str, color: str) -> Status: ...
+
+    def list_all(self) -> list[Status]: ...
+
+    def update(self, status_id: UUID, name: str, color: str) -> Status: ...
+
+    def delete(self, status_id: UUID) -> None: ...
+
+    def reorder(self, ids_in_order: list[UUID]) -> None: ...

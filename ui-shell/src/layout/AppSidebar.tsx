@@ -4,20 +4,15 @@ import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { useSidebar } from "../context/SidebarContext";
+import { getGatewayBaseUrl } from "@/lib/gateway";
 import {
   BoxCubeIcon,
-  CalenderIcon,
   ChevronDownIcon,
-  GridIcon,
   HorizontaLDots,
-  ListIcon,
-  PageIcon,
   PieChartIcon,
   PlugInIcon,
-  TableIcon,
   UserCircleIcon,
 } from "../icons/index";
-import SidebarWidget from "./SidebarWidget";
 
 type SubItem = {
   name: string;
@@ -34,40 +29,16 @@ type NavItem = {
   subItems?: SubItem[];
 };
 
-const navItems: NavItem[] = [
-  {
-    icon: <GridIcon />,
-    name: "Dashboard",
-    subItems: [{ name: "Ecommerce", path: "/", pro: false }],
-  },
-  {
-    icon: <CalenderIcon />,
-    name: "Calendar",
-    path: "/calendar",
-  },
-  {
-    icon: <UserCircleIcon />,
-    name: "User Profile",
-    path: "/profile",
-  },
+type PluginMeta = {
+  name: string;
+  enabled: boolean;
+};
 
+const staticNavItems: NavItem[] = [
   {
-    name: "Forms",
-    icon: <ListIcon />,
-    subItems: [{ name: "Form Elements", path: "/form-elements", pro: false }],
-  },
-  {
-    name: "Tables",
-    icon: <TableIcon />,
-    subItems: [{ name: "Basic Tables", path: "/basic-tables", pro: false }],
-  },
-  {
-    name: "Pages",
-    icon: <PageIcon />,
-    subItems: [
-      { name: "Blank Page", path: "/blank", pro: false },
-      { name: "404 Error", path: "/error-404", pro: false },
-    ],
+    name: "Модули",
+    icon: <PlugInIcon />,
+    subItems: [{ name: "Настройки", path: "/modules/settings" }],
   },
   {
     name: "Маркетплейсы",
@@ -75,46 +46,155 @@ const navItems: NavItem[] = [
     subItems: [
       {
         name: "Настройки",
-        children: [{ name: "API", path: "/modules/marketplaces/settings/api" }],
+        children: [{ name: "Общие", path: "/modules/marketplaces/settings/common" }],
+      },
+      {
+        name: "Ozon",
+        children: [
+          { name: "Настройки", path: "/modules/marketplaces/ozon/settings" },
+          { name: "Финансы", path: "/modules/marketplaces/ozon/finances" },
+          { name: "Акции", path: "/modules/marketplaces/ozon/promotions" },
+        ],
+      },
+      {
+        name: "WB",
+        children: [{ name: "Настройки", path: "/modules/marketplaces/wb/settings" }],
+      },
+      {
+        name: "Yandex",
+        children: [{ name: "Настройки", path: "/modules/marketplaces/yandex/settings" }],
       },
     ],
   },
+  {
+    name: "МойСклад",
+    icon: <BoxCubeIcon />,
+    subItems: [{ name: "Настройки", path: "/modules/moysklad/settings" }],
+  },
 ];
 
-const othersItems: NavItem[] = [
-  {
-    icon: <PieChartIcon />,
-    name: "Charts",
-    subItems: [
-      { name: "Line Chart", path: "/line-chart", pro: false },
-      { name: "Bar Chart", path: "/bar-chart", pro: false },
-    ],
-  },
-  {
-    icon: <BoxCubeIcon />,
-    name: "UI Elements",
-    subItems: [
-      { name: "Alerts", path: "/alerts", pro: false },
-      { name: "Avatar", path: "/avatars", pro: false },
-      { name: "Badge", path: "/badge", pro: false },
-      { name: "Buttons", path: "/buttons", pro: false },
-      { name: "Images", path: "/images", pro: false },
-      { name: "Videos", path: "/videos", pro: false },
-    ],
-  },
-  {
-    icon: <PlugInIcon />,
-    name: "Authentication",
-    subItems: [
-      { name: "Sign In", path: "/signin", pro: false },
-      { name: "Sign Up", path: "/signup", pro: false },
-    ],
-  },
-];
+const othersItems: NavItem[] = [];
 
 const AppSidebar: React.FC = () => {
   const { isExpanded, isMobileOpen, isHovered, setIsHovered } = useSidebar();
   const pathname = usePathname();
+  const [openSubItemChildren, setOpenSubItemChildren] = useState<Record<string, boolean>>({});
+  const [ordersEnabled, setOrdersEnabled] = useState(false);
+  const [contactsEnabled, setContactsEnabled] = useState(false);
+  const [financeEnabled, setFinanceEnabled] = useState(false);
+  const [warehousesEnabled, setWarehousesEnabled] = useState(false);
+
+  const navItems = React.useMemo<NavItem[]>(() => {
+    const dynamicItems: NavItem[] = [];
+
+    if (ordersEnabled) {
+      dynamicItems.push({
+        name: "Заказы",
+        icon: <BoxCubeIcon />,
+        subItems: [
+          { name: "Создать заказ", path: "/modules/orders/create" },
+          { name: "Список заказов", path: "/modules/orders/list" },
+          {
+            name: "Настройки",
+            children: [
+              { name: "Категория услуги", path: "/modules/orders/settings/service-category" },
+              { name: "Виды работ", path: "/modules/orders/settings/work-types" },
+              { name: "Объект ремонта/услуги", path: "/modules/orders/settings/service-object" },
+              { name: "Статусы", path: "/modules/orders/settings/statuses" },
+            ],
+          },
+        ],
+      });
+    }
+
+    if (financeEnabled) {
+      dynamicItems.push({
+        name: "Бухглатерия",
+        icon: <PieChartIcon />,
+        subItems: [
+          { name: "Учёт денег", path: "/modules/finance/money" },
+          { name: "Настройки", path: "/modules/finance/settings" },
+        ],
+      });
+    }
+
+    if (contactsEnabled) {
+      dynamicItems.push({
+        name: "Контакты",
+        icon: <UserCircleIcon />,
+        subItems: [
+          { name: "Список контактов", path: "/modules/contacts/list" },
+          { name: "Настройки", path: "/modules/contacts/settings" },
+        ],
+      });
+    }
+
+    if (warehousesEnabled) {
+      dynamicItems.push({
+        name: "Склады/Точки",
+        icon: <BoxCubeIcon />,
+        subItems: [
+          { name: "Склады", path: "/modules/warehouses/list" },
+          { name: "Настройки", path: "/modules/warehouses/settings" },
+        ],
+      });
+    }
+
+    dynamicItems.push({
+      name: "Печать",
+      icon: <BoxCubeIcon />,
+      subItems: [
+        { name: "Создать форму", path: "/modules/print/create" },
+        { name: "Список форм", path: "/modules/print/list" },
+        {
+          name: "Настройки",
+          children: [
+            { name: "Общие", path: "/modules/print/settings" },
+            { name: "Категории", path: "/modules/print/settings/categories" },
+          ],
+        },
+      ],
+    });
+
+    return [...dynamicItems, ...staticNavItems];
+  }, [ordersEnabled, contactsEnabled, financeEnabled, warehousesEnabled]);
+
+  useEffect(() => {
+    let alive = true;
+
+    const loadEnabledModules = async () => {
+      try {
+        const base = getGatewayBaseUrl();
+        const resp = await fetch(`${base}/plugins/_meta?enabled_only=true`, { cache: "no-store" });
+        if (!resp.ok) {
+          throw new Error(`plugins meta failed: ${resp.status}`);
+        }
+        const data = (await resp.json()) as PluginMeta[];
+        if (!alive) return;
+        setOrdersEnabled(data.some((item) => item.name === "orders" && item.enabled));
+        setContactsEnabled(data.some((item) => item.name === "contacts" && item.enabled));
+        setFinanceEnabled(data.some((item) => item.name === "finance" && item.enabled));
+        setWarehousesEnabled(data.some((item) => item.name === "warehouses" && item.enabled));
+      } catch {
+        if (alive) {
+          setOrdersEnabled(false);
+          setContactsEnabled(false);
+          setFinanceEnabled(false);
+          setWarehousesEnabled(false);
+        }
+      }
+    };
+
+    void loadEnabledModules();
+    const timer = window.setInterval(() => {
+      void loadEnabledModules();
+    }, 15000);
+
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const renderMenuItems = (
     navItems: NavItem[],
@@ -195,7 +275,12 @@ const AppSidebar: React.FC = () => {
                     : "0px",
               }}
             >
-              <ul className="mt-2 space-y-1 ml-9">
+              <ul
+                ref={(el) => {
+                  subMenuContentRefs.current[`${menuType}-${index}`] = el;
+                }}
+                className="mt-2 space-y-1 ml-9"
+              >
                 {nav.subItems.map((subItem) => (
                   <li key={subItem.name}>
                     {subItem.path ? (
@@ -234,27 +319,52 @@ const AppSidebar: React.FC = () => {
                         </span>
                       </Link>
                     ) : (
-                      <div className="menu-dropdown-item menu-dropdown-item-inactive cursor-default">
-                        {subItem.name}
-                      </div>
+                      subItem.children?.length ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const k = `${menuType}-${index}-${subItem.name}`;
+                            setOpenSubItemChildren((prev) => ({
+                              ...prev,
+                              [k]: !(prev[k] ?? true),
+                            }));
+                          }}
+                          className="menu-dropdown-item menu-dropdown-item-inactive w-full flex items-center"
+                        >
+                          {subItem.name}
+                          <ChevronDownIcon
+                            className={`ml-auto w-4 h-4 transition-transform duration-200 ${
+                              openSubItemChildren[`${menuType}-${index}-${subItem.name}`] ?? true
+                                ? "rotate-180 text-brand-500"
+                                : ""
+                            }`}
+                          />
+                        </button>
+                      ) : (
+                        <div className="menu-dropdown-item menu-dropdown-item-inactive cursor-default">
+                          {subItem.name}
+                        </div>
+                      )
                     )}
                     {subItem.children?.length ? (
-                      <ul className="mt-1 space-y-1 ml-4">
-                        {subItem.children.map((child) => (
-                          <li key={child.name}>
-                            <Link
-                              href={child.path}
-                              className={`menu-dropdown-item ${
-                                isActive(child.path)
-                                  ? "menu-dropdown-item-active"
-                                  : "menu-dropdown-item-inactive"
-                              }`}
-                            >
-                              {child.name}
-                            </Link>
-                          </li>
-                        ))}
-                      </ul>
+                      (openSubItemChildren[`${menuType}-${index}-${subItem.name}`] ?? true) ? (
+                        <ul className="mt-1 space-y-1 ml-4">
+                          {subItem.children.map((child) => (
+                            <li key={child.name}>
+                              <Link
+                                href={child.path}
+                                className={`menu-dropdown-item ${
+                                  isActive(child.path)
+                                    ? "menu-dropdown-item-active"
+                                    : "menu-dropdown-item-inactive"
+                                }`}
+                              >
+                                {child.name}
+                              </Link>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null
                     ) : null}
                   </li>
                 ))}
@@ -274,6 +384,7 @@ const AppSidebar: React.FC = () => {
     {}
   );
   const subMenuRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const subMenuContentRefs = useRef<Record<string, HTMLUListElement | null>>({});
 
   // const isActive = (path: string) => path === pathname;
    const isActive = useCallback((path: string) => path === pathname, [pathname]);
@@ -294,6 +405,10 @@ const AppSidebar: React.FC = () => {
                 type: menuType as "main" | "others",
                 index,
               });
+              if (subItem.children?.some((c) => isActive(c.path))) {
+                const k = `${menuType}-${index}-${subItem.name}`;
+                setOpenSubItemChildren((prev) => ({ ...prev, [k]: true }));
+              }
               submenuMatched = true;
             }
           });
@@ -305,20 +420,20 @@ const AppSidebar: React.FC = () => {
     if (!submenuMatched) {
       setOpenSubmenu(null);
     }
-  }, [pathname,isActive]);
+  }, [pathname, isActive, navItems]);
 
   useEffect(() => {
     // Set the height of the submenu items when the submenu is opened
     if (openSubmenu !== null) {
       const key = `${openSubmenu.type}-${openSubmenu.index}`;
-      if (subMenuRefs.current[key]) {
+      if (subMenuContentRefs.current[key]) {
         setSubMenuHeight((prevHeights) => ({
           ...prevHeights,
-          [key]: subMenuRefs.current[key]?.scrollHeight || 0,
+          [key]: subMenuContentRefs.current[key]?.scrollHeight || 0,
         }));
       }
     }
-  }, [openSubmenu]);
+  }, [openSubmenu, openSubItemChildren]);
 
   const handleSubmenuToggle = (index: number, menuType: "main" | "others") => {
     setOpenSubmenu((prevOpenSubmenu) => {
@@ -402,24 +517,27 @@ const AppSidebar: React.FC = () => {
             </div>
 
             <div className="">
-              <h2
-                className={`mb-4 text-xs uppercase flex leading-[20px] text-gray-400 ${
-                  !isExpanded && !isHovered
-                    ? "lg:justify-center"
-                    : "justify-start"
-                }`}
-              >
-                {isExpanded || isHovered || isMobileOpen ? (
-                  "Others"
-                ) : (
-                  <HorizontaLDots />
-                )}
-              </h2>
-              {renderMenuItems(othersItems, "others")}
+              {othersItems.length ? (
+                <>
+                  <h2
+                    className={`mb-4 text-xs uppercase flex leading-[20px] text-gray-400 ${
+                      !isExpanded && !isHovered
+                        ? "lg:justify-center"
+                        : "justify-start"
+                    }`}
+                  >
+                    {isExpanded || isHovered || isMobileOpen ? (
+                      "Others"
+                    ) : (
+                      <HorizontaLDots />
+                    )}
+                  </h2>
+                  {renderMenuItems(othersItems, "others")}
+                </>
+              ) : null}
             </div>
           </div>
         </nav>
-        {isExpanded || isHovered || isMobileOpen ? <SidebarWidget /> : null}
       </div>
     </aside>
   );

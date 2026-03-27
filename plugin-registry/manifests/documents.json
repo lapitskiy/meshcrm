@@ -1,0 +1,9 @@
+{
+  "name": "documents",
+  "bounded_context": "documents",
+  "version": "1.0.0",
+  "events": { "subscribes": [], "publishes": [] },
+  "ui": { "menu": { "title": "Документы", "items": [] } },
+  "api": { "base_url": "http://documents:8000" }
+}
+

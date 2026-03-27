@@ -24,11 +24,13 @@ export default function DatePicker({
   placeholder,
 }: PropsType) {
   useEffect(() => {
+    const resolvedMode = mode || "single";
     const flatPickr = flatpickr(`#${id}`, {
-      mode: mode || "single",
+      mode: resolvedMode,
       static: true,
       monthSelectorType: "static",
       dateFormat: "Y-m-d",
+      closeOnSelect: resolvedMode !== "range",
       defaultDate,
       onChange,
     });
