@@ -54,7 +54,11 @@ def upgrade() -> None:
           ('contacts', 'contact_phone', 'Телефон клиента'),
           ('orders', 'order_number', 'Номер заказа'),
           ('orders', 'order_created_at', 'Дата создания заказа'),
-          ('warehouses', 'warehouse_name', 'Склад/точка')
+          ('orders', 'user_name', 'Имя пользователя (мастера)'),
+          ('orders', 'user_login', 'Логин пользователя (мастера)'),
+          ('warehouses', 'warehouse_name', 'Склад/точка'),
+          ('warehouses', 'warehouse_address', 'Адрес склада/точки'),
+          ('warehouses', 'warehouse_point_phone', 'Телефон склада/точки')
         ON CONFLICT (module_name, var_key) DO NOTHING;
         """
     )

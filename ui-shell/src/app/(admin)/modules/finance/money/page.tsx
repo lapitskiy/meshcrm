@@ -17,6 +17,7 @@ type OrderItem = {
   id: string;
   order_number?: number | null;
   status?: string;
+  warehouse_id?: string | null;
   created_at: string;
 };
 
@@ -54,8 +55,14 @@ type FinanceHistoryItem = {
 type MoneyFilters = {
   amount: string;
   paid: "" | "paid" | "unpaid";
+  warehouse_id: string;
   created_from: string;
   created_to: string;
+};
+
+type WarehouseOption = {
+  id: string;
+  name: string;
 };
 
 function getToken(): string {
@@ -90,15 +97,19 @@ export default function FinanceMoneyPage() {
   const [lineDraftById, setLineDraftById] = useState<Record<string, { amount: string; is_paid: "yes" | "no" }>>({});
   const [lineSavingById, setLineSavingById] = useState<Record<string, boolean>>({});
   const [workTypeNameById, setWorkTypeNameById] = useState<Record<string, string>>({});
+  const [warehouseOptions, setWarehouseOptions] = useState<WarehouseOption[]>([]);
+  const [warehouseNameById, setWarehouseNameById] = useState<Record<string, string>>({});
   const [draftFilters, setDraftFilters] = useState<MoneyFilters>({
     amount: "",
     paid: "",
+    warehouse_id: "",
     created_from: "",
     created_to: "",
   });
   const [appliedFilters, setAppliedFilters] = useState<MoneyFilters>({
     amount: "",
     paid: "",
+    warehouse_id: "",
     created_from: "",
     created_to: "",
   });
@@ -155,6 +166,7 @@ export default function FinanceMoneyPage() {
       qs.set("page_size", "20");
       const s = String(searchArg ?? appliedSearch).trim();
       if (s) qs.set("search", s);
+      if (f.warehouse_id) qs.set("warehouse_id", f.warehouse_id);
       if (f.created_from) qs.set("created_from", f.created_from);
       if (f.created_to) qs.set("created_to", f.created_to);
       const resp = await fetch(`${base}/orders/orders?${qs.toString()}`, {
@@ -221,6 +233,26 @@ export default function FinanceMoneyPage() {
         const map: Record<string, string> = {};
         for (const row of rows || []) map[row.id] = row.name;
         setWorkTypeNameById(map);
+      } catch {
+        // ignore
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const resp = await fetch(`${base}/warehouses/warehouses/accessible`, {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!resp.ok) return;
+        const rows = (await resp.json()) as WarehouseOption[];
+        const nextMap: Record<string, string> = {};
+        for (const row of rows || []) nextMap[String(row.id)] = String(row.name || "");
+        setWarehouseOptions(rows || []);
+        setWarehouseNameById(nextMap);
       } catch {
         // ignore
       }
@@ -321,6 +353,7 @@ export default function FinanceMoneyPage() {
     const next: MoneyFilters = {
       amount: String(draftFilters.amount || "").trim(),
       paid: draftFilters.paid,
+      warehouse_id: draftFilters.warehouse_id,
       created_from: draftFilters.created_from,
       created_to: draftFilters.created_to,
     };
@@ -333,13 +366,25 @@ export default function FinanceMoneyPage() {
       <div className="rounded-2xl border border-gray-200 bg-white px-5 py-6 dark:border-gray-800 dark:bg-white/[0.03]">
         <h3 className="mb-4 font-semibold text-gray-800 text-theme-xl dark:text-white/90">Приход денег по заказам</h3>
         <div className="mb-4 rounded-xl border border-gray-200 p-4 dark:border-gray-800">
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-4">
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-5">
             <input
               className="h-10 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
               value={draftFilters.amount}
               onChange={(e) => setDraftFilters((prev) => ({ ...prev, amount: e.target.value }))}
               placeholder="Сумма (от)"
             />
+            <select
+              className="h-10 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
+              value={draftFilters.warehouse_id}
+              onChange={(e) => setDraftFilters((prev) => ({ ...prev, warehouse_id: e.target.value }))}
+            >
+              <option value="">Склад</option>
+              {warehouseOptions.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.name}
+                </option>
+              ))}
+            </select>
             <DatePicker
               id="finance-money-date-range"
               mode="range"
@@ -405,6 +450,11 @@ export default function FinanceMoneyPage() {
                         </td>
                         <td className="px-5 py-4 text-start text-theme-sm text-gray-500 dark:text-gray-400">
                           {new Date(order.created_at).toLocaleString()}
+                          {order.warehouse_id ? (
+                            <div className="text-xs text-gray-500 dark:text-gray-400">
+                              Склад: {warehouseNameById[order.warehouse_id] || order.warehouse_id}
+                            </div>
+                          ) : null}
                         </td>
                         <td className="px-5 py-4 text-start text-theme-sm text-gray-800 dark:text-white/90">
                           {(financeTotalByOrder[order.id] || 0).toFixed(2)} RUB

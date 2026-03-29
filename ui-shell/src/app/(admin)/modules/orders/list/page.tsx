@@ -19,7 +19,7 @@ import {
 type OrderItem = {
   id: string;
   order_number?: number | null;
-  status?: string;
+  status: string;
   order_kind: string;
   service_category_id: string | null;
   service_object_id: string | null;
@@ -78,6 +78,12 @@ type PrintFormListItem = {
   category_id?: string | null;
   category_name?: string;
   updated_at: string;
+};
+
+type WarehouseInfo = {
+  name: string;
+  address: string;
+  point_phone: string;
 };
 
 type ListFilters = {
@@ -162,6 +168,7 @@ export default function OrdersListPage() {
   const [financeLoadingByOrder, setFinanceLoadingByOrder] = useState<Record<string, boolean>>({});
   const [financeErrorByOrder, setFinanceErrorByOrder] = useState<Record<string, string>>({});
   const [warehouseNameById, setWarehouseNameById] = useState<Record<string, string>>({});
+  const [warehouseById, setWarehouseById] = useState<Record<string, WarehouseInfo>>({});
   const [categoryNameById, setCategoryNameById] = useState<Record<string, string>>({});
   const [serviceObjectNameById, setServiceObjectNameById] = useState<Record<string, string>>({});
   const [workTypeNameById, setWorkTypeNameById] = useState<Record<string, string>>({});
@@ -412,6 +419,21 @@ export default function OrdersListPage() {
     }
   };
 
+  useEffect(() => {
+    for (const order of items) {
+      if (!financeByOrder[order.id] && !financeLoadingByOrder[order.id]) {
+        void loadFinanceLines(order.id);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items]);
+
+  const isOrderPaid = (orderId: string): boolean => {
+    const lines = financeByOrder[orderId] || [];
+    if (!lines.length) return false;
+    return lines.every((line) => !!line.is_paid);
+  };
+
   const loadContactInfo = async (orderId: string, contactId: string) => {
     if (!contactId || contactByOrder[orderId] || contactLoadingByOrder[orderId]) return;
     setContactLoadingByOrder((prev) => ({ ...prev, [orderId]: true }));
@@ -435,27 +457,48 @@ export default function OrdersListPage() {
   };
 
   const renderTemplate = (html: string, ctx: Record<string, string>) => {
-    let out = String(html || "");
-    for (const [k, v] of Object.entries(ctx)) {
-      const re = new RegExp(`\\{\\{\\s*${k.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\s*\\}\\}`, "g");
-      out = out.replace(re, v);
+    const source = String(html || "");
+    const ctxLower: Record<string, string> = {};
+    for (const [k, v] of Object.entries(ctx)) ctxLower[k.toLowerCase()] = String(v ?? "");
+    return source.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_m, keyRaw: string) => {
+      const key = String(keyRaw || "").trim().toLowerCase();
+      return Object.prototype.hasOwnProperty.call(ctxLower, key) ? ctxLower[key] : _m;
+    });
+  };
+
+  const fetchWithRetry = async (url: string, init?: RequestInit, retries = 1, delayMs = 350): Promise<Response> => {
+    try {
+      return await fetch(url, init);
+    } catch (err) {
+      if (retries <= 0) throw err;
+      await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+      return fetchWithRetry(url, init, retries - 1, delayMs);
     }
-    return out;
   };
 
   const onPrintWithForm = async (order: OrderItem, formId: string) => {
     setError(null);
     setPrintDropdownOrderId(null);
+    const w = window.open("about:blank", "_blank");
     try {
-      const [formResp, financeResp, contactResp] = await Promise.all([
-        fetch(`${base}/documents/print/forms/${encodeURIComponent(formId)}`, { cache: "no-store", headers: authHeaders() }),
-        fetch(`${base}/finance/finance/orders/${encodeURIComponent(order.id)}/lines`, { cache: "no-store", headers: authHeaders() }),
+      if (!w) throw new Error("popup blocked");
+      w.document.open();
+      w.document.write(`<!doctype html><html><head><meta charset="utf-8"/><title>Документ</title></head><body>Loading...</body></html>`);
+      w.document.close();
+
+      const [formResp, financeResp, contactResp, creatorResp] = await Promise.all([
+        fetchWithRetry(`${base}/documents/print/forms/${encodeURIComponent(formId)}`, { cache: "no-store", headers: authHeaders() }),
+        fetchWithRetry(`${base}/finance/finance/orders/${encodeURIComponent(order.id)}/lines`, { cache: "no-store", headers: authHeaders() }),
         order.contact_uuid
-          ? fetch(`${base}/contacts/contacts/${encodeURIComponent(order.contact_uuid)}`, {
+          ? fetchWithRetry(`${base}/contacts/contacts/${encodeURIComponent(order.contact_uuid)}`, {
               cache: "no-store",
               headers: authHeaders(),
             })
           : Promise.resolve(null as any),
+        fetchWithRetry(`${base}/orders/orders/${encodeURIComponent(order.id)}/creator`, {
+          cache: "no-store",
+          headers: authHeaders(),
+        }),
       ]);
 
       if (!formResp.ok) {
@@ -470,10 +513,16 @@ export default function OrdersListPage() {
         const body = await contactResp.text().catch(() => "");
         throw new Error(`contact load failed: ${contactResp.status} ${body}`);
       }
+      if (!creatorResp.ok) {
+        const body = await creatorResp.text().catch(() => "");
+        throw new Error(`creator load failed: ${creatorResp.status} ${body}`);
+      }
 
       const form = await formResp.json();
       const financeLines = (await financeResp.json()) as FinanceLine[];
       const contact = contactResp ? await contactResp.json() : null;
+      const creator = (await creatorResp.json()) as CreatorInfo;
+      const printTitle = String(form?.title || "Документ").trim() || "Документ";
 
       const workTypesText =
         (order.work_type_ids || []).map((id) => workTypeNameById[id] || id).join(", ") || "-";
@@ -483,6 +532,7 @@ export default function OrdersListPage() {
       const linesText = (financeLines || [])
         .map((l) => `${workTypeNameById[l.work_type_uuid] || l.work_type_uuid}: ${l.amount} ${l.currency || "RUB"}`)
         .join("\n");
+      const linesTextHtml = linesText.replace(/\n/g, "<br/>");
 
       const ctx: Record<string, string> = {
         contact_name: String(contact?.name || "-"),
@@ -490,36 +540,57 @@ export default function OrdersListPage() {
         contact_email: String(contact?.email || ""),
         order_id: String(order.id || ""),
         order_number: String(order.order_number ?? ""),
-        order_status: String(order.status || "Новый"),
+        order_status: String(order.status),
         order_kind: orderKindLabel(order.order_kind),
         order_created_at: formatOrderDateAndTime(order.created_at).date,
+        user_name: String(creatorDisplayName(creator) || "-"),
+        user_login: String(creator?.username || creator?.email || "-"),
         service_category_name: String(categoryNameById[order.service_category_id || ""] || "-"),
         service_object_name: String(serviceObjectNameById[order.service_object_id || ""] || "-"),
         serial_model: String(order.serial_model || ""),
         work_types: workTypesText,
         warehouse_name: String(warehouseNameById[order.warehouse_id || ""] || "-"),
+        warehouse_address: String(warehouseById[order.warehouse_id || ""]?.address || "-"),
+        warehouse_point_phone: String(warehouseById[order.warehouse_id || ""]?.point_phone || "-"),
         payment_method: paymentMethod,
         is_paid: isPaid,
         total_amount: String(totalAmount),
-        lines_text: linesText,
+        lines_text: linesTextHtml,
       };
 
       const html = renderTemplate(String(form?.content_html || ""), ctx);
-      const w = window.open("", "_blank", "noopener,noreferrer");
-      if (!w) throw new Error("popup blocked");
       w.document.open();
-      w.document.write(`<!doctype html><html><head><meta charset="utf-8"/><title>Print</title>
+      w.document.write(`<!doctype html><html><head><meta charset="utf-8"/><title>${printTitle}</title>
         <style>
-          body{font-family:Arial, sans-serif; padding:24px;}
+          body{font-family:Arial, sans-serif; padding:0; margin:0;}
+          .print-root{padding:24px;}
           img{max-width:100%;}
-          @page { margin: 12mm; }
+          @page { margin: 8mm; }
         </style>
-      </head><body>${html}</body></html>`);
+      </head><body><div class="print-root">${html}</div></body></html>`);
       w.document.close();
+      try {
+        w.history.replaceState({}, "", "/print-preview");
+      } catch {
+        // ignore
+      }
       w.focus();
       setTimeout(() => w.print(), 300);
     } catch (e: any) {
       setError(e?.message || "print failed");
+      if (w) {
+        try {
+          w.document.open();
+          w.document.write(
+            `<!doctype html><html><head><meta charset="utf-8"/><title>Документ</title></head><body>Error: ${String(
+              e?.message || "print failed"
+            )}</body></html>`
+          );
+          w.document.close();
+        } catch {
+          // ignore
+        }
+      }
     }
   };
 
@@ -553,10 +624,22 @@ export default function OrdersListPage() {
           headers: authHeaders(),
         });
         if (!resp.ok) return;
-        const rows = (await resp.json()) as Array<{ id: string; name: string }>;
-        const next: Record<string, string> = {};
-        for (const row of rows || []) next[row.id] = row.name;
-        setWarehouseNameById(next);
+        const rows = (await resp.json()) as Array<{ id: string; name: string; address?: string; point_phone?: string }>;
+        const nextNames: Record<string, string> = {};
+        const nextMap: Record<string, WarehouseInfo> = {};
+        for (const row of rows || []) {
+          const id = String(row.id || "");
+          if (!id) continue;
+          const name = String(row.name || "");
+          nextNames[id] = name;
+          nextMap[id] = {
+            name,
+            address: String(row.address || ""),
+            point_phone: String(row.point_phone || ""),
+          };
+        }
+        setWarehouseNameById(nextNames);
+        setWarehouseById(nextMap);
       } catch {
         // ignore
       }
@@ -710,6 +793,12 @@ export default function OrdersListPage() {
                     >
                       Дата создания
                     </TableCell>
+                    <TableCell
+                      isHeader
+                      className="px-5 py-3 font-medium text-gray-500 text-start text-theme-xs dark:text-gray-400"
+                    >
+                      Оплата
+                    </TableCell>
                   </TableRow>
                 </TableHeader>
                 <TableBody className="divide-y divide-gray-100 dark:divide-white/[0.05]">
@@ -727,11 +816,11 @@ export default function OrdersListPage() {
                             <span
                               className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium"
                               style={{
-                                backgroundColor: statusColorByName[order.status || ""] || "#22c55e",
-                                color: textColorForBg(statusColorByName[order.status || ""] || "#22c55e"),
+                                backgroundColor: statusColorByName[order.status] || "#22c55e",
+                                color: textColorForBg(statusColorByName[order.status] || "#22c55e"),
                               }}
                             >
-                              {order.status || "Новый"}
+                              {order.status}
                             </span>
                             <span
                               className="group relative inline-flex items-center justify-center w-5 h-5 rounded-full border border-gray-300 text-xs text-gray-600 dark:border-gray-600 dark:text-gray-300 cursor-help"
@@ -763,22 +852,37 @@ export default function OrdersListPage() {
                           {formatOrderDateAndTime(order.created_at).date} (
                           {orderKindLabel(order.order_kind)} {formatOrderDateAndTime(order.created_at).time})
                         </td>
+                        <td className="px-5 py-4 text-start text-theme-sm">
+                          {financeLoadingByOrder[order.id] && !financeByOrder[order.id] ? (
+                            <span className="text-gray-500 dark:text-gray-400">...</span>
+                          ) : isOrderPaid(order.id) ? (
+                            <span className="inline-flex items-center gap-1 text-green-600 dark:text-green-400">
+                              <span aria-hidden>✓</span>
+                              <span>Оплачен</span>
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-red-600 dark:text-red-400">
+                              <span aria-hidden>✗</span>
+                              <span>Не оплачен</span>
+                            </span>
+                          )}
+                        </td>
                       </tr>
                       {openOrderId === order.id && (
                         <tr>
-                          <td className="px-5 py-4 text-start text-theme-sm text-gray-700 dark:text-gray-300" colSpan={3}>
+                          <td className="px-5 py-4 text-start text-theme-sm text-gray-700 dark:text-gray-300" colSpan={4}>
                             <div className="space-y-3">
                               <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Основные данные</div>
                               <div className="flex items-center gap-2">
                                 <span>Статус:</span>
                                 <select
                                   className="h-9 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
-                                  value={order.status || "Новый"}
+                                  value={order.status}
                                   disabled={!!statusSavingByOrder[order.id]}
                                   onChange={(e) => void onChangeStatus(order.id, e.target.value)}
                                 >
                                   {!statusOptions.length ? (
-                                    <option value={order.status || "Новый"}>{order.status || "Новый"}</option>
+                                    <option value={order.status}>{order.status}</option>
                                   ) : (
                                     statusOptions.map((s) => (
                                       <option key={s.id} value={s.name}>

@@ -1215,23 +1215,6 @@ export default function OrdersCreatePage() {
             </div>
           )}
 
-          {serviceObjectId && (
-            <div>
-              <Label>Выбранная цепочка</Label>
-              <Input
-                value={`${
-                  orderKinds.find((x) => x.id === orderKind)?.label || "-"
-                } -> ${categories.find((x) => x.id === categoryId)?.name || "-"} -> ${
-                  selectedWorkTypeLabels.join(", ") || "-"
-                } -> ${serviceObjectLabel || "-"}
-                ${serialModel ? ` -> ${serialModel}` : ""}
-                ${relatedModulesSummary ? ` -> ${relatedModulesSummary}` : ""}
-                `}
-                disabled
-              />
-            </div>
-          )}
-
           {error && <div className="text-sm text-red-600">Ошибка: {error}</div>}
           {createSuccess && <div className="text-sm text-green-600">{createSuccess}</div>}
         </div>

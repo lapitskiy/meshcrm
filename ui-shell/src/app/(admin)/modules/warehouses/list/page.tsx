@@ -9,6 +9,8 @@ import React, { useEffect, useMemo, useState } from "react";
 type Warehouse = {
   id: string;
   name: string;
+  address: string;
+  point_phone: string;
   created_at: string;
   updated_at: string;
 };
@@ -21,11 +23,15 @@ export default function WarehousesListPage() {
   const base = useMemo(() => getGatewayBaseUrl(), []);
   const [items, setItems] = useState<Warehouse[]>([]);
   const [newName, setNewName] = useState("");
+  const [newAddress, setNewAddress] = useState("");
+  const [newPointPhone, setNewPointPhone] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [editingId, setEditingId] = useState<string>("");
   const [editingName, setEditingName] = useState<string>("");
+  const [editingAddress, setEditingAddress] = useState<string>("");
+  const [editingPointPhone, setEditingPointPhone] = useState<string>("");
 
   const authHeaders = () => {
     const token = getToken();
@@ -59,13 +65,19 @@ export default function WarehousesListPage() {
       const resp = await fetch(`${base}/warehouses/warehouses`, {
         method: "POST",
         headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ name: newName }),
+        body: JSON.stringify({
+          name: newName,
+          address: newAddress,
+          point_phone: newPointPhone,
+        }),
       });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
         throw new Error(`create failed: ${resp.status} ${body}`);
       }
       setNewName("");
+      setNewAddress("");
+      setNewPointPhone("");
       await load();
     } catch (e: any) {
       setError(e?.message || "create failed");
@@ -77,11 +89,15 @@ export default function WarehousesListPage() {
   const onStartEdit = (w: Warehouse) => {
     setEditingId(w.id);
     setEditingName(w.name);
+    setEditingAddress(w.address || "");
+    setEditingPointPhone(w.point_phone || "");
   };
 
   const onCancelEdit = () => {
     setEditingId("");
     setEditingName("");
+    setEditingAddress("");
+    setEditingPointPhone("");
   };
 
   const onSaveEdit = async () => {
@@ -92,7 +108,11 @@ export default function WarehousesListPage() {
       const resp = await fetch(`${base}/warehouses/warehouses/${encodeURIComponent(editingId)}`, {
         method: "PUT",
         headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ name: editingName }),
+        body: JSON.stringify({
+          name: editingName,
+          address: editingAddress,
+          point_phone: editingPointPhone,
+        }),
       });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
@@ -142,6 +162,14 @@ export default function WarehousesListPage() {
               <Label>Название</Label>
               <Input value={newName} onChange={(e: any) => setNewName(e.target.value)} placeholder="Например: Склад №1" />
             </div>
+            <div>
+              <Label>Адрес</Label>
+              <Input value={newAddress} onChange={(e: any) => setNewAddress(e.target.value)} placeholder="Например: г. Алматы, ул. Абая, 10" />
+            </div>
+            <div>
+              <Label>Телефон точки</Label>
+              <Input value={newPointPhone} onChange={(e: any) => setNewPointPhone(e.target.value)} placeholder="+7 777 123 45 67" />
+            </div>
             <Button size="sm" disabled={busy || !newName.trim()} onClick={onCreate}>
               Добавить
             </Button>
@@ -161,9 +189,17 @@ export default function WarehousesListPage() {
                 >
                   <div className="flex-1">
                     {editingId === w.id ? (
-                      <Input value={editingName} onChange={(e: any) => setEditingName(e.target.value)} />
+                      <div className="space-y-2">
+                        <Input value={editingName} onChange={(e: any) => setEditingName(e.target.value)} placeholder="Название" />
+                        <Input value={editingAddress} onChange={(e: any) => setEditingAddress(e.target.value)} placeholder="Адрес" />
+                        <Input value={editingPointPhone} onChange={(e: any) => setEditingPointPhone(e.target.value)} placeholder="Телефон точки" />
+                      </div>
                     ) : (
-                      <div className="text-sm text-gray-800 dark:text-white/90">{w.name}</div>
+                      <div>
+                        <div className="text-sm text-gray-800 dark:text-white/90">{w.name}</div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400">{w.address}</div>
+                        <div className="text-xs text-gray-500 dark:text-gray-400">{w.point_phone}</div>
+                      </div>
                     )}
                   </div>
                   <div className="flex gap-2">

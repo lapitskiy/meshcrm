@@ -9,7 +9,7 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Link from "@tiptap/extension-link";
 import Image from "@tiptap/extension-image";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 type PrintVariable = {
   module_name: string;
@@ -38,6 +38,7 @@ export default function PrintCreateFormPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedId, setSavedId] = useState<string | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
 
   const authHeaders = () => {
     const token = getToken();
@@ -48,7 +49,7 @@ export default function PrintCreateFormPage() {
     extensions: [
       StarterKit,
       Link.configure({ openOnClick: false }),
-      Image.configure({ allowBase64: false }),
+      Image.configure({ allowBase64: true }),
     ],
     content: "<p></p>",
     editorProps: {
@@ -121,6 +122,33 @@ export default function PrintCreateFormPage() {
     const url = window.prompt("URL изображения");
     if (!url) return;
     editor.chain().focus().setImage({ src: url.trim() }).run();
+  };
+
+  const onPickImageFile = () => {
+    imageInputRef.current?.click();
+  };
+
+  const onImageFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!editor || !file) return;
+    if (!file.type.startsWith("image/")) {
+      setError("Можно загрузить только изображение");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const src = String(reader.result || "");
+      if (!src.startsWith("data:image/")) {
+        setError("Не удалось прочитать изображение");
+        return;
+      }
+      editor.chain().focus().setImage({ src }).run();
+    };
+    reader.onerror = () => {
+      setError("Ошибка чтения файла изображения");
+    };
+    reader.readAsDataURL(file);
   };
 
   const onSave = async () => {
@@ -238,6 +266,14 @@ export default function PrintCreateFormPage() {
             >
               Image URL
             </button>
+            <button
+              className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+              onClick={onPickImageFile}
+              disabled={!editor}
+            >
+              Upload image
+            </button>
+            <input ref={imageInputRef} type="file" accept="image/*" className="hidden" onChange={onImageFileChange} />
           </div>
 
           <EditorContent editor={editor} />

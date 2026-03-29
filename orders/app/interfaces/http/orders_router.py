@@ -27,6 +27,7 @@ class OrderCreateIn(BaseModel):
     warehouse_id: UUID | None = None
     contact_uuid: UUID | None = None
     related_modules: dict = Field(default_factory=dict)
+    status: str | None = Field(default=None, max_length=120)
 
 
 class OrderOut(BaseModel):
@@ -69,6 +70,38 @@ class OrderCreatorOut(BaseModel):
     full_name: str = ""
 
 
+def _normalize_status_value(raw_status: object) -> str:
+    status = str(raw_status or "").strip()
+    if not status:
+        raise HTTPException(status_code=500, detail="order status is missing")
+    return status
+
+
+def _ensure_status_exists(cur, status: str) -> None:
+    cur.execute("SELECT 1 FROM statuses WHERE name = %s LIMIT 1", (status,))
+    if cur.fetchone() is None:
+        raise HTTPException(status_code=400, detail=f"status '{status}' does not exist in settings")
+
+
+def _resolve_initial_status(cur, explicit_status: str | None) -> str:
+    candidate = str(explicit_status or "").strip()
+    if candidate:
+        _ensure_status_exists(cur, candidate)
+        return candidate
+    cur.execute(
+        """
+        SELECT name
+        FROM statuses
+        ORDER BY sort_order ASC, created_at ASC
+        LIMIT 1
+        """
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=400, detail="statuses are not configured")
+    return _normalize_status_value(row[0])
+
+
 def _user_uuid_from_headers(request: Request) -> str | None:
     value = str(request.headers.get("x-user-uuid", "")).strip()
     return value or None
@@ -103,13 +136,14 @@ def create_order(payload: OrderCreateIn, request: Request) -> OrderOut:
     try:
         conn = get_connection()
         with conn.cursor() as cur:
+            initial_status = _resolve_initial_status(cur, payload.status)
             cur.execute(
                 """
                 INSERT INTO orders (
                   id, order_kind, service_category_id, service_object_id, serial_model,
-                  work_type_ids, warehouse_id, contact_uuid, related_modules, created_by_uuid
+                  work_type_ids, warehouse_id, contact_uuid, related_modules, created_by_uuid, status
                 )
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s, %s)
                 RETURNING
                   id, order_number, status, order_kind, service_category_id, service_object_id, serial_model,
                   work_type_ids, warehouse_id, contact_uuid, related_modules, created_by_uuid, created_at
@@ -125,21 +159,23 @@ def create_order(payload: OrderCreateIn, request: Request) -> OrderOut:
                     payload.contact_uuid,
                     json.dumps(payload.related_modules or {}),
                     _user_uuid_from_headers(request),
+                    initial_status,
                 ),
             )
             row = cur.fetchone()
+            stored_status = _normalize_status_value(row[2])
             cur.execute(
                 """
                 INSERT INTO order_status_history (id, order_id, status)
                 VALUES (%s, %s, %s)
                 """,
-                (uuid4(), row[0], row[2] or "Новый"),
+                (uuid4(), row[0], stored_status),
             )
         conn.commit()
         return OrderOut(
             id=row[0],
             order_number=row[1],
-            status=row[2] or "Новый",
+            status=stored_status,
             order_kind=row[3],
             service_category_id=row[4],
             service_object_id=row[5],
@@ -169,12 +205,13 @@ def update_order_status(order_id: UUID, payload: OrderStatusUpdateIn) -> OrderOu
             raise HTTPException(status_code=400, detail="status must not be empty")
         conn = get_connection()
         with conn.cursor() as cur:
+            _ensure_status_exists(cur, next_status)
             cur.execute("SELECT status FROM orders WHERE id = %s", (order_id,))
             current = cur.fetchone()
             if not current:
                 conn.rollback()
                 raise HTTPException(status_code=404, detail="order not found")
-            current_status = str(current[0] or "Новый")
+            current_status = _normalize_status_value(current[0])
             if current_status == next_status:
                 cur.execute(
                     """
@@ -187,10 +224,11 @@ def update_order_status(order_id: UUID, payload: OrderStatusUpdateIn) -> OrderOu
                     (order_id,),
                 )
                 same_row = cur.fetchone()
+                same_status = _normalize_status_value(same_row[2])
                 return OrderOut(
                     id=same_row[0],
                     order_number=same_row[1],
-                    status=same_row[2] or "Новый",
+                    status=same_status,
                     order_kind=same_row[3],
                     service_category_id=same_row[4],
                     service_object_id=same_row[5],
@@ -214,6 +252,7 @@ def update_order_status(order_id: UUID, payload: OrderStatusUpdateIn) -> OrderOu
                 (next_status, order_id),
             )
             row = cur.fetchone()
+            updated_status = _normalize_status_value(row[2])
             cur.execute(
                 """
                 INSERT INTO order_status_history (id, order_id, status)
@@ -225,7 +264,7 @@ def update_order_status(order_id: UUID, payload: OrderStatusUpdateIn) -> OrderOu
         return OrderOut(
             id=row[0],
             order_number=row[1],
-            status=row[2] or "Новый",
+            status=updated_status,
             order_kind=row[3],
             service_category_id=row[4],
             service_object_id=row[5],
@@ -320,6 +359,7 @@ def list_orders(
     order_kind: str | None = None,
     service_category_id: UUID | None = None,
     work_type_id: UUID | None = None,
+    warehouse_id: UUID | None = None,
     search: str | None = None,
     created_from: str | None = None,  # YYYY-MM-DD
     created_to: str | None = None,  # YYYY-MM-DD
@@ -349,6 +389,9 @@ def list_orders(
                 """
             )
             params.append(work_type_id)
+        if warehouse_id:
+            where_parts.append("o.warehouse_id = %s")
+            params.append(warehouse_id)
         if search and str(search).strip():
             term = f"%{str(search).strip()}%"
             where_parts.append(
@@ -409,7 +452,7 @@ def list_orders(
             OrderOut(
                 id=row[0],
                 order_number=row[1],
-                status=row[2] or "Новый",
+                status=_normalize_status_value(row[2]),
                 order_kind=row[3],
                 service_category_id=row[4],
                 service_object_id=row[5],

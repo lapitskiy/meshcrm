@@ -91,11 +91,15 @@ def init_db() -> None:
                   ('orders', 'service_object_name', 'Объект ремонта/услуги'),
                   ('orders', 'serial_model', 'Серийный/Модель'),
                   ('orders', 'work_types', 'Виды работ (список)'),
+                  ('orders', 'user_name', 'Имя пользователя (мастера)'),
+                  ('orders', 'user_login', 'Логин пользователя (мастера)'),
                   ('finance', 'payment_method', 'Способ оплаты'),
                   ('finance', 'is_paid', 'Оплачен заказ (Да/Нет)'),
                   ('finance', 'lines_text', 'Строки оплаты (текст)'),
                   ('finance', 'total_amount', 'Итого сумма'),
-                  ('warehouses', 'warehouse_name', 'Склад/точка')
+                  ('warehouses', 'warehouse_name', 'Склад/точка'),
+                  ('warehouses', 'warehouse_address', 'Адрес склада/точки'),
+                  ('warehouses', 'warehouse_point_phone', 'Телефон склада/точки')
                 ON CONFLICT (module_name, var_key) DO NOTHING;
                 """
             )

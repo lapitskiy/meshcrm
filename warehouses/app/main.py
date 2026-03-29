@@ -39,11 +39,15 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS warehouses (
               id UUID PRIMARY KEY,
               name TEXT NOT NULL UNIQUE,
+              address TEXT NOT NULL DEFAULT '',
+              point_phone TEXT NOT NULL DEFAULT '',
               created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
               updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
+        cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS address TEXT NOT NULL DEFAULT ''")
+        cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS point_phone TEXT NOT NULL DEFAULT ''")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS warehouse_access (
@@ -60,11 +64,15 @@ def init_db() -> None:
 
 class WarehouseIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
+    address: str | None = Field(default=None, max_length=500)
+    point_phone: str | None = Field(default=None, max_length=100)
 
 
 class WarehouseOut(BaseModel):
     id: uuid.UUID
     name: str
+    address: str
+    point_phone: str
     created_at: datetime
     updated_at: datetime
 
@@ -163,11 +171,11 @@ def list_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
     is_admin = bool(roles_from_headers(request).intersection(ACCESS_ADMIN_ROLES))
     with db() as conn, conn.cursor() as cur:
         if is_admin:
-            cur.execute("SELECT id, name, created_at, updated_at FROM warehouses ORDER BY created_at DESC")
+            cur.execute("SELECT id, name, address, point_phone, created_at, updated_at FROM warehouses ORDER BY created_at DESC")
         else:
             cur.execute(
                 """
-                SELECT w.id, w.name, w.created_at, w.updated_at
+                SELECT w.id, w.name, w.address, w.point_phone, w.created_at, w.updated_at
                 FROM warehouses w
                 WHERE EXISTS (
                   SELECT 1
@@ -185,7 +193,7 @@ def list_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
             )
         rows = cur.fetchall()
     return [
-        WarehouseOut(id=row[0], name=row[1], created_at=row[2], updated_at=row[3])  # type: ignore[arg-type]
+        WarehouseOut(id=row[0], name=row[1], address=row[2], point_phone=row[3], created_at=row[4], updated_at=row[5])  # type: ignore[arg-type]
         for row in rows
     ]
 
@@ -196,7 +204,7 @@ def list_accessible_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT w.id, w.name, w.created_at, w.updated_at
+            SELECT w.id, w.name, w.address, w.point_phone, w.created_at, w.updated_at
             FROM warehouses w
             JOIN warehouse_access wa ON wa.warehouse_id = w.id
             WHERE wa.user_uuid = %s
@@ -206,7 +214,7 @@ def list_accessible_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
         )
         rows = cur.fetchall()
     return [
-        WarehouseOut(id=row[0], name=row[1], created_at=row[2], updated_at=row[3])  # type: ignore[arg-type]
+        WarehouseOut(id=row[0], name=row[1], address=row[2], point_phone=row[3], created_at=row[4], updated_at=row[5])  # type: ignore[arg-type]
         for row in rows
     ]
 
@@ -215,10 +223,10 @@ def list_accessible_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
 def list_warehouses_admin(request: FastAPIRequest) -> list[WarehouseOut]:
     require_access_admin(request)
     with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, name, created_at, updated_at FROM warehouses ORDER BY created_at DESC")
+        cur.execute("SELECT id, name, address, point_phone, created_at, updated_at FROM warehouses ORDER BY created_at DESC")
         rows = cur.fetchall()
     return [
-        WarehouseOut(id=row[0], name=row[1], created_at=row[2], updated_at=row[3])  # type: ignore[arg-type]
+        WarehouseOut(id=row[0], name=row[1], address=row[2], point_phone=row[3], created_at=row[4], updated_at=row[5])  # type: ignore[arg-type]
         for row in rows
     ]
 
@@ -227,17 +235,19 @@ def list_warehouses_admin(request: FastAPIRequest) -> list[WarehouseOut]:
 def create_warehouse(body: WarehouseIn, request: FastAPIRequest) -> WarehouseOut:
     user_uuid = require_user_uuid(request)
     name = body.name.strip()
+    address = (body.address or "").strip()
+    point_phone = (body.point_phone or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="name must not be empty")
     with db() as conn, conn.cursor() as cur:
         try:
             cur.execute(
                 """
-                INSERT INTO warehouses (id, name, created_at, updated_at)
-                VALUES (%s, %s, NOW(), NOW())
-                RETURNING id, name, created_at, updated_at
+                INSERT INTO warehouses (id, name, address, point_phone, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, NOW(), NOW())
+                RETURNING id, name, address, point_phone, created_at, updated_at
                 """,
-                (uuid.uuid4(), name),
+                (uuid.uuid4(), name, address, point_phone),
             )
             row = cur.fetchone()
             cur.execute(
@@ -250,7 +260,7 @@ def create_warehouse(body: WarehouseIn, request: FastAPIRequest) -> WarehouseOut
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return WarehouseOut(id=row[0], name=row[1], created_at=row[2], updated_at=row[3])  # type: ignore[arg-type]
+    return WarehouseOut(id=row[0], name=row[1], address=row[2], point_phone=row[3], created_at=row[4], updated_at=row[5])  # type: ignore[arg-type]
 
 
 @app.put("/warehouses/{warehouse_id}", response_model=WarehouseOut)
@@ -258,6 +268,8 @@ def update_warehouse(warehouse_id: uuid.UUID, body: WarehouseIn, request: FastAP
     user_uuid = require_user_uuid(request)
     is_admin = bool(roles_from_headers(request).intersection(ACCESS_ADMIN_ROLES))
     name = body.name.strip()
+    address = body.address.strip() if body.address is not None else None
+    point_phone = body.point_phone.strip() if body.point_phone is not None else None
     if not name:
         raise HTTPException(status_code=400, detail="name must not be empty")
     with db() as conn, conn.cursor() as cur:
@@ -275,16 +287,16 @@ def update_warehouse(warehouse_id: uuid.UUID, body: WarehouseIn, request: FastAP
         cur.execute(
             """
             UPDATE warehouses
-            SET name=%s, updated_at=NOW()
+            SET name=%s, address=COALESCE(%s, address), point_phone=COALESCE(%s, point_phone), updated_at=NOW()
             WHERE id=%s
-            RETURNING id, name, created_at, updated_at
+            RETURNING id, name, address, point_phone, created_at, updated_at
             """,
-            (name, warehouse_id),
+            (name, address, point_phone, warehouse_id),
         )
         row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="warehouse not found")
-    return WarehouseOut(id=row[0], name=row[1], created_at=row[2], updated_at=row[3])  # type: ignore[arg-type]
+    return WarehouseOut(id=row[0], name=row[1], address=row[2], point_phone=row[3], created_at=row[4], updated_at=row[5])  # type: ignore[arg-type]
 
 
 @app.delete("/warehouses/{warehouse_id}", status_code=204)

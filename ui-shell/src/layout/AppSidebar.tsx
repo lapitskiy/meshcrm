@@ -2,6 +2,7 @@
 import React, { useEffect, useRef, useState,useCallback } from "react";
 import Link from "next/link";
 import Image from "next/image";
+import logoPng from "@/app/logo.png";
 import { usePathname } from "next/navigation";
 import { useSidebar } from "../context/SidebarContext";
 import { getGatewayBaseUrl } from "@/lib/gateway";
@@ -473,14 +474,14 @@ const AppSidebar: React.FC = () => {
             <>
               <Image
                 className="dark:hidden"
-                src="/images/logo/logo.svg"
+                src={logoPng}
                 alt="Logo"
                 width={150}
                 height={40}
               />
               <Image
                 className="hidden dark:block"
-                src="/images/logo/logo-dark.svg"
+                src={logoPng}
                 alt="Logo"
                 width={150}
                 height={40}
@@ -507,9 +508,7 @@ const AppSidebar: React.FC = () => {
                     : "justify-start"
                 }`}
               >
-                {isExpanded || isHovered || isMobileOpen ? (
-                  "Menu"
-                ) : (
+                {isExpanded || isHovered || isMobileOpen ? null : (
                   <HorizontaLDots />
                 )}
               </h2>
