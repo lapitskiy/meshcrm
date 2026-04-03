@@ -18,6 +18,7 @@ type OrderItem = {
   order_number?: number | null;
   status?: string;
   warehouse_id?: string | null;
+  related_modules?: Record<string, Record<string, string>>;
   created_at: string;
 };
 
@@ -84,6 +85,7 @@ export default function FinanceMoneyPage() {
   const [items, setItems] = useState<OrderItem[]>([]);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [openOrderId, setOpenOrderId] = useState<string | null>(null);
@@ -99,6 +101,7 @@ export default function FinanceMoneyPage() {
   const [workTypeNameById, setWorkTypeNameById] = useState<Record<string, string>>({});
   const [warehouseOptions, setWarehouseOptions] = useState<WarehouseOption[]>([]);
   const [warehouseNameById, setWarehouseNameById] = useState<Record<string, string>>({});
+  const [moneyVisibleRelatedModules, setMoneyVisibleRelatedModules] = useState<string[]>([]);
   const [draftFilters, setDraftFilters] = useState<MoneyFilters>({
     amount: "",
     paid: "",
@@ -156,14 +159,15 @@ export default function FinanceMoneyPage() {
     setLineDraftById(nextDrafts);
   };
 
-  const load = async (targetPage: number, searchArg?: string, filtersArg?: MoneyFilters) => {
+  const load = async (targetPage: number, searchArg?: string, filtersArg?: MoneyFilters, pageSizeArg?: number) => {
     setLoading(true);
     setError(null);
     try {
       const f = filtersArg || appliedFilters;
+      const effectivePageSize = pageSizeArg || pageSize;
       const qs = new URLSearchParams();
       qs.set("page", String(targetPage));
-      qs.set("page_size", "20");
+      qs.set("page_size", String(effectivePageSize));
       const s = String(searchArg ?? appliedSearch).trim();
       if (s) qs.set("search", s);
       if (f.warehouse_id) qs.set("warehouse_id", f.warehouse_id);
@@ -181,6 +185,9 @@ export default function FinanceMoneyPage() {
       const rows = data.items || [];
       setItems(rows);
       setPage(data.page || targetPage);
+      if (Number.isFinite(Number(data.page_size)) && Number(data.page_size) > 0) {
+        setPageSize(Number(data.page_size));
+      }
       setTotalPages(data.total_pages || 1);
       if (pendingOpenOrderId && rows.some((x) => x.id === pendingOpenOrderId)) {
         setOpenOrderId(pendingOpenOrderId);
@@ -253,6 +260,26 @@ export default function FinanceMoneyPage() {
         for (const row of rows || []) nextMap[String(row.id)] = String(row.name || "");
         setWarehouseOptions(rows || []);
         setWarehouseNameById(nextMap);
+      } catch {
+        // ignore
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const resp = await fetch(`${base}/finance/finance/settings`, {
+          cache: "no-store",
+          headers: authHeaders(),
+        });
+        if (!resp.ok) return;
+        const payload = (await resp.json()) as { money_visible_related_modules?: string[] };
+        const normalized = Array.from(
+          new Set((payload.money_visible_related_modules || []).map((x) => String(x || "").trim().toLowerCase()).filter(Boolean))
+        );
+        setMoneyVisibleRelatedModules(normalized);
       } catch {
         // ignore
       }
@@ -341,13 +368,21 @@ export default function FinanceMoneyPage() {
     return (items || []).filter((order) => {
       const total = Number(financeTotalByOrder[order.id] || 0);
       if (hasAmount && !(total >= amountMin)) return false;
+      if (moneyVisibleRelatedModules.length > 0 && !moneyVisibleRelatedModules.includes("orders")) return false;
       if (!appliedFilters.paid) return true;
       const lines = financeByOrder[order.id] || [];
       const allPaid = !!lines.length && lines.every((l) => !!l.is_paid);
       if (appliedFilters.paid === "paid") return allPaid;
       return !allPaid;
     });
-  }, [items, appliedFilters.amount, appliedFilters.paid, financeTotalByOrder, financeByOrder]);
+  }, [
+    items,
+    appliedFilters.amount,
+    appliedFilters.paid,
+    financeTotalByOrder,
+    financeByOrder,
+    moneyVisibleRelatedModules,
+  ]);
 
   const onApplyFilters = async () => {
     const next: MoneyFilters = {
@@ -360,6 +395,10 @@ export default function FinanceMoneyPage() {
     setAppliedFilters(next);
     await load(1, appliedSearch, next);
   };
+
+  const visibleTotalAmount = React.useMemo(() => {
+    return visibleItems.reduce((acc, order) => acc + Number(financeTotalByOrder[order.id] || 0), 0);
+  }, [visibleItems, financeTotalByOrder]);
 
   return (
     <div className="space-y-6">
@@ -569,12 +608,33 @@ export default function FinanceMoneyPage() {
             </div>
           </div>
         )}
+        <div className="mt-4 rounded-lg border border-gray-200 px-4 py-3 text-sm dark:border-gray-800">
+          <span className="text-gray-500 dark:text-gray-400">Сводка по отображаемым заказам:</span>{" "}
+          <span className="font-medium text-gray-800 dark:text-white/90">{visibleTotalAmount.toFixed(2)} RUB</span>
+        </div>
         {!!items.length && (
           <div className="mt-4 flex items-center justify-between">
             <div className="text-sm text-gray-500 dark:text-gray-400">
               Страница {page} из {totalPages}
             </div>
             <div className="flex items-center gap-2">
+              <select
+                className="h-9 rounded-lg border border-gray-300 px-2 text-sm dark:border-gray-700 dark:bg-gray-900"
+                value={String(pageSize)}
+                onChange={(e) => {
+                  const nextSize = Number(e.target.value);
+                  if (!Number.isFinite(nextSize) || nextSize <= 0) return;
+                  setPageSize(nextSize);
+                  void load(1, appliedSearch, appliedFilters, nextSize);
+                }}
+                disabled={loading}
+                title="Заказов на странице"
+              >
+                <option value="10">10</option>
+                <option value="20">20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+              </select>
               <button
                 type="button"
                 className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm disabled:opacity-50 dark:border-gray-700"

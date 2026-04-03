@@ -32,6 +32,17 @@ def db() -> psycopg.Connection:
     return psycopg.connect(DATABASE_URL, autocommit=True)
 
 
+def normalize_svg(value: str | None) -> str | None:
+    if value is None:
+        return None
+    data = value.strip()
+    if not data:
+        return ""
+    if "<svg" not in data.lower():
+        raise HTTPException(status_code=400, detail="invalid svg payload")
+    return data
+
+
 def init_db() -> None:
     with db() as conn, conn.cursor() as cur:
         cur.execute(
@@ -41,6 +52,10 @@ def init_db() -> None:
               name TEXT NOT NULL UNIQUE,
               address TEXT NOT NULL DEFAULT '',
               point_phone TEXT NOT NULL DEFAULT '',
+              qr_site_svg TEXT NOT NULL DEFAULT '',
+              qr_yandex_svg TEXT NOT NULL DEFAULT '',
+              qr_vk_svg TEXT NOT NULL DEFAULT '',
+              qr_telegram_svg TEXT NOT NULL DEFAULT '',
               created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
               updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
@@ -48,6 +63,10 @@ def init_db() -> None:
         )
         cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS address TEXT NOT NULL DEFAULT ''")
         cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS point_phone TEXT NOT NULL DEFAULT ''")
+        cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS qr_site_svg TEXT NOT NULL DEFAULT ''")
+        cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS qr_yandex_svg TEXT NOT NULL DEFAULT ''")
+        cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS qr_vk_svg TEXT NOT NULL DEFAULT ''")
+        cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS qr_telegram_svg TEXT NOT NULL DEFAULT ''")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS warehouse_access (
@@ -66,6 +85,10 @@ class WarehouseIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     address: str | None = Field(default=None, max_length=500)
     point_phone: str | None = Field(default=None, max_length=100)
+    qr_site_svg: str | None = None
+    qr_yandex_svg: str | None = None
+    qr_vk_svg: str | None = None
+    qr_telegram_svg: str | None = None
 
 
 class WarehouseOut(BaseModel):
@@ -73,6 +96,10 @@ class WarehouseOut(BaseModel):
     name: str
     address: str
     point_phone: str
+    qr_site_svg: str
+    qr_yandex_svg: str
+    qr_vk_svg: str
+    qr_telegram_svg: str
     created_at: datetime
     updated_at: datetime
 
@@ -171,11 +198,13 @@ def list_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
     is_admin = bool(roles_from_headers(request).intersection(ACCESS_ADMIN_ROLES))
     with db() as conn, conn.cursor() as cur:
         if is_admin:
-            cur.execute("SELECT id, name, address, point_phone, created_at, updated_at FROM warehouses ORDER BY created_at DESC")
+            cur.execute(
+                "SELECT id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at FROM warehouses ORDER BY created_at DESC"
+            )
         else:
             cur.execute(
                 """
-                SELECT w.id, w.name, w.address, w.point_phone, w.created_at, w.updated_at
+                SELECT w.id, w.name, w.address, w.point_phone, w.qr_site_svg, w.qr_yandex_svg, w.qr_vk_svg, w.qr_telegram_svg, w.created_at, w.updated_at
                 FROM warehouses w
                 WHERE EXISTS (
                   SELECT 1
@@ -193,7 +222,18 @@ def list_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
             )
         rows = cur.fetchall()
     return [
-        WarehouseOut(id=row[0], name=row[1], address=row[2], point_phone=row[3], created_at=row[4], updated_at=row[5])  # type: ignore[arg-type]
+        WarehouseOut(
+            id=row[0],
+            name=row[1],
+            address=row[2],
+            point_phone=row[3],
+            qr_site_svg=row[4],
+            qr_yandex_svg=row[5],
+            qr_vk_svg=row[6],
+            qr_telegram_svg=row[7],
+            created_at=row[8],
+            updated_at=row[9],
+        )  # type: ignore[arg-type]
         for row in rows
     ]
 
@@ -204,7 +244,7 @@ def list_accessible_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT w.id, w.name, w.address, w.point_phone, w.created_at, w.updated_at
+            SELECT w.id, w.name, w.address, w.point_phone, w.qr_site_svg, w.qr_yandex_svg, w.qr_vk_svg, w.qr_telegram_svg, w.created_at, w.updated_at
             FROM warehouses w
             JOIN warehouse_access wa ON wa.warehouse_id = w.id
             WHERE wa.user_uuid = %s
@@ -214,7 +254,18 @@ def list_accessible_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
         )
         rows = cur.fetchall()
     return [
-        WarehouseOut(id=row[0], name=row[1], address=row[2], point_phone=row[3], created_at=row[4], updated_at=row[5])  # type: ignore[arg-type]
+        WarehouseOut(
+            id=row[0],
+            name=row[1],
+            address=row[2],
+            point_phone=row[3],
+            qr_site_svg=row[4],
+            qr_yandex_svg=row[5],
+            qr_vk_svg=row[6],
+            qr_telegram_svg=row[7],
+            created_at=row[8],
+            updated_at=row[9],
+        )  # type: ignore[arg-type]
         for row in rows
     ]
 
@@ -223,10 +274,23 @@ def list_accessible_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
 def list_warehouses_admin(request: FastAPIRequest) -> list[WarehouseOut]:
     require_access_admin(request)
     with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, name, address, point_phone, created_at, updated_at FROM warehouses ORDER BY created_at DESC")
+        cur.execute(
+            "SELECT id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at FROM warehouses ORDER BY created_at DESC"
+        )
         rows = cur.fetchall()
     return [
-        WarehouseOut(id=row[0], name=row[1], address=row[2], point_phone=row[3], created_at=row[4], updated_at=row[5])  # type: ignore[arg-type]
+        WarehouseOut(
+            id=row[0],
+            name=row[1],
+            address=row[2],
+            point_phone=row[3],
+            qr_site_svg=row[4],
+            qr_yandex_svg=row[5],
+            qr_vk_svg=row[6],
+            qr_telegram_svg=row[7],
+            created_at=row[8],
+            updated_at=row[9],
+        )  # type: ignore[arg-type]
         for row in rows
     ]
 
@@ -237,17 +301,23 @@ def create_warehouse(body: WarehouseIn, request: FastAPIRequest) -> WarehouseOut
     name = body.name.strip()
     address = (body.address or "").strip()
     point_phone = (body.point_phone or "").strip()
+    qr_site_svg = normalize_svg(body.qr_site_svg) or ""
+    qr_yandex_svg = normalize_svg(body.qr_yandex_svg) or ""
+    qr_vk_svg = normalize_svg(body.qr_vk_svg) or ""
+    qr_telegram_svg = normalize_svg(body.qr_telegram_svg) or ""
     if not name:
         raise HTTPException(status_code=400, detail="name must not be empty")
     with db() as conn, conn.cursor() as cur:
         try:
             cur.execute(
                 """
-                INSERT INTO warehouses (id, name, address, point_phone, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, NOW(), NOW())
-                RETURNING id, name, address, point_phone, created_at, updated_at
+                INSERT INTO warehouses (
+                  id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                RETURNING id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at
                 """,
-                (uuid.uuid4(), name, address, point_phone),
+                (uuid.uuid4(), name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg),
             )
             row = cur.fetchone()
             cur.execute(
@@ -260,7 +330,18 @@ def create_warehouse(body: WarehouseIn, request: FastAPIRequest) -> WarehouseOut
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return WarehouseOut(id=row[0], name=row[1], address=row[2], point_phone=row[3], created_at=row[4], updated_at=row[5])  # type: ignore[arg-type]
+    return WarehouseOut(
+        id=row[0],
+        name=row[1],
+        address=row[2],
+        point_phone=row[3],
+        qr_site_svg=row[4],
+        qr_yandex_svg=row[5],
+        qr_vk_svg=row[6],
+        qr_telegram_svg=row[7],
+        created_at=row[8],
+        updated_at=row[9],
+    )  # type: ignore[arg-type]
 
 
 @app.put("/warehouses/{warehouse_id}", response_model=WarehouseOut)
@@ -270,6 +351,10 @@ def update_warehouse(warehouse_id: uuid.UUID, body: WarehouseIn, request: FastAP
     name = body.name.strip()
     address = body.address.strip() if body.address is not None else None
     point_phone = body.point_phone.strip() if body.point_phone is not None else None
+    qr_site_svg = normalize_svg(body.qr_site_svg)
+    qr_yandex_svg = normalize_svg(body.qr_yandex_svg)
+    qr_vk_svg = normalize_svg(body.qr_vk_svg)
+    qr_telegram_svg = normalize_svg(body.qr_telegram_svg)
     if not name:
         raise HTTPException(status_code=400, detail="name must not be empty")
     with db() as conn, conn.cursor() as cur:
@@ -287,16 +372,34 @@ def update_warehouse(warehouse_id: uuid.UUID, body: WarehouseIn, request: FastAP
         cur.execute(
             """
             UPDATE warehouses
-            SET name=%s, address=COALESCE(%s, address), point_phone=COALESCE(%s, point_phone), updated_at=NOW()
+            SET name=%s,
+                address=COALESCE(%s, address),
+                point_phone=COALESCE(%s, point_phone),
+                qr_site_svg=COALESCE(%s, qr_site_svg),
+                qr_yandex_svg=COALESCE(%s, qr_yandex_svg),
+                qr_vk_svg=COALESCE(%s, qr_vk_svg),
+                qr_telegram_svg=COALESCE(%s, qr_telegram_svg),
+                updated_at=NOW()
             WHERE id=%s
-            RETURNING id, name, address, point_phone, created_at, updated_at
+            RETURNING id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at
             """,
-            (name, address, point_phone, warehouse_id),
+            (name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, warehouse_id),
         )
         row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="warehouse not found")
-    return WarehouseOut(id=row[0], name=row[1], address=row[2], point_phone=row[3], created_at=row[4], updated_at=row[5])  # type: ignore[arg-type]
+    return WarehouseOut(
+        id=row[0],
+        name=row[1],
+        address=row[2],
+        point_phone=row[3],
+        qr_site_svg=row[4],
+        qr_yandex_svg=row[5],
+        qr_vk_svg=row[6],
+        qr_telegram_svg=row[7],
+        created_at=row[8],
+        updated_at=row[9],
+    )  # type: ignore[arg-type]
 
 
 @app.delete("/warehouses/{warehouse_id}", status_code=204)

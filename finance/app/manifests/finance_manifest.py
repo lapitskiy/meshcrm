@@ -7,7 +7,8 @@ MANIFEST = {
         "menu": {
             "title": "Бухглатерия",
             "items": [
-                {"id": "money", "title": "Учёт денег"},
+                {"id": "money", "title": "Учёт денег заказы"},
+                {"id": "money-skupka", "title": "Учёт денег скупка"},
                 {"id": "settings", "title": "Настройки"},
             ],
         },

@@ -5,6 +5,7 @@ import Label from "@/components/form/Label";
 import Button from "@/components/ui/button/Button";
 import { PencilIcon, TrashBinIcon } from "@/icons/index";
 import { getGatewayBaseUrl } from "@/lib/gateway";
+import { getKeycloak } from "@/lib/keycloak";
 import React, { useEffect, useMemo, useState } from "react";
 
 type ServiceCategory = {
@@ -21,7 +22,11 @@ type UserLite = {
 };
 
 function getToken(): string {
-  return (window as any).__hubcrmAccessToken || "";
+  const raw = (window as any).__hubcrmAccessToken;
+  if (!raw) return "";
+  const token = String(raw).trim();
+  if (!token || token === "undefined" || token === "null") return "";
+  return token;
 }
 
 function parseJwtPayload(token: string): any {
@@ -62,15 +67,49 @@ export default function OrdersSettingsServiceCategoryPage() {
   const [accessBusy, setAccessBusy] = useState(false);
   const [accessMessage, setAccessMessage] = useState<string | null>(null);
 
-  const authHeaders = () => {
-    const token = getToken();
+  const authHeaders = async (forceRefresh = false) => {
+    let token = getToken();
+    if (!token || forceRefresh) {
+      try {
+        const kc = await getKeycloak();
+        try {
+          await kc.updateToken(forceRefresh ? 0 : 30);
+        } catch {
+          // Ignore refresh error here; fallback to current token if any.
+        }
+        token = kc.token || "";
+        if (token) {
+          (window as any).__hubcrmAccessToken = token;
+        }
+      } catch {
+        // Keep token empty; backend will return 401 with explicit detail.
+      }
+    }
     return token ? { authorization: `Bearer ${token}` } : {};
   };
 
+  const withAuth = async (init: RequestInit = {}, forceRefresh = false): Promise<RequestInit> => {
+    return {
+      ...init,
+      headers: {
+        ...(init.headers as Record<string, string> | undefined),
+        ...(await authHeaders(forceRefresh)),
+      },
+    };
+  };
+
+  const authedFetch = async (url: string, init: RequestInit = {}) => {
+    let resp = await fetch(url, await withAuth(init, false));
+    if (resp.status === 401) {
+      // Retry once after forced token refresh to avoid transient auth races.
+      resp = await fetch(url, await withAuth(init, true));
+    }
+    return resp;
+  };
+
   const load = async () => {
-    const resp = await fetch(`${base}/orders/settings/service-categories`, {
+    const resp = await authedFetch(`${base}/orders/settings/service-categories`, {
       cache: "no-store",
-      headers: authHeaders(),
     });
     if (!resp.ok) {
       const body = await resp.text().catch(() => "");
@@ -103,11 +142,10 @@ export default function OrdersSettingsServiceCategoryPage() {
     const timer = window.setTimeout(() => {
       (async () => {
         try {
-          const resp = await fetch(
+          const resp = await authedFetch(
             `${base}/orders/settings/service-categories/access/users/search?q=${encodeURIComponent(accessQuery.trim())}`,
             {
               cache: "no-store",
-              headers: authHeaders(),
             }
           );
           if (!resp.ok) {
@@ -132,11 +170,10 @@ export default function OrdersSettingsServiceCategoryPage() {
     setAccessMessage(null);
     setError(null);
     try {
-      const resp = await fetch(
+      const resp = await authedFetch(
         `${base}/orders/settings/service-categories/access/users/${encodeURIComponent(user.user_uuid)}`,
         {
           cache: "no-store",
-          headers: authHeaders(),
         }
       );
       if (!resp.ok) {
@@ -164,14 +201,11 @@ export default function OrdersSettingsServiceCategoryPage() {
     setError(null);
     try {
       const categoryIds = Object.keys(selectedCategoryIds).filter((id) => selectedCategoryIds[id]);
-      const resp = await fetch(
+      const resp = await authedFetch(
         `${base}/orders/settings/service-categories/access/users/${encodeURIComponent(selectedAccessUser.user_uuid)}`,
         {
           method: "PUT",
-          headers: {
-            "content-type": "application/json",
-            ...authHeaders(),
-          },
+          headers: { "content-type": "application/json" },
           body: JSON.stringify({ category_ids: categoryIds }),
         }
       );
@@ -202,12 +236,9 @@ export default function OrdersSettingsServiceCategoryPage() {
     setBusy(true);
     setError(null);
     try {
-      const resp = await fetch(`${base}/orders/settings/service-categories`, {
+      const resp = await authedFetch(`${base}/orders/settings/service-categories`, {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...authHeaders(),
-        },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ name }),
       });
       if (!resp.ok) {
@@ -238,12 +269,9 @@ export default function OrdersSettingsServiceCategoryPage() {
     setActionBusy(true);
     setError(null);
     try {
-      const resp = await fetch(`${base}/orders/settings/service-categories/${editingId}`, {
+      const resp = await authedFetch(`${base}/orders/settings/service-categories/${editingId}`, {
         method: "PUT",
-        headers: {
-          "content-type": "application/json",
-          ...authHeaders(),
-        },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ name: editingName }),
       });
       if (!resp.ok) {
@@ -263,9 +291,8 @@ export default function OrdersSettingsServiceCategoryPage() {
     setActionBusy(true);
     setError(null);
     try {
-      const resp = await fetch(`${base}/orders/settings/service-categories/${id}`, {
+      const resp = await authedFetch(`${base}/orders/settings/service-categories/${id}`, {
         method: "DELETE",
-        headers: authHeaders(),
       });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");

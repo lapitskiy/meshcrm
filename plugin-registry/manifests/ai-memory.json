@@ -1,0 +1,16 @@
+{
+  "name": "ai-memory",
+  "bounded_context": "ai-memory",
+  "version": "1.0.0",
+  "events": { "subscribes": [], "publishes": [] },
+  "ui": {
+    "menu": {
+      "title": "ИИ",
+      "items": [
+        { "id": "insights", "title": "Анализ" },
+        { "id": "settings", "title": "Настройки" }
+      ]
+    }
+  },
+  "api": { "base_url": "http://ai-memory:8000" }
+}

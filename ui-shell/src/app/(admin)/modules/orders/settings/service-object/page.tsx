@@ -26,6 +26,7 @@ function getToken(): string {
 
 export default function OrdersSettingsServiceObjectPage() {
   const base = useMemo(() => getGatewayBaseUrl(), []);
+  const [isSuperadmin, setIsSuperadmin] = useState(false);
 
   const [categories, setCategories] = useState<ServiceCategory[]>([]);
   const [items, setItems] = useState<ServiceObject[]>([]);
@@ -47,8 +48,25 @@ export default function OrdersSettingsServiceObjectPage() {
     return token ? { authorization: `Bearer ${token}` } : {};
   };
 
+  const parseJwtPayload = (token: string): any => {
+    try {
+      const parts = token.split(".");
+      if (parts.length < 2) return null;
+      const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      const pad = payload.length % 4 ? "=".repeat(4 - (payload.length % 4)) : "";
+      return JSON.parse(atob(payload + pad));
+    } catch {
+      return null;
+    }
+  };
+
   const loadCategories = async () => {
-    const resp = await fetch(`${base}/orders/settings/service-categories`, {
+    const token = getToken();
+    const payload = parseJwtPayload(token);
+    const roles = Array.isArray(payload?.realm_access?.roles) ? payload.realm_access.roles : [];
+    const useAllCategories = roles.includes("superadmin");
+    setIsSuperadmin(useAllCategories);
+    const resp = await fetch(`${base}/orders/settings/service-categories${useAllCategories ? "" : "/accessible"}`, {
       cache: "no-store",
       headers: authHeaders(),
     });
@@ -59,6 +77,12 @@ export default function OrdersSettingsServiceObjectPage() {
     const data = (await resp.json()) as ServiceCategory[];
     setCategories(data);
     if (!newCategoryId && data.length) setNewCategoryId(data[0].id);
+    if (newCategoryId && !data.some((item) => item.id === newCategoryId)) {
+      setNewCategoryId(data[0]?.id || "");
+    }
+    if (filterCategoryId && !data.some((item) => item.id === filterCategoryId)) {
+      setFilterCategoryId("");
+    }
   };
 
   const loadServiceObjects = async (categoryId: string) => {
@@ -186,6 +210,7 @@ export default function OrdersSettingsServiceObjectPage() {
               className="h-11 w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
               value={newCategoryId}
               onChange={(e) => setNewCategoryId(e.target.value)}
+              disabled={!categories.length}
             >
               {!categories.length && <option value="">Нет категорий</option>}
               {categories.map((c) => (
@@ -205,6 +230,11 @@ export default function OrdersSettingsServiceObjectPage() {
             Добавить
           </Button>
         </div>
+        {!isSuperadmin && !categories.length ? (
+          <div className="mt-3 text-sm text-red-600">
+            Нет доступа ни к одной из категорий услуг, обратитесь к администратору.
+          </div>
+        ) : null}
       </div>
 
       <div className="rounded-2xl border border-gray-200 bg-white px-5 py-6 dark:border-gray-800 dark:bg-white/[0.03]">

@@ -1,5 +1,6 @@
 import GridShape from "@/components/common/GridShape";
 import ThemeTogglerTwo from "@/components/common/ThemeTogglerTwo";
+import meshLogoPng from "@/app/meshlogo.png";
 
 import { ThemeProvider } from "@/context/ThemeContext";
 import Image from "next/image";
@@ -25,12 +26,12 @@ export default function AuthLayout({
                   <Image
                     width={231}
                     height={48}
-                    src="./images/logo/auth-logo.svg"
-                    alt="Logo"
+                    src={meshLogoPng}
+                    alt="MeshCRM logo"
                   />
                 </Link>
                 <p className="text-center text-gray-400 dark:text-white/60">
-                  Free and Open-Source Tailwind CSS Admin Dashboard Template
+                  Бесплатная и open-source mesh CRM система
                 </p>
               </div>
             </div>

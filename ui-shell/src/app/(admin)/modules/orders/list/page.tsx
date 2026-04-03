@@ -72,6 +72,13 @@ type CreatorInfo = {
   full_name?: string;
 };
 
+type UserLite = {
+  user_uuid: string;
+  username: string;
+  email: string;
+  full_name: string;
+};
+
 type PrintFormListItem = {
   id: string;
   title: string;
@@ -84,12 +91,17 @@ type WarehouseInfo = {
   name: string;
   address: string;
   point_phone: string;
+  qr_site_svg: string;
+  qr_yandex_svg: string;
+  qr_vk_svg: string;
+  qr_telegram_svg: string;
 };
 
 type ListFilters = {
   order_kind: string;
   service_category_id: string;
   work_type_id: string;
+  created_by_uuid: string;
   search: string;
   created_from: string;
   created_to: string;
@@ -163,6 +175,7 @@ export default function OrdersListPage() {
   const [openOrderId, setOpenOrderId] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const [loading, setLoading] = useState(false);
   const [financeByOrder, setFinanceByOrder] = useState<Record<string, FinanceLine[]>>({});
   const [financeLoadingByOrder, setFinanceLoadingByOrder] = useState<Record<string, boolean>>({});
@@ -187,10 +200,15 @@ export default function OrdersListPage() {
   const [printFormsError, setPrintFormsError] = useState<string>("");
   const [printFormsLoading, setPrintFormsLoading] = useState(false);
   const [printDropdownOrderId, setPrintDropdownOrderId] = useState<string | null>(null);
+  const [isSuperadmin, setIsSuperadmin] = useState(false);
+  const [creatorFilterQuery, setCreatorFilterQuery] = useState("");
+  const [creatorFilterOptions, setCreatorFilterOptions] = useState<UserLite[]>([]);
+  const [creatorFilterOpen, setCreatorFilterOpen] = useState(false);
   const [draftFilters, setDraftFilters] = useState<ListFilters>({
     order_kind: "",
     service_category_id: "",
     work_type_id: "",
+    created_by_uuid: "",
     search: initialSearch,
     created_from: "",
     created_to: "",
@@ -199,6 +217,7 @@ export default function OrdersListPage() {
     order_kind: "",
     service_category_id: "",
     work_type_id: "",
+    created_by_uuid: "",
     search: initialSearch,
     created_from: "",
     created_to: "",
@@ -227,17 +246,31 @@ export default function OrdersListPage() {
     return token ? { authorization: `Bearer ${token}` } : {};
   };
 
-  const load = async (targetPage: number, filtersArg?: ListFilters) => {
+  const parseJwtPayload = (token: string): any => {
+    try {
+      const parts = token.split(".");
+      if (parts.length < 2) return null;
+      const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      const pad = payload.length % 4 ? "=".repeat(4 - (payload.length % 4)) : "";
+      return JSON.parse(atob(payload + pad));
+    } catch {
+      return null;
+    }
+  };
+
+  const load = async (targetPage: number, filtersArg?: ListFilters, pageSizeArg?: number) => {
     setLoading(true);
     setError(null);
     try {
       const f = filtersArg || appliedFilters;
+      const effectivePageSize = pageSizeArg || pageSize;
       const qs = new URLSearchParams();
       qs.set("page", String(targetPage));
-      qs.set("page_size", "20");
+      qs.set("page_size", String(effectivePageSize));
       if (f.order_kind) qs.set("order_kind", f.order_kind);
       if (f.service_category_id) qs.set("service_category_id", f.service_category_id);
       if (f.work_type_id) qs.set("work_type_id", f.work_type_id);
+      if (f.created_by_uuid) qs.set("created_by_uuid", f.created_by_uuid);
       if (f.search.trim()) qs.set("search", f.search.trim());
       if (f.created_from) qs.set("created_from", f.created_from);
       if (f.created_to) qs.set("created_to", f.created_to);
@@ -252,6 +285,9 @@ export default function OrdersListPage() {
       const data = (await resp.json()) as OrdersPage;
       setItems(data.items || []);
       setPage(data.page || targetPage);
+      if (Number.isFinite(Number(data.page_size)) && Number(data.page_size) > 0) {
+        setPageSize(Number(data.page_size));
+      }
       setTotalPages(data.total_pages || 1);
       if (pendingOpenOrderId && (data.items || []).some((x) => x.id === pendingOpenOrderId)) {
         setOpenOrderId(pendingOpenOrderId);
@@ -273,11 +309,46 @@ export default function OrdersListPage() {
   };
 
   useEffect(() => {
+    const payload = parseJwtPayload(getToken());
+    const roles = Array.isArray(payload?.realm_access?.roles) ? payload.realm_access.roles : [];
+    setIsSuperadmin(roles.includes("superadmin"));
+  }, []);
+
+  useEffect(() => {
     (async () => {
       await load(1, appliedFilters);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!isSuperadmin) return;
+    const term = creatorFilterQuery.trim();
+    if (!creatorFilterOpen && term.length < 2) {
+      setCreatorFilterOptions([]);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const resp = await fetch(
+            `${base}/orders/orders/creators/options?q=${encodeURIComponent(term)}`,
+            { cache: "no-store", headers: authHeaders() }
+          );
+          if (!resp.ok) {
+            const body = await resp.text().catch(() => "");
+            throw new Error(`creator options failed: ${resp.status} ${body}`);
+          }
+          setCreatorFilterOptions((await resp.json()) as UserLite[]);
+          setCreatorFilterOpen(true);
+        } catch (e: any) {
+          setError(e?.message || "failed to load creator options");
+          setCreatorFilterOptions([]);
+        }
+      })();
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [creatorFilterQuery, creatorFilterOpen, isSuperadmin, base]);
 
   useEffect(() => {
     (async () => {
@@ -466,6 +537,19 @@ export default function OrdersListPage() {
     });
   };
 
+  const fitSvgForPrint = (rawSvg: string, targetPx = 200): string => {
+    const source = String(rawSvg || "").trim();
+    if (!source || !source.toLowerCase().includes("<svg")) return source;
+    return source.replace(/<svg\b([^>]*)>/i, (_m, attrs: string) => {
+      let nextAttrs = String(attrs || "");
+      nextAttrs = nextAttrs.replace(/\swidth=(['"]).*?\1/i, "");
+      nextAttrs = nextAttrs.replace(/\sheight=(['"]).*?\1/i, "");
+      nextAttrs = nextAttrs.replace(/\spreserveAspectRatio=(['"]).*?\1/i, "");
+      nextAttrs = nextAttrs.replace(/\sstyle=(['"]).*?\1/i, "");
+      return `<svg${nextAttrs} width="${targetPx}" height="${targetPx}" preserveAspectRatio="xMidYMid meet" style="display:block; width:${targetPx}px; max-width:100%; height:auto;">`;
+    });
+  };
+
   const fetchWithRetry = async (url: string, init?: RequestInit, retries = 1, delayMs = 350): Promise<Response> => {
     try {
       return await fetch(url, init);
@@ -552,6 +636,10 @@ export default function OrdersListPage() {
         warehouse_name: String(warehouseNameById[order.warehouse_id || ""] || "-"),
         warehouse_address: String(warehouseById[order.warehouse_id || ""]?.address || "-"),
         warehouse_point_phone: String(warehouseById[order.warehouse_id || ""]?.point_phone || "-"),
+        warehouse_qr_site_svg: fitSvgForPrint(String(warehouseById[order.warehouse_id || ""]?.qr_site_svg || ""), 100),
+        warehouse_qr_yandex_svg: fitSvgForPrint(String(warehouseById[order.warehouse_id || ""]?.qr_yandex_svg || ""), 100),
+        warehouse_qr_vk_svg: fitSvgForPrint(String(warehouseById[order.warehouse_id || ""]?.qr_vk_svg || ""), 100),
+        warehouse_qr_telegram_svg: fitSvgForPrint(String(warehouseById[order.warehouse_id || ""]?.qr_telegram_svg || ""), 100),
         payment_method: paymentMethod,
         is_paid: isPaid,
         total_amount: String(totalAmount),
@@ -562,10 +650,22 @@ export default function OrdersListPage() {
       w.document.open();
       w.document.write(`<!doctype html><html><head><meta charset="utf-8"/><title>${printTitle}</title>
         <style>
-          body{font-family:Arial, sans-serif; padding:0; margin:0;}
-          .print-root{padding:24px;}
-          img{max-width:100%;}
-          @page { margin: 8mm; }
+          body{font-family:Arial, sans-serif; margin:0; padding:0; width:80mm;}
+          .print-root{width:80mm; margin:0; padding:0;}
+          .print-root table{width:100% !important; table-layout:fixed !important; border-collapse:collapse !important;}
+          .print-root td,.print-root th{overflow:hidden; vertical-align:top; word-break:break-word;}
+          .print-root p{margin:0;}
+          .print-root img,.print-root svg{
+            display:block;
+            width:100% !important;
+            max-width:100% !important;
+            height:auto !important;
+          }
+          @page { size: 80mm auto; margin: 0; }
+          @media print {
+            html, body { width: 80mm; margin: 0 !important; padding: 0 !important; }
+            .print-root { width: 80mm; margin: 0 !important; padding: 0 !important; }
+          }
         </style>
       </head><body><div class="print-root">${html}</div></body></html>`);
       w.document.close();
@@ -624,7 +724,16 @@ export default function OrdersListPage() {
           headers: authHeaders(),
         });
         if (!resp.ok) return;
-        const rows = (await resp.json()) as Array<{ id: string; name: string; address?: string; point_phone?: string }>;
+        const rows = (await resp.json()) as Array<{
+          id: string;
+          name: string;
+          address?: string;
+          point_phone?: string;
+          qr_site_svg?: string;
+          qr_yandex_svg?: string;
+          qr_vk_svg?: string;
+          qr_telegram_svg?: string;
+        }>;
         const nextNames: Record<string, string> = {};
         const nextMap: Record<string, WarehouseInfo> = {};
         for (const row of rows || []) {
@@ -636,6 +745,10 @@ export default function OrdersListPage() {
             name,
             address: String(row.address || ""),
             point_phone: String(row.point_phone || ""),
+            qr_site_svg: String(row.qr_site_svg || ""),
+            qr_yandex_svg: String(row.qr_yandex_svg || ""),
+            qr_vk_svg: String(row.qr_vk_svg || ""),
+            qr_telegram_svg: String(row.qr_telegram_svg || ""),
           };
         }
         setWarehouseNameById(nextNames);
@@ -650,8 +763,15 @@ export default function OrdersListPage() {
   useEffect(() => {
     (async () => {
       try {
+        const token = getToken();
+        const payload = parseJwtPayload(token);
+        const roles = Array.isArray(payload?.realm_access?.roles) ? payload.realm_access.roles : [];
+        const useAllCategories = roles.includes("superadmin");
         const [catResp, objResp, wtResp] = await Promise.all([
-          fetch(`${base}/orders/settings/service-categories`, { cache: "no-store", headers: authHeaders() }),
+          fetch(
+            `${base}/orders/settings/service-categories${useAllCategories ? "" : "/accessible"}`,
+            { cache: "no-store", headers: authHeaders() }
+          ),
           fetch(`${base}/orders/settings/service-objects?limit=500`, { cache: "no-store", headers: authHeaders() }),
           fetch(`${base}/orders/settings/work-types?limit=500`, { cache: "no-store", headers: authHeaders() }),
         ]);
@@ -744,6 +864,44 @@ export default function OrdersListPage() {
                 </div>
               )}
             </div>
+            {isSuperadmin ? (
+              <div className="relative">
+                <input
+                  className="h-10 w-full rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
+                  value={creatorFilterQuery}
+                  onFocus={() => setCreatorFilterOpen(true)}
+                  onBlur={() => setTimeout(() => setCreatorFilterOpen(false), 120)}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setCreatorFilterQuery(next);
+                    setDraftFilters((prev) => ({ ...prev, created_by_uuid: "" }));
+                  }}
+                  placeholder="Создатель заказа"
+                />
+                {creatorFilterOpen && (
+                  <div className="absolute z-20 mt-1 w-full max-h-56 overflow-auto rounded-lg border border-gray-200 bg-white shadow-theme-lg dark:border-gray-800 dark:bg-gray-900">
+                    {!creatorFilterOptions.length ? (
+                      <div className="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">Ничего не найдено</div>
+                    ) : (
+                      creatorFilterOptions.map((item) => (
+                        <button
+                          key={item.user_uuid}
+                          type="button"
+                          className="w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-white/10"
+                          onClick={() => {
+                            setDraftFilters((prev) => ({ ...prev, created_by_uuid: item.user_uuid }));
+                            setCreatorFilterQuery(creatorDisplayName(item));
+                            setCreatorFilterOpen(false);
+                          }}
+                        >
+                          {creatorDisplayName(item)}
+                        </button>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : null}
             <input
               className="h-10 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
               value={draftFilters.search}
@@ -1042,6 +1200,23 @@ export default function OrdersListPage() {
               Страница {page} из {totalPages}
             </div>
             <div className="flex items-center gap-2">
+              <select
+                className="h-9 rounded-lg border border-gray-300 px-2 text-sm dark:border-gray-700 dark:bg-gray-900"
+                value={String(pageSize)}
+                onChange={(e) => {
+                  const nextSize = Number(e.target.value);
+                  if (!Number.isFinite(nextSize) || nextSize <= 0) return;
+                  setPageSize(nextSize);
+                  void load(1, appliedFilters, nextSize);
+                }}
+                disabled={loading}
+                title="Заказов на странице"
+              >
+                <option value="10">10</option>
+                <option value="20">20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+              </select>
               <button
                 type="button"
                 className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm disabled:opacity-50 dark:border-gray-700"

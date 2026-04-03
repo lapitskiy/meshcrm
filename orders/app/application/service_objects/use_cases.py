@@ -18,11 +18,13 @@ class ServiceObjectUseCases:
     def list_all(
         self,
         service_category_id: UUID | None = None,
+        accessible_category_ids: list[UUID] | None = None,
         name_query: str | None = None,
         limit: int = 100,
     ) -> list[ServiceObject]:
         return self._repo.list_all(
             service_category_id=service_category_id,
+            accessible_category_ids=accessible_category_ids,
             name_query=name_query,
             limit=limit,
         )

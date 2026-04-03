@@ -1,0 +1,20 @@
+{
+  "name": "skupka",
+  "bounded_context": "skupka",
+  "version": "1.0.0",
+  "events": { "subscribes": [], "publishes": [] },
+  "ui": {
+    "menu": {
+      "title": "Скупка",
+      "items": [
+        { "id": "new-deal", "title": "Новая сделка" },
+        { "id": "list", "title": "Список выкупов" },
+        { "id": "categories", "title": "Категории" },
+        { "id": "purchase-object", "title": "Объект покупки" },
+        { "id": "statuses", "title": "Статусы" },
+        { "id": "device-condition", "title": "Состояние устройства" }
+      ]
+    }
+  },
+  "api": { "base_url": "http://skupka:8000" }
+}

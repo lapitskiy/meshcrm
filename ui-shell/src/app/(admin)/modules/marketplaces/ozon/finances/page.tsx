@@ -9,6 +9,9 @@ export default function OzonFinancesPage() {
   const [query, setQuery] = React.useState("");
   const [data, setData] = React.useState<any>(null);
   const [monthsAgo, setMonthsAgo] = React.useState(1);
+  const [mode, setMode] = React.useState<"cache" | "live">("cache");
+  const [profitMinFilter, setProfitMinFilter] = React.useState(0);
+  const [profitMaxFilter, setProfitMaxFilter] = React.useState(0);
 
   const getToken = () => (window as any).__hubcrmAccessToken || "";
 
@@ -17,7 +20,7 @@ export default function OzonFinancesPage() {
     setError("");
     try {
       const r = await fetch(
-        `${getGatewayBaseUrl()}/marketplaces/ozon/finances?months_ago=${encodeURIComponent(String(mAgo))}`,
+        `${getGatewayBaseUrl()}/marketplaces/ozon/finances?months_ago=${encodeURIComponent(String(mAgo))}&mode=${encodeURIComponent(mode)}`,
         {
         headers: { Authorization: `Bearer ${getToken()}` },
         }
@@ -40,18 +43,32 @@ export default function OzonFinancesPage() {
   React.useEffect(() => {
     load(monthsAgo);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [monthsAgo]);
+  }, [monthsAgo, mode]);
 
   const reportEntries = (data?.report && typeof data.report === "object") ? Object.entries<any>(data.report) : [];
-  const filtered = query
-    ? reportEntries.filter(([offerId]) => String(offerId).toLowerCase().includes(query.toLowerCase()))
-    : reportEntries;
+  const profitValues = reportEntries.map(([offerId]) => Number(data?.summed_totals?.[offerId]?.average_percent_posttax ?? 0));
+  const minProfitPercent = profitValues.length ? Math.min(...profitValues) : 0;
+  const maxProfitPercent = profitValues.length ? Math.max(...profitValues) : 0;
+
+  React.useEffect(() => {
+    setProfitMinFilter(minProfitPercent);
+    setProfitMaxFilter(maxProfitPercent);
+  }, [minProfitPercent, maxProfitPercent]);
+
+  const filtered = reportEntries.filter(([offerId]) => {
+    const byQuery = query ? String(offerId).toLowerCase().includes(query.toLowerCase()) : true;
+    const avgProfitPercent = Number(data?.summed_totals?.[offerId]?.average_percent_posttax ?? 0);
+    const byProfit = avgProfitPercent >= profitMinFilter && avgProfitPercent <= profitMaxFilter;
+    return byQuery && byProfit;
+  });
 
   return (
     <div className="p-6 max-w-3xl">
       <h1 className="text-2xl font-semibold mb-2">Ozon → Финансы</h1>
       <div className="text-sm text-gray-600 mb-4">
         Отчет за {data?.header_data?.month || "месяц"} ({data?.header_data?.start_date} — {data?.header_data?.stop_date})
+        {data?.header_data?.source ? `, источник: ${data.header_data.source}` : ""}
+        {data?.header_data?.refreshed_at ? `, обновлено: ${data.header_data.refreshed_at}` : ""}
       </div>
 
       <div className="flex items-center gap-3 mb-4">
@@ -61,8 +78,17 @@ export default function OzonFinancesPage() {
           disabled={loading}
           onClick={() => load(monthsAgo)}
         >
-          {loading ? "Загружаю..." : "Обновить"}
+          {loading ? "Загружаю..." : mode === "live" ? "Обновить из Ozon" : "Загрузить из БД"}
         </button>
+        <select
+          className="h-11 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
+          value={mode}
+          onChange={(e) => setMode(e.target.value as "cache" | "live")}
+          disabled={loading}
+        >
+          <option value="cache">БД (быстро)</option>
+          <option value="live">Ozon - сохранить в БД</option>
+        </select>
         <select
           className="h-11 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
           value={monthsAgo}
@@ -84,6 +110,43 @@ export default function OzonFinancesPage() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
+      </div>
+
+      <div className="mb-4 rounded-xl border border-gray-200 p-4 dark:border-gray-800">
+        <div className="text-sm font-medium mb-2">Фильтр по % прибыли</div>
+        <div className="text-xs text-gray-600 mb-2">
+          Диапазон: <span className="font-semibold">{profitMinFilter}%</span> - <span className="font-semibold">{profitMaxFilter}%</span>
+        </div>
+        <input
+          type="range"
+          min={minProfitPercent}
+          max={maxProfitPercent}
+          step={1}
+          value={Math.min(Math.max(profitMinFilter, minProfitPercent), maxProfitPercent)}
+          onChange={(e) => {
+            const next = Number(e.target.value);
+            setProfitMinFilter(Math.min(next, profitMaxFilter));
+          }}
+          className="w-full"
+          disabled={loading || minProfitPercent === maxProfitPercent}
+        />
+        <input
+          type="range"
+          min={minProfitPercent}
+          max={maxProfitPercent}
+          step={1}
+          value={Math.min(Math.max(profitMaxFilter, minProfitPercent), maxProfitPercent)}
+          onChange={(e) => {
+            const next = Number(e.target.value);
+            setProfitMaxFilter(Math.max(next, profitMinFilter));
+          }}
+          className="w-full mt-2"
+          disabled={loading || minProfitPercent === maxProfitPercent}
+        />
+        <div className="mt-2 flex justify-between text-xs text-gray-500">
+          <span>min: {minProfitPercent}%</span>
+          <span>max: {maxProfitPercent}%</span>
+        </div>
       </div>
 
       {error && (
@@ -122,7 +185,7 @@ export default function OzonFinancesPage() {
                 <span className="font-semibold">{offerId}</span>
                 {totals ? (
                   <span className="ml-2 text-sm text-gray-600">
-                    ₽{totals.posttax_profit_sum} ({totals.average_percent_posttax}%)
+                    шт: {totals.total_quantity} • ₽{totals.posttax_profit_sum} ({totals.average_percent_posttax}%)
                     {totals.total_quantity < 3 ? "  ⚠ мало продаж" : ""}
                   </span>
                 ) : null}
@@ -132,6 +195,9 @@ export default function OzonFinancesPage() {
                   entries.map((e: any, idx: number) => (
                     <div key={idx} className="rounded-lg bg-gray-50 p-3 text-sm dark:bg-white/[0.03]">
                       <div className="font-medium">Выплата за {e.quantity} шт: {e.name}</div>
+                      <div className="text-gray-700 dark:text-gray-300">
+                        Схема: <span className="font-semibold">{e.delivery_schema || "N/A"}</span>
+                      </div>
                       <div className="text-gray-700 dark:text-gray-300">
                         Зачислено: <span className="font-semibold">₽{e.payoff}</span>, опт: ₽{e.opt}, комиссии: ₽{e.fees}
                       </div>

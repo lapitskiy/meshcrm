@@ -41,6 +41,11 @@ class CategoryAccessOut(BaseModel):
     category_ids: list[UUID]
 
 
+class CategoryAccessibleSummaryOut(BaseModel):
+    total_count: int
+    accessible_count: int
+
+
 def _roles_from_headers(request: Request) -> set[str]:
     raw = str(request.headers.get("x-user-roles", "")).strip()
     if not raw:
@@ -118,6 +123,34 @@ def list_accessible_service_categories(request: Request) -> list[ServiceCategory
             )
             rows = cur.fetchall()
         return [ServiceCategoryOut(id=row[0], name=row[1], created_at=row[2]) for row in rows]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+@router.get("/accessible-summary", response_model=CategoryAccessibleSummaryOut)
+def get_accessible_service_categories_summary(request: Request) -> CategoryAccessibleSummaryOut:
+    conn = None
+    try:
+        conn = get_connection()
+        user_uuid = _require_user_uuid(request)
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM service_categories")
+            total_count = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM service_category_access
+                WHERE user_uuid = %s
+                """,
+                (user_uuid,),
+            )
+            accessible_count = int(cur.fetchone()[0] or 0)
+        return CategoryAccessibleSummaryOut(total_count=total_count, accessible_count=accessible_count)
     except HTTPException:
         raise
     except Exception as exc:

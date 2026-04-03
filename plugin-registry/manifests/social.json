@@ -1,0 +1,16 @@
+{
+  "name": "social",
+  "bounded_context": "social",
+  "version": "1.0.0",
+  "events": { "subscribes": [], "publishes": [] },
+  "ui": {
+    "menu": {
+      "title": "Соцсети",
+      "items": [
+        { "id": "settings", "title": "Настройки" },
+        { "id": "vk", "title": "Вконтакте" }
+      ]
+    }
+  },
+  "api": { "base_url": "http://social:8000" }
+}

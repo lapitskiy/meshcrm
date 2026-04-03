@@ -1,14 +1,16 @@
 "use client";
-import React, { useEffect, useRef, useState,useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import logoPng from "@/app/logo.png";
+import meshLogoPng from "@/app/meshlogo.png";
 import { usePathname } from "next/navigation";
 import { useSidebar } from "../context/SidebarContext";
 import { getGatewayBaseUrl } from "@/lib/gateway";
 import {
   BoxCubeIcon,
   ChevronDownIcon,
+  GroupIcon,
   HorizontaLDots,
   PieChartIcon,
   PlugInIcon,
@@ -35,44 +37,40 @@ type PluginMeta = {
   enabled: boolean;
 };
 
-const staticNavItems: NavItem[] = [
-  {
-    name: "Модули",
-    icon: <PlugInIcon />,
-    subItems: [{ name: "Настройки", path: "/modules/settings" }],
-  },
-  {
-    name: "Маркетплейсы",
-    icon: <BoxCubeIcon />,
-    subItems: [
-      {
-        name: "Настройки",
-        children: [{ name: "Общие", path: "/modules/marketplaces/settings/common" }],
-      },
-      {
-        name: "Ozon",
-        children: [
-          { name: "Настройки", path: "/modules/marketplaces/ozon/settings" },
-          { name: "Финансы", path: "/modules/marketplaces/ozon/finances" },
-          { name: "Акции", path: "/modules/marketplaces/ozon/promotions" },
-        ],
-      },
-      {
-        name: "WB",
-        children: [{ name: "Настройки", path: "/modules/marketplaces/wb/settings" }],
-      },
-      {
-        name: "Yandex",
-        children: [{ name: "Настройки", path: "/modules/marketplaces/yandex/settings" }],
-      },
-    ],
-  },
-  {
-    name: "МойСклад",
-    icon: <BoxCubeIcon />,
-    subItems: [{ name: "Настройки", path: "/modules/moysklad/settings" }],
-  },
-];
+type AccessCheckResponse = {
+  allowed: boolean;
+};
+
+function getToken(): string {
+  const raw = (window as any).__hubcrmAccessToken;
+  if (!raw) return "";
+  const token = String(raw).trim();
+  if (!token || token === "undefined" || token === "null") return "";
+  return token;
+}
+
+function parseJwtPayload(token: string): any {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const pad = payload.length % 4 ? "=".repeat(4 - (payload.length % 4)) : "";
+    return JSON.parse(atob(payload + pad));
+  } catch {
+    return null;
+  }
+}
+
+function hasAdminAccess(token: string): boolean {
+  const payload = parseJwtPayload(token);
+  if (!payload) return false;
+  const realmRoles = Array.isArray(payload?.realm_access?.roles) ? payload.realm_access.roles : [];
+  if (realmRoles.includes("superadmin") || realmRoles.includes("admin")) return true;
+  const resourceAccess = payload?.resource_access || {};
+  return Object.values(resourceAccess).some(
+    (obj: any) => Array.isArray(obj?.roles) && (obj.roles.includes("superadmin") || obj.roles.includes("admin"))
+  );
+}
 
 const othersItems: NavItem[] = [];
 
@@ -80,16 +78,14 @@ const AppSidebar: React.FC = () => {
   const { isExpanded, isMobileOpen, isHovered, setIsHovered } = useSidebar();
   const pathname = usePathname();
   const [openSubItemChildren, setOpenSubItemChildren] = useState<Record<string, boolean>>({});
-  const [ordersEnabled, setOrdersEnabled] = useState(false);
-  const [contactsEnabled, setContactsEnabled] = useState(false);
-  const [financeEnabled, setFinanceEnabled] = useState(false);
-  const [warehousesEnabled, setWarehousesEnabled] = useState(false);
+  const [enabledModuleOrder, setEnabledModuleOrder] = useState<string[]>([]);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [canManageUsers, setCanManageUsers] = useState(false);
 
   const navItems = React.useMemo<NavItem[]>(() => {
     const dynamicItems: NavItem[] = [];
-
-    if (ordersEnabled) {
-      dynamicItems.push({
+    const knownModuleItems: Record<string, NavItem> = {
+      orders: {
         name: "Заказы",
         icon: <BoxCubeIcon />,
         subItems: [
@@ -105,60 +101,138 @@ const AppSidebar: React.FC = () => {
             ],
           },
         ],
-      });
-    }
-
-    if (financeEnabled) {
-      dynamicItems.push({
+      },
+      finance: {
         name: "Бухглатерия",
         icon: <PieChartIcon />,
         subItems: [
-          { name: "Учёт денег", path: "/modules/finance/money" },
+          { name: "Учёт денег заказы", path: "/modules/finance/money" },
+          { name: "Учёт денег скупка", path: "/modules/finance/money-skupka" },
           { name: "Настройки", path: "/modules/finance/settings" },
         ],
-      });
-    }
-
-    if (contactsEnabled) {
-      dynamicItems.push({
+      },
+      contacts: {
         name: "Контакты",
         icon: <UserCircleIcon />,
         subItems: [
           { name: "Список контактов", path: "/modules/contacts/list" },
           { name: "Настройки", path: "/modules/contacts/settings" },
         ],
-      });
-    }
-
-    if (warehousesEnabled) {
-      dynamicItems.push({
+      },
+      skupka: {
+        name: "Скупка",
+        icon: <BoxCubeIcon />,
+        subItems: [
+          { name: "Новая сделка", path: "/modules/skupka/new-deal" },
+          { name: "Список выкупов", path: "/modules/skupka/list" },
+          {
+            name: "Настройки",
+            children: [
+              { name: "Категории", path: "/modules/skupka/settings/categories" },
+              { name: "Объект покупки", path: "/modules/skupka/settings/purchase-object" },
+              { name: "Статусы", path: "/modules/skupka/settings/statuses" },
+              { name: "Состояние устройства", path: "/modules/skupka/settings/device-condition" },
+            ],
+          },
+        ],
+      },
+      social: {
+        name: "Соцсети",
+        icon: <BoxCubeIcon />,
+        subItems: [
+          { name: "Вконтакте", path: "/modules/social/vk" },
+          { name: "Настройки", path: "/modules/social/settings/vk" },
+        ],
+      },
+      warehouses: {
         name: "Склады/Точки",
         icon: <BoxCubeIcon />,
         subItems: [
           { name: "Склады", path: "/modules/warehouses/list" },
           { name: "Настройки", path: "/modules/warehouses/settings" },
         ],
+      },
+      documents: {
+        name: "Печать",
+        icon: <BoxCubeIcon />,
+        subItems: [
+          { name: "Создать форму", path: "/modules/print/create" },
+          { name: "Список форм", path: "/modules/print/list" },
+          {
+            name: "Настройки",
+            children: [
+              { name: "Общие", path: "/modules/print/settings" },
+              { name: "Категории", path: "/modules/print/settings/categories" },
+            ],
+          },
+        ],
+      },
+      marketplaces: {
+        name: "Маркетплейсы",
+        icon: <BoxCubeIcon />,
+        subItems: [
+          {
+            name: "Настройки",
+            children: [{ name: "Общие", path: "/modules/marketplaces/settings/common" }],
+          },
+          {
+            name: "Ozon",
+            children: [
+              { name: "Настройки", path: "/modules/marketplaces/ozon/settings" },
+              { name: "Финансы", path: "/modules/marketplaces/ozon/finances" },
+              { name: "Акции", path: "/modules/marketplaces/ozon/promotions" },
+            ],
+          },
+          {
+            name: "WB",
+            children: [{ name: "Настройки", path: "/modules/marketplaces/wb/settings" }],
+          },
+          {
+            name: "Yandex",
+            children: [{ name: "Настройки", path: "/modules/marketplaces/yandex/settings" }],
+          },
+        ],
+      },
+      moysklad: {
+        name: "МойСклад",
+        icon: <BoxCubeIcon />,
+        subItems: [{ name: "Настройки", path: "/modules/moysklad/settings" }],
+      },
+      "ai-memory": {
+        name: "ИИ",
+        icon: <BoxCubeIcon />,
+        subItems: [
+          { name: "Анализ", path: "/modules/ai-memory/insights" },
+          { name: "Настройки", path: "/modules/ai-memory/settings" },
+        ],
+      },
+    };
+    for (const moduleName of enabledModuleOrder) {
+      const nav = knownModuleItems[moduleName];
+      if (nav) dynamicItems.push(nav);
+    }
+
+    if (canManageUsers) {
+      dynamicItems.push({
+        name: "Пользователи",
+        icon: <GroupIcon />,
+        subItems: [
+          { name: "Добавить", path: "/modules/users/add" },
+          { name: "Список", path: "/modules/users/list" },
+        ],
       });
     }
 
-    dynamicItems.push({
-      name: "Печать",
-      icon: <BoxCubeIcon />,
-      subItems: [
-        { name: "Создать форму", path: "/modules/print/create" },
-        { name: "Список форм", path: "/modules/print/list" },
-        {
-          name: "Настройки",
-          children: [
-            { name: "Общие", path: "/modules/print/settings" },
-            { name: "Категории", path: "/modules/print/settings/categories" },
-          ],
-        },
-      ],
-    });
+    if (isAdmin) {
+      dynamicItems.push({
+        name: "Модули",
+        icon: <PlugInIcon />,
+        subItems: [{ name: "Настройки", path: "/modules/settings" }],
+      });
+    }
 
-    return [...dynamicItems, ...staticNavItems];
-  }, [ordersEnabled, contactsEnabled, financeEnabled, warehousesEnabled]);
+    return dynamicItems;
+  }, [enabledModuleOrder, isAdmin, canManageUsers]);
 
   useEffect(() => {
     let alive = true;
@@ -166,22 +240,34 @@ const AppSidebar: React.FC = () => {
     const loadEnabledModules = async () => {
       try {
         const base = getGatewayBaseUrl();
-        const resp = await fetch(`${base}/plugins/_meta?enabled_only=true`, { cache: "no-store" });
-        if (!resp.ok) {
-          throw new Error(`plugins meta failed: ${resp.status}`);
+        const token = getToken();
+        setIsAdmin(hasAdminAccess(token));
+        const headers = token ? { authorization: `Bearer ${token}` } : {};
+        const metaResp = await fetch(`${base}/plugins/_meta?enabled_only=true`, {
+          cache: "no-store",
+          headers,
+        });
+        if (!metaResp.ok) {
+          throw new Error(`plugins meta failed: ${metaResp.status}`);
         }
-        const data = (await resp.json()) as PluginMeta[];
+        const data = (await metaResp.json()) as PluginMeta[];
+        let usersManage = false;
+        if (token) {
+          const usersManageResp = await fetch(`${base}/plugins/access/check/users.manage`, {
+            cache: "no-store",
+            headers,
+          });
+          usersManage = usersManageResp.ok
+            ? (((await usersManageResp.json()) as AccessCheckResponse).allowed ?? false)
+            : false;
+        }
         if (!alive) return;
-        setOrdersEnabled(data.some((item) => item.name === "orders" && item.enabled));
-        setContactsEnabled(data.some((item) => item.name === "contacts" && item.enabled));
-        setFinanceEnabled(data.some((item) => item.name === "finance" && item.enabled));
-        setWarehousesEnabled(data.some((item) => item.name === "warehouses" && item.enabled));
+        setCanManageUsers(usersManage);
+        setEnabledModuleOrder((data || []).filter((item) => item.enabled).map((item) => item.name));
       } catch {
         if (alive) {
-          setOrdersEnabled(false);
-          setContactsEnabled(false);
-          setFinanceEnabled(false);
-          setWarehousesEnabled(false);
+          setEnabledModuleOrder([]);
+          setCanManageUsers(false);
         }
       }
     };
@@ -537,6 +623,13 @@ const AppSidebar: React.FC = () => {
             </div>
           </div>
         </nav>
+      </div>
+      <div
+        className={`mt-auto pb-4 ${
+          isExpanded || isHovered || isMobileOpen ? "flex justify-center" : "hidden lg:flex lg:justify-center"
+        }`}
+      >
+        <Image src={meshLogoPng} alt="Mesh logo" width={144} height={34} className="h-auto w-auto max-w-[144px]" />
       </div>
     </aside>
   );

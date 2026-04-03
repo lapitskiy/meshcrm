@@ -25,6 +25,7 @@ DATABASE_URL = env(
     "DATABASE_URL",
     "postgresql://marketplaces:marketplaces_pw@marketplaces-db:5432/marketplaces",
 )
+MARKETPLACES_SCHEDULER_TOKEN = os.getenv("MARKETPLACES_SCHEDULER_TOKEN", "")
 MANIFEST = {
     "name": "marketplaces",
     "bounded_context": "marketplaces",
@@ -147,6 +148,41 @@ def init_db() -> None:
               updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
               PRIMARY KEY (user_uuid, offer_id)
             );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ozon_finance_operations_cache (
+              user_uuid UUID NOT NULL,
+              months_ago INT NOT NULL,
+              posting_number TEXT NOT NULL,
+              offer_id TEXT NOT NULL DEFAULT '',
+              delivery_schema TEXT NOT NULL DEFAULT '',
+              sku BIGINT,
+              sale_price INT NOT NULL DEFAULT 0,
+              opt INT NOT NULL DEFAULT 0,
+              fees INT NOT NULL DEFAULT 0,
+              payoff INT NOT NULL DEFAULT 0,
+              net_profit INT NOT NULL DEFAULT 0,
+              net_profit_perc INT NOT NULL DEFAULT 0,
+              posttax_profit INT NOT NULL DEFAULT 0,
+              posttax_profit_perc INT NOT NULL DEFAULT 0,
+              quantity INT NOT NULL DEFAULT 1,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (user_uuid, months_ago, posting_number)
+            );
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE ozon_finance_operations_cache
+            ADD COLUMN IF NOT EXISTS delivery_schema TEXT NOT NULL DEFAULT '';
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ozon_finance_cache_user_month
+            ON ozon_finance_operations_cache (user_uuid, months_ago);
             """
         )
 
@@ -345,6 +381,137 @@ def _ozon_get_products(ozon_hdrs: dict[str, str]) -> dict[str, Any]:
     )
 
 
+def _chunked(items: list[int], size: int = 1000) -> list[list[int]]:
+    out: list[list[int]] = []
+    current: list[int] = []
+    for item in items:
+        current.append(item)
+        if len(current) >= size:
+            out.append(current)
+            current = []
+    if current:
+        out.append(current)
+    return out
+
+
+def _ozon_offer_to_product_id_map(ozon_hdrs: dict[str, str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    last_id = ""
+    while True:
+        resp = _ozon_post_json(
+            "https://api-seller.ozon.ru/v5/product/info/prices",
+            ozon_hdrs,
+            {"filter": {"visibility": "ALL"}, "last_id": last_id, "limit": 1000},
+        )
+        items = resp.get("items") or []
+        for item in items:
+            offer_id = str(item.get("offer_id") or "")
+            if not offer_id:
+                continue
+            try:
+                out[offer_id] = int(float(item.get("product_id") or 0))
+            except Exception:
+                continue
+        next_last_id = str(resp.get("last_id") or "")
+        if not items or not next_last_id or next_last_id == last_id:
+            break
+        last_id = next_last_id
+    return out
+
+
+def _update_ozon_promotion_timer(ozon_hdrs: dict[str, str], product_ids: list[int]) -> dict[str, Any]:
+    if not product_ids:
+        return {"requested": 0, "updated": 0, "skipped": 0, "updated_ids": [], "skipped_ids": []}
+    statuses: list[dict[str, Any]] = []
+    for chunk in _chunked(product_ids, 1000):
+        s = _ozon_post_json(
+            "https://api-seller.ozon.ru/v1/product/action/timer/status",
+            ozon_hdrs,
+            {"product_ids": chunk},
+        )
+        statuses.extend(s.get("statuses") or [])
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    threshold_dt = now_utc + datetime.timedelta(days=10)
+    products_with_status: set[int] = set()
+    need_update: set[int] = set()
+    skipped: set[int] = set()
+    for st in statuses:
+        raw_pid = st.get("product_id")
+        try:
+            pid = int(raw_pid)
+        except Exception:
+            continue
+        products_with_status.add(pid)
+        expired_at_raw = st.get("expired_at")
+        if not expired_at_raw:
+            need_update.add(pid)
+            continue
+        try:
+            expired_at_dt = datetime.datetime.fromisoformat(str(expired_at_raw).replace("Z", "+00:00"))
+        except Exception:
+            need_update.add(pid)
+            continue
+        if expired_at_dt <= threshold_dt:
+            need_update.add(pid)
+        else:
+            skipped.add(pid)
+    missing = {int(pid) for pid in product_ids if int(pid) not in products_with_status}
+    need_update.update(missing)
+    updated_ids: list[int] = []
+    for chunk in _chunked(sorted(need_update), 1000):
+        _ozon_post_json(
+            "https://api-seller.ozon.ru/v1/product/action/timer/update",
+            ozon_hdrs,
+            {"product_ids": chunk},
+        )
+        updated_ids.extend(chunk)
+    return {
+        "requested": len(product_ids),
+        "updated": len(updated_ids),
+        "skipped": len(skipped),
+        "updated_ids": sorted(updated_ids),
+        "skipped_ids": sorted(skipped),
+    }
+
+
+def _run_user_timer_autoupdate(user_uuid_val: uuid.UUID) -> dict[str, Any]:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT offer_id
+            FROM ozon_promo_product_settings
+            WHERE user_uuid=%s AND auto_update_days_limit_promo = TRUE
+            """,
+            (user_uuid_val,),
+        )
+        offer_rows = cur.fetchall()
+    offer_ids = [str(r[0] or "") for r in offer_rows if r and r[0]]
+    if not offer_ids:
+        return {
+            "user_uuid": str(user_uuid_val),
+            "offer_ids_total": 0,
+            "offer_ids_without_product_id": [],
+            "timer": {"requested": 0, "updated": 0, "skipped": 0, "updated_ids": [], "skipped_ids": []},
+        }
+    ozon_hdrs = _ozon_headers(user_uuid_val)
+    offer_to_product = _ozon_offer_to_product_id_map(ozon_hdrs)
+    product_ids = []
+    missed_offer_ids = []
+    for offer_id in offer_ids:
+        pid = offer_to_product.get(offer_id)
+        if pid:
+            product_ids.append(int(pid))
+        else:
+            missed_offer_ids.append(offer_id)
+    timer_result = _update_ozon_promotion_timer(ozon_hdrs, product_ids)
+    return {
+        "user_uuid": str(user_uuid_val),
+        "offer_ids_total": len(offer_ids),
+        "offer_ids_without_product_id": missed_offer_ids,
+        "timer": timer_result,
+    }
+
+
 def _moysklad_opt_prices(user_uuid_val: uuid.UUID) -> dict[str, int]:
     token = _get_moysklad_token(user_uuid_val)
     data = _moysklad_get(token, "https://api.moysklad.ru/api/remap/1.2/entity/product?limit=1000")
@@ -403,6 +570,308 @@ def _ru_month_name_nominative(month: int) -> str:
         "Декабрь",
     ]
     return names[month - 1] if 1 <= month <= 12 else str(month)
+
+
+def _compose_ozon_finance_response(
+    report: dict[str, list[dict[str, Any]]],
+    start_date: datetime.date,
+    stop_date: datetime.date,
+    source: str,
+    refreshed_at: str | None = None,
+) -> dict[str, Any]:
+    summed_totals: dict[str, Any] = {}
+    for offer_id, entries in report.items():
+        total_quantity = sum(int(e.get("quantity") or 0) for e in entries) or 0
+        payoff_sum = sum(int(e.get("payoff") or 0) for e in entries)
+        net_profit_sum = sum(int(e.get("net_profit") or 0) for e in entries)
+        posttax_profit_sum = sum(int(e.get("posttax_profit") or 0) for e in entries)
+        avg_sales_price = int(payoff_sum / total_quantity) if total_quantity else 0
+        avg_percent_posttax = int(
+            (sum(int(e.get("posttax_profit_perc") or 0) for e in entries) / len(entries)) if entries else 0
+        )
+        summed_totals[offer_id] = {
+            "payoff": int(payoff_sum),
+            "net_profit_sum": int(net_profit_sum),
+            "posttax_profit_sum": int(posttax_profit_sum),
+            "average_sales_price": int(avg_sales_price),
+            "average_percent_posttax": int(avg_percent_posttax),
+            "total_quantity": int(total_quantity),
+        }
+
+    all_return_total = sum(
+        abs(int(e.get("payoff") or 0))
+        for entries in report.values()
+        for e in entries
+        if int(e.get("payoff") or 0) < 0
+    )
+    total_payoff = sum(int(e.get("payoff") or 0) for entries in report.values() for e in entries)
+    all_totals_raw: dict[str, Any] = {
+        "all_total_price_sum": int(total_payoff),
+        "all_net_profit_sum": sum(v["net_profit_sum"] for v in summed_totals.values()),
+        "all_posttax_profit_sum": sum(v["posttax_profit_sum"] for v in summed_totals.values()),
+        "all_quantity": sum(v["total_quantity"] for v in summed_totals.values()),
+        "all_return_total": int(all_return_total),
+    }
+    all_totals = {k: (f"{v:,}" if isinstance(v, (int, float)) else v) for k, v in all_totals_raw.items()}
+    header_data = {
+        "start_date": start_date.isoformat(),
+        "stop_date": stop_date.isoformat(),
+        "month": _ru_month_name_nominative(start_date.month),
+        "day_delta": int((stop_date - start_date).days),
+        "source": source,
+        "refreshed_at": refreshed_at or "",
+    }
+    sorted_report = dict(sorted(report.items(), key=lambda kv: kv[0]))
+    return {
+        "report": sorted_report,
+        "summed_totals": summed_totals,
+        "all_totals": all_totals,
+        "header_data": header_data,
+    }
+
+
+def _build_ozon_finance_report_from_api(
+    user_uuid_val: uuid.UUID, ozon_hdrs: dict[str, str], start_date: datetime.date, stop_date: datetime.date
+) -> dict[str, list[dict[str, Any]]]:
+    prod = _ozon_get_products(ozon_hdrs)
+    sku_offer_id: dict[str, str] = {}
+    for item in prod.get("items") or []:
+        offer_id = item.get("offer_id")
+        if not offer_id:
+            continue
+        for src in item.get("sources") or []:
+            sku = src.get("sku")
+            if sku is None:
+                continue
+            sku_offer_id[str(sku)] = str(offer_id)
+
+    ms_opt = _moysklad_opt_prices(user_uuid_val)
+    from_iso = f"{start_date.isoformat()}T00:00:00.000Z"
+    to_iso = f"{stop_date.isoformat()}T23:59:59.999Z"
+    url = "https://api-seller.ozon.ru/v3/finance/transaction/list"
+    page = 1
+    page_size = 1000
+    all_operations: list[dict[str, Any]] = []
+    while True:
+        payload = {
+            "filter": {
+                "date": {"from": from_iso, "to": to_iso},
+                "operation_type": [],
+                "posting_number": "",
+                "transaction_type": "all",
+            },
+            "page": page,
+            "page_size": page_size,
+        }
+        resp = _ozon_post_json(url, ozon_hdrs, payload)
+        result = resp.get("result") or {}
+        operations = result.get("operations") or []
+        if not operations:
+            break
+        all_operations.extend(operations)
+        page_count = int(result.get("page_count") or 0)
+        if page >= page_count:
+            break
+        page += 1
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in all_operations:
+        pn = (entry.get("posting") or {}).get("posting_number") or "unknown"
+        grouped[str(pn)].append(entry)
+
+    report: dict[str, list[dict[str, Any]]] = {}
+    for posting_number, items in grouped.items():
+        sale_price = 0.0
+        payoff = 0.0
+        sku_val: str | None = None
+        offer_id: str | None = None
+        delivery_schema = ""
+        opt = 0
+        for item in items:
+            if not delivery_schema:
+                posting = item.get("posting") or {}
+                ds = str(posting.get("delivery_schema") or "").strip().upper()
+                if ds in ("FBS", "FBO", "RFBS", "REAL_FBS", "FBO_LITE"):
+                    delivery_schema = ds
+            item_s = item.get("items") or []
+            if item_s and not sku_val:
+                sku_raw = item_s[0].get("sku")
+                if sku_raw is not None:
+                    sku_val = str(sku_raw)
+                    offer_id = sku_offer_id.get(sku_val)
+                    if offer_id:
+                        opt = int(ms_opt.get(offer_id) or 0)
+            accruals = float(item.get("accruals_for_sale") or 0)
+            if accruals != 0:
+                sale_price += accruals
+            payoff += float(item.get("amount") or 0)
+        service_fees = sale_price - payoff
+        if not offer_id or opt == 0 or sale_price == 0:
+            continue
+        net_profit = int(payoff) - int(opt)
+        posttax_profit = int(net_profit - (int(payoff) * 0.06))
+        net_profit_perc = int((net_profit / int(opt)) * 100) if int(opt) else 0
+        posttax_profit_perc = int((posttax_profit / int(opt)) * 100) if int(opt) else 0
+        report.setdefault(offer_id, []).append(
+            {
+                "quantity": 1,
+                "name": posting_number,
+                "delivery_schema": delivery_schema,
+                "product_id": int(sku_val) if sku_val and sku_val.isdigit() else 0,
+                "sale_price": int(sale_price),
+                "opt": int(opt),
+                "fees": int(service_fees),
+                "payoff": int(payoff),
+                "net_profit": int(net_profit),
+                "net_profit_perc": int(net_profit_perc),
+                "posttax_profit": int(posttax_profit),
+                "posttax_profit_perc": int(posttax_profit_perc),
+            }
+        )
+    return report
+
+
+def _save_ozon_finance_cache(
+    user_uuid_val: uuid.UUID, months_ago: int, report: dict[str, list[dict[str, Any]]]
+) -> None:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM ozon_finance_operations_cache WHERE user_uuid=%s AND months_ago=%s",
+            (user_uuid_val, months_ago),
+        )
+        for offer_id, entries in report.items():
+            for entry in entries:
+                cur.execute(
+                    """
+                    INSERT INTO ozon_finance_operations_cache (
+                      user_uuid, months_ago, posting_number, offer_id, delivery_schema, sku, sale_price, opt, fees, payoff,
+                      net_profit, net_profit_perc, posttax_profit, posttax_profit_perc, quantity, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    """,
+                    (
+                        user_uuid_val,
+                        months_ago,
+                        str(entry.get("name") or ""),
+                        offer_id,
+                        str(entry.get("delivery_schema") or ""),
+                        int(entry.get("product_id") or 0),
+                        int(entry.get("sale_price") or 0),
+                        int(entry.get("opt") or 0),
+                        int(entry.get("fees") or 0),
+                        int(entry.get("payoff") or 0),
+                        int(entry.get("net_profit") or 0),
+                        int(entry.get("net_profit_perc") or 0),
+                        int(entry.get("posttax_profit") or 0),
+                        int(entry.get("posttax_profit_perc") or 0),
+                        int(entry.get("quantity") or 1),
+                    ),
+                )
+
+
+def _load_ozon_finance_cache(
+    user_uuid_val: uuid.UUID, months_ago: int
+) -> tuple[dict[str, list[dict[str, Any]]], str | None]:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT offer_id, posting_number, delivery_schema, sku, sale_price, opt, fees, payoff, net_profit, net_profit_perc,
+                   posttax_profit, posttax_profit_perc, quantity, updated_at
+            FROM ozon_finance_operations_cache
+            WHERE user_uuid=%s AND months_ago=%s
+            ORDER BY offer_id, posting_number
+            """,
+            (user_uuid_val, months_ago),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="cache is empty for this period, run mode=live first")
+    report: dict[str, list[dict[str, Any]]] = {}
+    refreshed_at = ""
+    for row in rows:
+        offer_id = str(row[0] or "")
+        report.setdefault(offer_id, []).append(
+            {
+                "quantity": int(row[12] or 1),
+                "name": str(row[1] or ""),
+                "delivery_schema": str(row[2] or ""),
+                "product_id": int(row[3] or 0),
+                "sale_price": int(row[4] or 0),
+                "opt": int(row[5] or 0),
+                "fees": int(row[6] or 0),
+                "payoff": int(row[7] or 0),
+                "net_profit": int(row[8] or 0),
+                "net_profit_perc": int(row[9] or 0),
+                "posttax_profit": int(row[10] or 0),
+                "posttax_profit_perc": int(row[11] or 0),
+            }
+        )
+        if row[13]:
+            refreshed_at = row[13].isoformat()
+    return report, refreshed_at or None
+
+
+def _realization_from_finance_cache(user_uuid_val: uuid.UUID, months_ago: int = 1) -> dict[str, Any]:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT offer_id, sale_price, quantity
+            FROM ozon_finance_operations_cache
+            WHERE user_uuid=%s AND months_ago=%s
+            """,
+            (user_uuid_val, months_ago),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="finance cache is empty, run /ozon/finances with mode=live first")
+    realization: dict[str, Any] = {}
+    price_groups: dict[str, list[float]] = {}
+    price_acc: dict[str, Any] = {}
+    for row in rows:
+        offer_id = str(row[0] or "")
+        if not offer_id:
+            continue
+        qty = int(row[2] or 0)
+        sale_price = float(row[1] or 0)
+        realization.setdefault(offer_id, {"sale_qty": 0, "avg_seller_price": 0, "avg_list": []})
+        realization[offer_id]["sale_qty"] = int(realization[offer_id].get("sale_qty") or 0) + max(qty, 0)
+        if qty > 0 and sale_price > 0:
+            per_unit = sale_price / qty
+            price_acc.setdefault(offer_id, {"total": 0.0, "count": 0})
+            price_acc[offer_id]["total"] += per_unit * qty
+            price_acc[offer_id]["count"] += qty
+            price_groups.setdefault(offer_id, []).extend([per_unit] * qty)
+
+    for offer_id, acc in price_acc.items():
+        c = int(acc.get("count") or 0)
+        avg = int((float(acc.get("total") or 0) / c) if c else 0)
+        realization.setdefault(offer_id, {"sale_qty": 0})
+        realization[offer_id]["avg_seller_price"] = avg
+
+    for offer_id, prices in price_groups.items():
+        if not prices:
+            realization.setdefault(offer_id, {})["avg_list"] = []
+            continue
+        sorted_prices = sorted(prices)
+        used = [False] * len(sorted_prices)
+        groups: list[list[float]] = []
+        i = 0
+        while i < len(sorted_prices):
+            if used[i]:
+                i += 1
+                continue
+            group = [sorted_prices[i]]
+            used[i] = True
+            for j in range(i + 1, len(sorted_prices)):
+                if not used[j] and abs(sorted_prices[j] - group[0]) / group[0] <= 0.1:
+                    group.append(sorted_prices[j])
+                    used[j] = True
+            groups.append(group)
+            i += 1
+        realization.setdefault(offer_id, {})["avg_list"] = [
+            {"count": len(g), "avg_price": int(sum(g) / len(g))} for g in groups if g
+        ]
+    return realization
 
 def _get_moysklad_token(user_uuid_val: uuid.UUID) -> str:
     s = _get_provider_settings("moysklad", user_uuid_val)
@@ -781,162 +1250,74 @@ def save_yandex_settings(body: ProviderSettingsIn, x_user_uuid: str | None = Hea
 def ozon_finances(
     x_user_uuid: str | None = Header(default=None),
     months_ago: int = Query(default=1, ge=1, le=24),
+    mode: str = Query(default="cache", pattern="^(cache|live)$"),
 ) -> dict[str, Any]:
     user_uuid_val = _user_uuid(x_user_uuid)
-    ozon_hdrs = _ozon_headers(user_uuid_val)
-
-    # dependencies: Ozon products list + MoySklad opt prices
-    prod = _ozon_get_products(ozon_hdrs)
-    sku_offer_id: dict[str, str] = {}
-    for item in prod.get("items") or []:
-        offer_id = item.get("offer_id")
-        if not offer_id:
-            continue
-        for src in item.get("sources") or []:
-            sku = src.get("sku")
-            if sku is None:
-                continue
-            sku_offer_id[str(sku)] = str(offer_id)
-
-    ms_opt = _moysklad_opt_prices(user_uuid_val)
-
     now = datetime.datetime.utcnow()
-    from_iso, to_iso, start_date, stop_date = _month_range_utc_months_ago(now, months_ago)
-
-    # https://docs.ozon.ru/api/seller/#operation/FinanceAPI_FinanceTransactionListV3
-    url = "https://api-seller.ozon.ru/v3/finance/transaction/list"
-    page = 1
-    page_size = 1000
-    all_operations: list[dict[str, Any]] = []
-    while True:
-        payload = {
-            "filter": {
-                "date": {"from": from_iso, "to": to_iso},
-                "operation_type": [],
-                "posting_number": "",
-                "transaction_type": "all",
-            },
-            "page": page,
-            "page_size": page_size,
-        }
-        resp = _ozon_post_json(url, ozon_hdrs, payload)
-        result = resp.get("result") or {}
-        operations = result.get("operations") or []
-        if not operations:
-            break
-        all_operations.extend(operations)
-        page_count = int(result.get("page_count") or 0)
-        if page >= page_count:
-            break
-        page += 1
-
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for entry in all_operations:
-        pn = (entry.get("posting") or {}).get("posting_number") or "unknown"
-        grouped[str(pn)].append(entry)
-
-    report: dict[str, list[dict[str, Any]]] = {}
-    total_payoff = 0
-    all_return_total = 0
-
-    for posting_number, items in grouped.items():
-        sale_price = 0.0
-        payoff = 0.0
-        sku_val: str | None = None
-        offer_id: str | None = None
-        opt = 0
-
-        for item in items:
-            item_s = item.get("items") or []
-            if item_s and not sku_val:
-                sku_raw = item_s[0].get("sku")
-                if sku_raw is not None:
-                    sku_val = str(sku_raw)
-                    offer_id = sku_offer_id.get(sku_val)
-                    if offer_id:
-                        opt = int(ms_opt.get(offer_id) or 0)
-
-            accruals = float(item.get("accruals_for_sale") or 0)
-            if accruals != 0:
-                sale_price += accruals
-
-            payoff += float(item.get("amount") or 0)
-
-        service_fees = sale_price - payoff
-        total_payoff += int(payoff)
-
-        # returns are usually negative amounts without a sale_price
-        if payoff < 0:
-            all_return_total += abs(int(payoff))
-
-        if not offer_id or opt == 0 or sale_price == 0:
-            continue
-
-        net_profit = int(payoff) - int(opt)
-        posttax_profit = int(net_profit - (int(payoff) * 0.06))
-        net_profit_perc = int((net_profit / int(opt)) * 100) if int(opt) else 0
-        posttax_profit_perc = int((posttax_profit / int(opt)) * 100) if int(opt) else 0
-
-        new_entry = {
-            "quantity": 1,
-            "name": posting_number,
-            "product_id": int(sku_val) if sku_val and sku_val.isdigit() else 0,
-            "sale_price": int(sale_price),
-            "opt": int(opt),
-            "fees": int(service_fees),
-            "payoff": int(payoff),
-            "net_profit": int(net_profit),
-            "net_profit_perc": int(net_profit_perc),
-            "posttax_profit": int(posttax_profit),
-            "posttax_profit_perc": int(posttax_profit_perc),
-        }
-        report.setdefault(offer_id, []).append(new_entry)
-
-    # summed totals per offer_id
-    summed_totals: dict[str, Any] = {}
-    for offer_id, entries in report.items():
-        total_quantity = sum(int(e.get("quantity") or 0) for e in entries) or 0
-        payoff_sum = sum(int(e.get("payoff") or 0) for e in entries)
-        net_profit_sum = sum(int(e.get("net_profit") or 0) for e in entries)
-        posttax_profit_sum = sum(int(e.get("posttax_profit") or 0) for e in entries)
-        avg_sales_price = int(payoff_sum / total_quantity) if total_quantity else 0
-        avg_percent_posttax = int(
-            (sum(int(e.get("posttax_profit_perc") or 0) for e in entries) / len(entries)) if entries else 0
+    _, _, start_date, stop_date = _month_range_utc_months_ago(now, months_ago)
+    if mode == "live":
+        ozon_hdrs = _ozon_headers(user_uuid_val)
+        report = _build_ozon_finance_report_from_api(user_uuid_val, ozon_hdrs, start_date, stop_date)
+        _save_ozon_finance_cache(user_uuid_val, months_ago, report)
+        return _compose_ozon_finance_response(
+            report=report,
+            start_date=start_date,
+            stop_date=stop_date,
+            source="live",
+            refreshed_at=datetime.datetime.utcnow().isoformat(),
         )
-        summed_totals[offer_id] = {
-            "payoff": int(payoff_sum),
-            "net_profit_sum": int(net_profit_sum),
-            "posttax_profit_sum": int(posttax_profit_sum),
-            "average_sales_price": int(avg_sales_price),
-            "average_percent_posttax": int(avg_percent_posttax),
-            "total_quantity": int(total_quantity),
-        }
+    report, refreshed_at = _load_ozon_finance_cache(user_uuid_val, months_ago)
+    return _compose_ozon_finance_response(
+        report=report,
+        start_date=start_date,
+        stop_date=stop_date,
+        source="cache",
+        refreshed_at=refreshed_at,
+    )
 
-    all_totals_raw: dict[str, Any] = {
-        "all_total_price_sum": int(total_payoff),
-        "all_net_profit_sum": sum(v["net_profit_sum"] for v in summed_totals.values()),
-        "all_posttax_profit_sum": sum(v["posttax_profit_sum"] for v in summed_totals.values()),
-        "all_quantity": sum(v["total_quantity"] for v in summed_totals.values()),
-        "all_return_total": int(all_return_total),
-    }
-    all_totals = {k: (f"{v:,}" if isinstance(v, (int, float)) else v) for k, v in all_totals_raw.items()}
 
-    header_data = {
-        "start_date": start_date.isoformat(),
-        "stop_date": stop_date.isoformat(),
-        "month": _ru_month_name_nominative(start_date.month),
-        "day_delta": int((stop_date - start_date).days),
-    }
+@app.post("/internal/jobs/ozon/promotions/timer-autoupdate")
+def run_ozon_promo_timer_autoupdate(x_scheduler_token: str | None = Header(default=None)) -> dict[str, Any]:
+    if MARKETPLACES_SCHEDULER_TOKEN and x_scheduler_token != MARKETPLACES_SCHEDULER_TOKEN:
+        raise HTTPException(status_code=403, detail="invalid scheduler token")
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT user_uuid
+            FROM ozon_promo_product_settings
+            WHERE auto_update_days_limit_promo = TRUE
+            """
+        )
+        rows = cur.fetchall()
+    users = [uuid.UUID(str(r[0])) for r in rows if r and r[0]]
+    user_results: list[dict[str, Any]] = []
+    for user_uuid_val in users:
+        with db() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT offer_id
+                FROM ozon_promo_product_settings
+                WHERE user_uuid=%s AND auto_update_days_limit_promo = TRUE
+                """,
+                (user_uuid_val,),
+            )
+            offer_rows = cur.fetchall()
+        offer_ids = [str(r[0] or "") for r in offer_rows if r and r[0]]
+        if not offer_ids:
+            continue
+        try:
+            user_results.append(_run_user_timer_autoupdate(user_uuid_val))
+        except HTTPException as e:
+            user_results.append(
+                {"user_uuid": str(user_uuid_val), "error": str(e.detail), "status_code": int(e.status_code)}
+            )
+    return {"users_total": len(users), "results": user_results}
 
-    # stable ordering for UI
-    sorted_report = dict(sorted(report.items(), key=lambda kv: kv[0]))
 
-    return {
-        "report": sorted_report,
-        "summed_totals": summed_totals,
-        "all_totals": all_totals,
-        "header_data": header_data,
-    }
+@app.post("/ozon/promotions/timer-autoupdate")
+def run_ozon_promo_timer_autoupdate_for_user(x_user_uuid: str | None = Header(default=None)) -> dict[str, Any]:
+    user_uuid_val = _user_uuid(x_user_uuid)
+    return _run_user_timer_autoupdate(user_uuid_val)
 
 
 @app.get("/ozon/promotions")
@@ -950,69 +1331,10 @@ def ozon_promotions(
     # opt prices from MoySklad: article == offer_id
     ms_opt = _moysklad_opt_prices(user_uuid_val)
 
-    # realization stats for last month
+    # realization stats for last month from finances cache
     now = datetime.datetime.utcnow()
-    from_iso, to_iso, start_date, stop_date = _month_range_utc_months_ago(now, 1)
-    _ = (from_iso, to_iso)  # unused, keep range derivation consistent
-    real = _ozon_finance_realization(ozon_hdrs, start_date.year, start_date.month)
-    rows = ((real.get("result") or {}).get("rows") or []) if isinstance(real, dict) else []
-
-    realization: dict[str, Any] = {}
-    price_groups: dict[str, list[float]] = {}
-    price_acc: dict[str, Any] = {}
-    for it in rows:
-        offer_id = ((it.get("item") or {}).get("offer_id")) if isinstance(it, dict) else None
-        if not offer_id:
-            continue
-        offer_id = str(offer_id)
-        qty = 0
-        try:
-            qty = int(((it.get("delivery_commission") or {}).get("quantity")) or 0)
-        except Exception:
-            qty = 0
-        realization.setdefault(offer_id, {"sale_qty": 0, "avg_seller_price": 0, "avg_list": []})
-        realization[offer_id]["sale_qty"] = int(realization[offer_id].get("sale_qty") or 0) + qty
-
-        seller_price = it.get("seller_price_per_instance")
-        if seller_price is not None:
-            try:
-                sp = float(seller_price)
-                price_acc.setdefault(offer_id, {"total": 0.0, "count": 0})
-                price_acc[offer_id]["total"] += sp * qty
-                price_acc[offer_id]["count"] += qty
-                price_groups.setdefault(offer_id, []).extend([sp] * max(qty, 0))
-            except Exception:
-                pass
-
-    for offer_id, acc in price_acc.items():
-        c = int(acc.get("count") or 0)
-        avg = int((float(acc.get("total") or 0) / c) if c else 0)
-        realization.setdefault(offer_id, {"sale_qty": 0})
-        realization[offer_id]["avg_seller_price"] = avg
-
-    # group prices by +-10% like OWM (simplified same algo)
-    for offer_id, prices in price_groups.items():
-        if not prices:
-            realization.setdefault(offer_id, {})["avg_list"] = []
-            continue
-        sorted_prices = sorted(prices)
-        used = [False] * len(sorted_prices)
-        groups: list[list[float]] = []
-        i = 0
-        while i < len(sorted_prices):
-            if used[i]:
-                i += 1
-                continue
-            group = [sorted_prices[i]]
-            used[i] = True
-            for j in range(i + 1, len(sorted_prices)):
-                if not used[j] and abs(sorted_prices[j] - group[0]) / group[0] <= 0.1:
-                    group.append(sorted_prices[j])
-                    used[j] = True
-            groups.append(group)
-            i += 1
-        avg_list = [{"count": len(g), "avg_price": int(sum(g) / len(g))} for g in groups if g]
-        realization.setdefault(offer_id, {})["avg_list"] = avg_list
+    _, _, start_date, _ = _month_range_utc_months_ago(now, 1)
+    realization = _realization_from_finance_cache(user_uuid_val, 1)
 
     # prices + commissions
     prices_resp = _ozon_post_json(

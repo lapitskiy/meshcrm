@@ -5,14 +5,20 @@ import Label from "@/components/form/Label";
 import Button from "@/components/ui/button/Button";
 import { Dropdown } from "@/components/ui/dropdown/Dropdown";
 import { DropdownItem } from "@/components/ui/dropdown/DropdownItem";
-import { ChevronDownIcon } from "@/icons/index";
+import { ChevronDownIcon, PlusIcon } from "@/icons/index";
 import { getGatewayBaseUrl } from "@/lib/gateway";
+import { getKeycloak } from "@/lib/keycloak";
 import { useRouter } from "next/navigation";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 type ServiceCategory = {
   id: string;
   name: string;
+};
+
+type ServiceCategoryAccessSummary = {
+  total_count: number;
+  accessible_count: number;
 };
 
 type WorkType = {
@@ -63,7 +69,11 @@ type WorkTypeRow = {
 };
 
 function getToken(): string {
-  return (window as any).__hubcrmAccessToken || "";
+  const raw = (window as any).__hubcrmAccessToken;
+  if (!raw) return "";
+  const token = String(raw).trim();
+  if (!token || token === "undefined" || token === "null") return "";
+  return token;
 }
 
 const orderKinds = [
@@ -125,6 +135,10 @@ export default function OrdersCreatePage() {
   const [orderKind, setOrderKind] = useState<string>("");
 
   const [categories, setCategories] = useState<ServiceCategory[]>([]);
+  const [categoryAccessSummary, setCategoryAccessSummary] = useState<ServiceCategoryAccessSummary>({
+    total_count: 0,
+    accessible_count: 0,
+  });
   const [serviceObjects, setServiceObjects] = useState<ServiceObject[]>([]);
 
   const [categoryId, setCategoryId] = useState("");
@@ -161,21 +175,49 @@ export default function OrdersCreatePage() {
     setIsOpen(false);
   }
 
-  const authHeaders = () => {
-    const token = getToken();
+  const authHeaders = async () => {
+    let token = getToken();
+    if (!token) {
+      try {
+        const kc = await getKeycloak();
+        try {
+          await kc.updateToken(30);
+        } catch {
+          // If refresh fails, we'll still try with the current token value.
+        }
+        token = kc.token || "";
+        if (token) {
+          (window as any).__hubcrmAccessToken = token;
+        }
+      } catch {
+        // Keep empty token; API will return 401 and show a clear error.
+      }
+    }
     return token ? { authorization: `Bearer ${token}` } : {};
   };
 
   const loadCategories = async () => {
-    const resp = await fetch(`${base}/orders/settings/service-categories/accessible`, {
-      cache: "no-store",
-      headers: authHeaders(),
-    });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => "");
-      throw new Error(`load categories failed: ${resp.status} ${body}`);
+    const headers = await authHeaders();
+    const [categoriesResp, summaryResp] = await Promise.all([
+      fetch(`${base}/orders/settings/service-categories/accessible`, {
+        cache: "no-store",
+        headers,
+      }),
+      fetch(`${base}/orders/settings/service-categories/accessible-summary`, {
+        cache: "no-store",
+        headers,
+      }),
+    ]);
+    if (!categoriesResp.ok) {
+      const body = await categoriesResp.text().catch(() => "");
+      throw new Error(`load categories failed: ${categoriesResp.status} ${body}`);
     }
-    setCategories((await resp.json()) as ServiceCategory[]);
+    if (!summaryResp.ok) {
+      const body = await summaryResp.text().catch(() => "");
+      throw new Error(`load categories summary failed: ${summaryResp.status} ${body}`);
+    }
+    setCategories((await categoriesResp.json()) as ServiceCategory[]);
+    setCategoryAccessSummary((await summaryResp.json()) as ServiceCategoryAccessSummary);
   };
 
   const fetchWorkTypeOptions = async (selectedCategoryId: string, q: string): Promise<WorkType[]> => {
@@ -185,7 +227,7 @@ export default function OrdersCreatePage() {
       )}&q=${encodeURIComponent(q)}&limit=50`,
       {
         cache: "no-store",
-        headers: authHeaders(),
+        headers: await authHeaders(),
       }
     );
     if (!resp.ok) {
@@ -202,7 +244,7 @@ export default function OrdersCreatePage() {
       )}&q=${encodeURIComponent(q)}&limit=50`,
       {
         cache: "no-store",
-        headers: authHeaders(),
+        headers: await authHeaders(),
       }
     );
     if (!resp.ok) {
@@ -296,6 +338,8 @@ export default function OrdersCreatePage() {
     setContactHasNoPhone(false);
     setError(null);
   };
+
+  const hasNoCategoryAccess = orderKind && categories.length === 0 && categoryAccessSummary.total_count > 0;
 
   const onSelectWorkType = (rowKey: number, item: WorkType) => {
     const alreadySelected = workTypeRows.some((r) => r.key !== rowKey && r.selectedId === item.id);
@@ -401,7 +445,7 @@ export default function OrdersCreatePage() {
     try {
       const linksResp = await fetch(`${base}/plugins/_links?enabled_only=true`, {
         cache: "no-store",
-        headers: authHeaders(),
+        headers: await authHeaders(),
       });
       if (!linksResp.ok) {
         const body = await linksResp.text().catch(() => "");
@@ -421,7 +465,7 @@ export default function OrdersCreatePage() {
       for (const moduleName of linkedTargets) {
         const moduleResp = await fetch(`${base}/plugins/${encodeURIComponent(moduleName)}`, {
           cache: "no-store",
-          headers: authHeaders(),
+          headers: await authHeaders(),
         });
         if (!moduleResp.ok) continue;
 
@@ -558,7 +602,7 @@ export default function OrdersCreatePage() {
           if (name && phone && phone !== "+7" && contactsCfg.listEndpoint) {
             const createContactResp = await fetch(`${base}${contactsCfg.listEndpoint}`, {
               method: "POST",
-              headers: { "content-type": "application/json", ...authHeaders() },
+              headers: { "content-type": "application/json", ...(await authHeaders()) },
               body: JSON.stringify({ name, phone }),
             });
             if (!createContactResp.ok) {
@@ -570,7 +614,7 @@ export default function OrdersCreatePage() {
                 const fallbackSearchEndpoint = contactsCfg.searchEndpoint || `${contactsCfg.listEndpoint}/search`;
                 const searchResp = await fetch(
                   `${base}${fallbackSearchEndpoint}?phone=${encodeURIComponent(phone)}&limit=20`,
-                  { cache: "no-store", headers: authHeaders() },
+                  { cache: "no-store", headers: await authHeaders() },
                 );
                 if (!searchResp.ok) {
                   const searchBody = await searchResp.text().catch(() => "");
@@ -612,7 +656,7 @@ export default function OrdersCreatePage() {
 
       const createOrderResp = await fetch(`${base}/orders/orders`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...authHeaders() },
+        headers: { "content-type": "application/json", ...(await authHeaders()) },
         body: JSON.stringify(orderPayload),
       });
       if (!createOrderResp.ok) {
@@ -640,7 +684,7 @@ export default function OrdersCreatePage() {
             }
             const financeResp = await fetch(`${base}/finance/finance/order-lines`, {
               method: "PUT",
-              headers: { "content-type": "application/json", ...authHeaders() },
+              headers: { "content-type": "application/json", ...(await authHeaders()) },
               body: JSON.stringify({
                 order_uuid: orderUuid,
                 work_type_uuid: wt.id,
@@ -697,7 +741,7 @@ export default function OrdersCreatePage() {
           `${base}${contactConfig.searchEndpoint}?phone=${encodeURIComponent(currentPhoneValue)}&limit=20`,
           {
             cache: "no-store",
-            headers: authHeaders(),
+            headers: await authHeaders(),
           }
         );
         if (!resp.ok) {
@@ -729,7 +773,7 @@ export default function OrdersCreatePage() {
       try {
         const resp = await fetch(`${base}${contactConfig.listEndpoint}`, {
           cache: "no-store",
-          headers: authHeaders(),
+          headers: await authHeaders(),
         });
         if (!resp.ok) {
           const body = await resp.text().catch(() => "");
@@ -838,6 +882,7 @@ export default function OrdersCreatePage() {
               <select
                 value={categoryId}
                 onChange={(e) => void onSelectCategory(e.target.value)}
+                disabled={categories.length === 0}
                 className="h-11 w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
               >
                 <option value="">Выберите категорию</option>
@@ -847,6 +892,11 @@ export default function OrdersCreatePage() {
                   </option>
                 ))}
               </select>
+              {hasNoCategoryAccess ? (
+                <div className="mt-2 text-sm text-red-600">
+                  Нет доступа ни к одной из категорий услуг, обратитесь к администратору.
+                </div>
+              ) : null}
             </div>
           )}
 
@@ -854,7 +904,19 @@ export default function OrdersCreatePage() {
             <div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <Label>Объект ремонта услуги</Label>
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <Label>Объект ремонта услуги</Label>
+                    <a
+                      href="/modules/orders/settings/service-object"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-gray-300 text-gray-600 hover:bg-gray-100 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-white/10"
+                      title="Добавить объект ремонта"
+                      aria-label="Добавить объект ремонта"
+                    >
+                      <PlusIcon className="h-4 w-4" />
+                    </a>
+                  </div>
                   <div className="relative" ref={serviceObjectBoxRef}>
                     <input
                       value={serviceObjectQuery}
@@ -911,7 +973,19 @@ export default function OrdersCreatePage() {
 
           {categoryId && serviceObjectId && (
             <div>
-              <Label>Вид работы</Label>
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <Label>Вид работы</Label>
+                <a
+                  href="/modules/orders/settings/work-types"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-gray-300 text-gray-600 hover:bg-gray-100 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-white/10"
+                  title="Добавить вид работы"
+                  aria-label="Добавить вид работы"
+                >
+                  <PlusIcon className="h-4 w-4" />
+                </a>
+              </div>
               <div ref={workTypesBlockRef} className="space-y-3">
                 {workTypeRows.map((row, index) => {
                   const selectedIdsExceptCurrent = new Set(

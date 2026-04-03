@@ -9,6 +9,10 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Link from "@tiptap/extension-link";
 import Image from "@tiptap/extension-image";
+import Table from "@tiptap/extension-table";
+import TableRow from "@tiptap/extension-table-row";
+import TableHeader from "@tiptap/extension-table-header";
+import TableCell from "@tiptap/extension-table-cell";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 type PrintVariable = {
@@ -22,6 +26,75 @@ type PrintCategory = {
   id: string;
   name: string;
 };
+
+const ResizableImage = Image.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      width: {
+        default: "100%",
+        parseHTML: (element) =>
+          element.getAttribute("data-width") || element.style.width || "100%",
+        renderHTML: (attributes) => {
+          const width = String(attributes.width || "100%");
+          return { "data-width": width, style: `width: ${width}; height: auto; max-width: 100%;` };
+        },
+      },
+    };
+  },
+});
+
+function parseWidthPercent(raw: string): number {
+  const value = Number.parseInt(String(raw || "").replace("%", "").trim(), 10);
+  if (!Number.isFinite(value)) return 100;
+  return Math.max(10, Math.min(100, value));
+}
+
+function makeHtmlReadable(html: string): { readableHtml: string; srcMap: Record<string, string> } {
+  const srcMap: Record<string, string> = {};
+  let idx = 0;
+  const readableHtml = String(html || "").replace(
+    /src=(['"])(data:image\/[^'"]+)\1/gi,
+    (_m, quote: string, value: string) => {
+      idx += 1;
+      const token = `__IMG_DATA_${idx}__`;
+      srcMap[token] = value;
+      return `src=${quote}${token}${quote}`;
+    }
+  );
+  return { readableHtml, srcMap };
+}
+
+function restoreReadableHtml(html: string, srcMap: Record<string, string>): string {
+  let restored = String(html || "");
+  for (const [token, original] of Object.entries(srcMap || {})) {
+    restored = restored.split(token).join(original);
+  }
+  return restored;
+}
+
+function ensureCssDecl(style: string, decl: string): string {
+  const [prop] = decl.split(":");
+  if (style.toLowerCase().includes(`${String(prop).trim().toLowerCase()}:`)) return style;
+  return `${style.trim()}${style.trim().endsWith(";") || !style.trim() ? "" : ";"} ${decl}`.trim();
+}
+
+function normalizeTablesForPrint(html: string): string {
+  return String(html || "").replace(/<table\b([^>]*)>/gi, (full: string, attrs: string) => {
+    const styleMatch = attrs.match(/\sstyle=(['"])(.*?)\1/i);
+    const styleQuote = styleMatch?.[1] || '"';
+    const currentStyle = styleMatch?.[2] || "";
+    const nextStyle = [
+      "width: 100%",
+      "table-layout: fixed",
+      "border-collapse: collapse",
+    ].reduce((acc, decl) => ensureCssDecl(acc, decl), currentStyle);
+    if (styleMatch) {
+      return full.replace(styleMatch[0], ` style=${styleQuote}${nextStyle}${styleQuote}`);
+    }
+    return `<table${attrs} style="${nextStyle}">`;
+  });
+}
 
 function getToken(): string {
   return (window as any).__hubcrmAccessToken || "";
@@ -38,6 +111,9 @@ export default function PrintCreateFormPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedId, setSavedId] = useState<string | null>(null);
+  const [htmlMode, setHtmlMode] = useState(false);
+  const [htmlDraft, setHtmlDraft] = useState("");
+  const [htmlSrcMap, setHtmlSrcMap] = useState<Record<string, string>>({});
   const imageInputRef = useRef<HTMLInputElement | null>(null);
 
   const authHeaders = () => {
@@ -49,14 +125,22 @@ export default function PrintCreateFormPage() {
     extensions: [
       StarterKit,
       Link.configure({ openOnClick: false }),
-      Image.configure({ allowBase64: true }),
+      Table.configure({
+        resizable: false,
+        HTMLAttributes: { style: "width: 100%; table-layout: fixed; border-collapse: collapse;" },
+      }),
+      TableRow,
+      TableHeader,
+      TableCell,
+      ResizableImage.configure({ allowBase64: true }),
     ],
     content: "<p></p>",
     editorProps: {
       attributes: {
         class:
-          "min-h-[260px] rounded-xl border border-gray-200 bg-white p-4 text-sm text-gray-800 outline-none dark:border-gray-800 dark:bg-white/[0.03] dark:text-white/90 " +
-          "[&_ul]:list-disc [&_ul]:pl-6 [&_ol]:list-decimal [&_ol]:pl-6 [&_h1]:text-xl [&_h1]:font-semibold [&_h2]:text-lg [&_h2]:font-semibold",
+          "min-h-[260px] w-full max-w-[210mm] mx-auto rounded-xl border border-gray-200 bg-white p-4 text-sm text-gray-800 outline-none dark:border-gray-800 dark:bg-white/[0.03] dark:text-white/90 " +
+          "[&_ul]:list-disc [&_ul]:pl-6 [&_ol]:list-decimal [&_ol]:pl-6 [&_h1]:text-xl [&_h1]:font-semibold [&_h2]:text-lg [&_h2]:font-semibold " +
+          "[&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:border-gray-200 [&_td]:align-top [&_td]:p-2 dark:[&_td]:border-gray-700",
       },
     },
   });
@@ -108,6 +192,18 @@ export default function PrintCreateFormPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editingId, editor]);
 
+  useEffect(() => {
+    if (!editor) return;
+    const syncHtml = () => {
+      if (!htmlMode) setHtmlDraft(editor.getHTML());
+    };
+    syncHtml();
+    editor.on("update", syncHtml);
+    return () => {
+      editor.off("update", syncHtml);
+    };
+  }, [editor, htmlMode]);
+
   const insertVariable = (v: PrintVariable) => {
     if (!editor) return;
     if (!v.allowed) {
@@ -119,9 +215,13 @@ export default function PrintCreateFormPage() {
 
   const onInsertImageUrl = () => {
     if (!editor) return;
+    if (htmlMode) {
+      setError("В HTML mode вставка через кнопки отключена. Переключись в Visual mode.");
+      return;
+    }
     const url = window.prompt("URL изображения");
     if (!url) return;
-    editor.chain().focus().setImage({ src: url.trim() }).run();
+    editor.chain().focus().setImage({ src: url.trim(), width: "100%" }).run();
   };
 
   const onPickImageFile = () => {
@@ -132,6 +232,10 @@ export default function PrintCreateFormPage() {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!editor || !file) return;
+    if (htmlMode) {
+      setError("В HTML mode вставка через кнопки отключена. Переключись в Visual mode.");
+      return;
+    }
     if (!file.type.startsWith("image/")) {
       setError("Можно загрузить только изображение");
       return;
@@ -143,7 +247,7 @@ export default function PrintCreateFormPage() {
         setError("Не удалось прочитать изображение");
         return;
       }
-      editor.chain().focus().setImage({ src }).run();
+      editor.chain().focus().setImage({ src, width: "100%" }).run();
     };
     reader.onerror = () => {
       setError("Ошибка чтения файла изображения");
@@ -157,6 +261,12 @@ export default function PrintCreateFormPage() {
     setError(null);
     setSavedId(null);
     try {
+      let htmlForEditor = editor.getHTML();
+      if (htmlMode) {
+        htmlForEditor = restoreReadableHtml(htmlDraft, htmlSrcMap) || "<p></p>";
+        editor.commands.setContent(htmlForEditor);
+      }
+      const normalizedHtml = normalizeTablesForPrint(htmlForEditor);
       const cleanTitle = title.trim();
       if (!cleanTitle) throw new Error("Название формы обязательно");
       const cleanCategoryId = categoryId.trim();
@@ -165,7 +275,7 @@ export default function PrintCreateFormPage() {
         title: cleanTitle,
         category_id: cleanCategoryId,
         content_json: editor.getJSON(),
-        content_html: editor.getHTML(),
+        content_html: normalizedHtml,
       };
       const url = editingId ? `${base}/documents/print/forms/${encodeURIComponent(editingId)}` : `${base}/documents/print/forms`;
       const method = editingId ? "PUT" : "POST";
@@ -185,6 +295,53 @@ export default function PrintCreateFormPage() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const resizeSelectedImage = (delta: number) => {
+    if (!editor) return;
+    if (htmlMode) {
+      setError("Изменение размера доступно только в Visual mode");
+      return;
+    }
+    if (!editor.isActive("image")) {
+      setError("Сначала выдели изображение в редакторе");
+      return;
+    }
+    const attrs = editor.getAttributes("image") as { width?: string };
+    const current = parseWidthPercent(String(attrs?.width || "100%"));
+    const next = Math.max(10, Math.min(100, current + delta));
+    editor.chain().focus().updateAttributes("image", { width: `${next}%` }).run();
+  };
+
+  const insertImageGrid = (cols: number) => {
+    if (!editor) return;
+    if (htmlMode) {
+      setError("Сетка вставляется только в Visual mode");
+      return;
+    }
+    editor.chain().focus().insertTable({ rows: 1, cols, withHeaderRow: false }).run();
+  };
+
+  const insertTableGrid = (rows: number, cols: number) => {
+    if (!editor) return;
+    if (htmlMode) {
+      setError("Сетка вставляется только в Visual mode");
+      return;
+    }
+    editor.chain().focus().insertTable({ rows, cols, withHeaderRow: false }).run();
+  };
+
+  const onToggleHtmlMode = () => {
+    if (!editor) return;
+    if (!htmlMode) {
+      const { readableHtml, srcMap } = makeHtmlReadable(editor.getHTML());
+      setHtmlDraft(readableHtml);
+      setHtmlSrcMap(srcMap);
+      setHtmlMode(true);
+      return;
+    }
+    editor.commands.setContent(restoreReadableHtml(htmlDraft, htmlSrcMap) || "<p></p>");
+    setHtmlMode(false);
   };
 
   const varsByModule = vars.reduce<Record<string, PrintVariable[]>>((acc, v) => {
@@ -234,49 +391,112 @@ export default function PrintCreateFormPage() {
             <button
               className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
               onClick={() => editor?.chain().focus().toggleBold().run()}
-              disabled={!editor}
+              disabled={!editor || htmlMode}
             >
               Bold
             </button>
             <button
               className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
               onClick={() => editor?.chain().focus().toggleItalic().run()}
-              disabled={!editor}
+              disabled={!editor || htmlMode}
             >
               Italic
             </button>
             <button
               className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
               onClick={() => editor?.chain().focus().toggleBulletList().run()}
-              disabled={!editor}
+              disabled={!editor || htmlMode}
             >
               • list
             </button>
             <button
               className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
               onClick={() => editor?.chain().focus().toggleOrderedList().run()}
-              disabled={!editor}
+              disabled={!editor || htmlMode}
             >
               1. list
             </button>
             <button
               className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
               onClick={onInsertImageUrl}
-              disabled={!editor}
+              disabled={!editor || htmlMode}
             >
               Image URL
             </button>
             <button
               className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
               onClick={onPickImageFile}
-              disabled={!editor}
+              disabled={!editor || htmlMode}
             >
               Upload image
+            </button>
+            <button
+              className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+              onClick={() => resizeSelectedImage(-10)}
+              disabled={!editor || htmlMode}
+            >
+              Image -10%
+            </button>
+            <button
+              className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+              onClick={() => resizeSelectedImage(10)}
+              disabled={!editor || htmlMode}
+            >
+              Image +10%
+            </button>
+            <button
+              className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+              onClick={() => insertImageGrid(2)}
+              disabled={!editor || htmlMode}
+            >
+              Grid 1x2
+            </button>
+            <button
+              className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+              onClick={() => insertImageGrid(3)}
+              disabled={!editor || htmlMode}
+            >
+              Grid 1x3
+            </button>
+            <button
+              className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+              onClick={() => insertTableGrid(2, 2)}
+              disabled={!editor || htmlMode}
+            >
+              Grid 2x2
+            </button>
+            <button
+              className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+              onClick={() => insertTableGrid(3, 3)}
+              disabled={!editor || htmlMode}
+            >
+              Grid 3x3
+            </button>
+            <button
+              className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+              onClick={onToggleHtmlMode}
+              disabled={!editor}
+            >
+              {htmlMode ? "Visual mode" : "HTML mode"}
             </button>
             <input ref={imageInputRef} type="file" accept="image/*" className="hidden" onChange={onImageFileChange} />
           </div>
 
-          <EditorContent editor={editor} />
+          {htmlMode ? (
+            <textarea
+              className="min-h-[320px] w-full rounded-xl border border-gray-200 bg-white p-4 text-sm font-mono text-gray-800 outline-none dark:border-gray-800 dark:bg-white/[0.03] dark:text-white/90"
+              value={htmlDraft}
+              onChange={(e) => setHtmlDraft(e.target.value)}
+              placeholder="<p>HTML...</p>"
+            />
+          ) : (
+            <EditorContent editor={editor} />
+          )}
+          <div className="text-xs text-gray-500 dark:text-gray-400">
+            {htmlMode
+              ? "Режим HTML: base64 src у изображений скрыт токенами (__IMG_DATA_N__), при применении восстанавливается."
+              : "Режим предпросмотра: ширина листа A4 (210mm), таблицы сохраняются с fixed-layout для стабильной печати."}
+          </div>
 
           <Button size="sm" disabled={busy || !editor} onClick={onSave}>
             Сохранить

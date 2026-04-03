@@ -22,6 +22,11 @@ type PromoItem = {
   avg_list?: any[];
 };
 
+const pickPositiveOr = (value: any, fallback: number): number => {
+  const n = Number(value ?? 0);
+  return n > 0 ? n : Number(fallback ?? 0);
+};
+
 export default function OzonPromotionsPage() {
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState("");
@@ -29,6 +34,7 @@ export default function OzonPromotionsPage() {
   const [color, setColor] = React.useState<"" | "green" | "yellow" | "red">("");
   const [items, setItems] = React.useState<PromoItem[]>([]);
   const [savingOfferId, setSavingOfferId] = React.useState<string>("");
+  const [timerUpdating, setTimerUpdating] = React.useState(false);
   const [draft, setDraft] = React.useState<Record<string, any>>({});
 
   const getToken = () => (window as any).__hubcrmAccessToken || "";
@@ -63,25 +69,29 @@ export default function OzonPromotionsPage() {
   }, [color]);
 
   React.useEffect(() => {
-    // init/update drafts for loaded items
+    // sync key price fields from backend on every load
     setDraft((prev) => {
       const next = { ...prev };
       for (const it of items) {
-        if (next[it.offer_id]) continue;
         const s = it.settings || {};
+        const current = next[it.offer_id] || {};
+        const fallbackPrice = Number(it.price ?? 0);
+        const fallbackMinPrice = Number(it.min_price ?? 0);
         next[it.offer_id] = {
-          yourprice: s.yourprice ?? it.price ?? 0,
-          minprice: s.minprice ?? it.min_price ?? 0,
-          min_price_fbs: s.min_price_fbs ?? it.min_price ?? 0,
-          min_price_promo: s.min_price_promo ?? it.min_price ?? 0,
-          min_price_discount: s.min_price_discount ?? it.min_price ?? 0,
-          limit_count_value: s.limit_count_value ?? 1,
-          use_fbs: Boolean(s.use_fbs),
-          use_limit_count: Boolean(s.use_limit_count),
-          use_promo: Boolean(s.use_promo),
-          autoupdate_promo: Boolean(s.autoupdate_promo),
-          auto_update_days_limit_promo: Boolean(s.auto_update_days_limit_promo),
-          use_discount: Boolean(s.use_discount),
+          ...current,
+          yourprice: pickPositiveOr(s.yourprice, fallbackPrice),
+          minprice: pickPositiveOr(s.minprice, fallbackMinPrice),
+          min_price_fbs: pickPositiveOr(s.min_price_fbs, Number(current.min_price_fbs ?? fallbackMinPrice)),
+          min_price_promo: pickPositiveOr(s.min_price_promo, Number(current.min_price_promo ?? fallbackMinPrice)),
+          min_price_discount: pickPositiveOr(s.min_price_discount, Number(current.min_price_discount ?? fallbackMinPrice)),
+          limit_count_value: s.limit_count_value ?? current.limit_count_value ?? 1,
+          use_fbs: s.use_fbs ?? current.use_fbs ?? false,
+          use_limit_count: s.use_limit_count ?? current.use_limit_count ?? false,
+          use_promo: s.use_promo ?? current.use_promo ?? false,
+          autoupdate_promo: s.autoupdate_promo ?? current.autoupdate_promo ?? false,
+          auto_update_days_limit_promo:
+            s.auto_update_days_limit_promo ?? current.auto_update_days_limit_promo ?? false,
+          use_discount: s.use_discount ?? current.use_discount ?? false,
         };
       }
       return next;
@@ -141,6 +151,27 @@ export default function OzonPromotionsPage() {
     });
   };
 
+  const forceTimerUpdate = async () => {
+    setTimerUpdating(true);
+    setError("");
+    try {
+      const r = await fetch(`${getGatewayBaseUrl()}/marketplaces/ozon/promotions/timer-autoupdate`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${getToken()}` },
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok) {
+        setError(j?.detail || `HTTP ${r.status}`);
+        return;
+      }
+      await load();
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setTimerUpdating(false);
+    }
+  };
+
   const OzonLinkIcon = ({ className }: { className?: string }) => (
     <svg
       viewBox="0 0 24 24"
@@ -172,6 +203,14 @@ export default function OzonPromotionsPage() {
           onClick={load}
         >
           {loading ? "Загружаю..." : "Обновить"}
+        </button>
+        <button
+          type="button"
+          className="px-4 py-2 rounded bg-amber-500 text-white disabled:opacity-50"
+          disabled={timerUpdating}
+          onClick={forceTimerUpdate}
+        >
+          {timerUpdating ? "Обновляю 30 дней..." : "Принудительно обновить 30 дней"}
         </button>
 
         <select
@@ -208,7 +247,7 @@ export default function OzonPromotionsPage() {
             <summary className="cursor-pointer select-none">
               <span className="font-semibold text-lg">{it.offer_id}</span>
               <span className="ml-3 text-sm text-gray-600">
-                продано за месяц: {it.sale_qty} • опт: {it.opt_price} • FBS прибыль: {it.profit_price_fbs} ({it.profit_percent_fbs}%)
+                продано за месяц: {it.sale_qty} • опт: {it.opt_price} • FBS: {it.profit_price_fbs} ({it.profit_percent_fbs}%) • FBO: {it.profit_price_fbo} ({it.profit_percent_fbo}%)
               </span>
             </summary>
 
@@ -268,7 +307,10 @@ export default function OzonPromotionsPage() {
                 <div className="text-gray-600 mb-1">Ваша цена без акций</div>
                 <input
                   className="h-11 w-full rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
-                  value={String(draft[it.offer_id]?.yourprice ?? "")}
+                  value={String(
+                    draft[it.offer_id]?.yourprice ??
+                      pickPositiveOr(it.settings?.yourprice, Number(it.price ?? 0))
+                  )}
                   onChange={(e) => setDraftField(it.offer_id, { yourprice: e.target.value })}
                   disabled={savingOfferId === it.offer_id}
                 />
@@ -277,7 +319,10 @@ export default function OzonPromotionsPage() {
                 <div className="text-gray-600 mb-1">Минимальная цена в Ozon</div>
                 <input
                   className="h-11 w-full rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
-                  value={String(draft[it.offer_id]?.minprice ?? "")}
+                  value={String(
+                    draft[it.offer_id]?.minprice ??
+                      pickPositiveOr(it.settings?.minprice, Number(it.min_price ?? 0))
+                  )}
                   onChange={(e) => setDraftField(it.offer_id, { minprice: e.target.value })}
                   disabled={savingOfferId === it.offer_id}
                 />

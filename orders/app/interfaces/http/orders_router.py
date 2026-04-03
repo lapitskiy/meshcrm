@@ -16,6 +16,7 @@ KEYCLOAK_INTERNAL_URL = os.getenv("KEYCLOAK_INTERNAL_URL", "http://keycloak:8080
 KEYCLOAK_REALM = os.getenv("KEYCLOAK_REALM", "hubcrm")
 KEYCLOAK_ADMIN_USER = os.getenv("KEYCLOAK_ADMIN", "admin")
 KEYCLOAK_ADMIN_PASSWORD = os.getenv("KEYCLOAK_ADMIN_PASSWORD", "admin")
+WAREHOUSES_BASE_URL = os.getenv("WAREHOUSES_BASE_URL", "http://warehouses:8000")
 
 
 class OrderCreateIn(BaseModel):
@@ -70,6 +71,13 @@ class OrderCreatorOut(BaseModel):
     full_name: str = ""
 
 
+class UserLiteOut(BaseModel):
+    user_uuid: str
+    username: str
+    email: str
+    full_name: str
+
+
 def _normalize_status_value(raw_status: object) -> str:
     status = str(raw_status or "").strip()
     if not status:
@@ -105,6 +113,73 @@ def _resolve_initial_status(cur, explicit_status: str | None) -> str:
 def _user_uuid_from_headers(request: Request) -> str | None:
     value = str(request.headers.get("x-user-uuid", "")).strip()
     return value or None
+
+
+def _roles_from_headers(request: Request) -> set[str]:
+    raw = str(request.headers.get("x-user-roles", "")).strip()
+    if not raw:
+        return set()
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _require_superadmin(request: Request) -> None:
+    if "superadmin" in _roles_from_headers(request):
+        return
+    raise HTTPException(status_code=403, detail="forbidden: superadmin role required")
+
+
+def _is_superadmin(request: Request) -> bool:
+    return "superadmin" in _roles_from_headers(request)
+
+
+def _require_user_uuid(request: Request) -> str:
+    user_uuid = _user_uuid_from_headers(request)
+    if not user_uuid:
+        raise HTTPException(status_code=401, detail="missing x-user-uuid")
+    return user_uuid
+
+
+def _fetch_keycloak_user(user_uuid: str) -> dict:
+    token = _keycloak_admin_token()
+    req = UrlRequest(
+        f"{KEYCLOAK_INTERNAL_URL}/admin/realms/{KEYCLOAK_REALM}/users/{user_uuid}",
+        headers={"authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    with urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def _user_lite_from_keycloak_payload(user_uuid: str, payload: dict) -> UserLiteOut:
+    first = str(payload.get("firstName") or "").strip()
+    last = str(payload.get("lastName") or "").strip()
+    full_name = (f"{first} {last}").strip() or str(payload.get("username") or "").strip() or user_uuid
+    return UserLiteOut(
+        user_uuid=user_uuid,
+        username=str(payload.get("username") or "").strip(),
+        email=str(payload.get("email") or "").strip(),
+        full_name=full_name,
+    )
+
+
+def _fetch_accessible_warehouse_ids(request: Request) -> list[str]:
+    user_uuid = _require_user_uuid(request)
+    req = UrlRequest(
+        f"{WAREHOUSES_BASE_URL}/warehouses/accessible",
+        headers={
+            "x-user-uuid": user_uuid,
+            "x-user-roles": ",".join(sorted(_roles_from_headers(request))),
+        },
+        method="GET",
+    )
+    with urlopen(req, timeout=10) as resp:
+        payload = json.loads(resp.read().decode("utf-8") or "[]")
+    out: list[str] = []
+    for row in payload or []:
+        warehouse_id = str((row or {}).get("id") or "").strip()
+        if warehouse_id:
+            out.append(warehouse_id)
+    return out
 
 
 def _keycloak_admin_token() -> str:
@@ -326,14 +401,7 @@ def get_order_creator(order_id: UUID) -> OrderCreatorOut:
         user_uuid = str(row[0] or "").strip()
         if not user_uuid:
             return OrderCreatorOut(user_uuid=None, username="", email="", full_name="")
-        token = _keycloak_admin_token()
-        req = UrlRequest(
-            f"{KEYCLOAK_INTERNAL_URL}/admin/realms/{KEYCLOAK_REALM}/users/{user_uuid}",
-            headers={"authorization": f"Bearer {token}"},
-            method="GET",
-        )
-        with urlopen(req, timeout=10) as resp:
-            payload = json.loads(resp.read().decode("utf-8") or "{}")
+        payload = _fetch_keycloak_user(user_uuid)
         first = str(payload.get("firstName") or "").strip()
         last = str(payload.get("lastName") or "").strip()
         full_name = (f"{first} {last}").strip()
@@ -352,14 +420,92 @@ def get_order_creator(order_id: UUID) -> OrderCreatorOut:
             conn.close()
 
 
+@router.get("/creators/search", response_model=list[UserLiteOut])
+def search_creators(q: str, request: Request) -> list[UserLiteOut]:
+    _require_superadmin(request)
+    term = q.strip()
+    if len(term) < 2:
+        return []
+    token = _keycloak_admin_token()
+    req = UrlRequest(
+        f"{KEYCLOAK_INTERNAL_URL}/admin/realms/{KEYCLOAK_REALM}/users?search={term}&max=20",
+        headers={"authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    with urlopen(req, timeout=10) as resp:
+        payload = json.loads(resp.read().decode("utf-8") or "[]")
+    out: list[UserLiteOut] = []
+    for row in payload or []:
+        user_uuid = str((row or {}).get("id") or "").strip()
+        if not user_uuid:
+            continue
+        first = str((row or {}).get("firstName") or "").strip()
+        last = str((row or {}).get("lastName") or "").strip()
+        full_name = f"{first} {last}".strip() or str((row or {}).get("username") or "").strip() or user_uuid
+        out.append(
+            UserLiteOut(
+                user_uuid=user_uuid,
+                username=str((row or {}).get("username") or "").strip(),
+                email=str((row or {}).get("email") or "").strip(),
+                full_name=full_name,
+            )
+        )
+    return out
+
+
+@router.get("/creators/options", response_model=list[UserLiteOut])
+def list_creator_options(request: Request, q: str | None = None) -> list[UserLiteOut]:
+    _require_superadmin(request)
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT created_by_uuid
+                FROM orders
+                WHERE created_by_uuid IS NOT NULL
+                  AND created_by_uuid <> ''
+                ORDER BY created_by_uuid
+                """
+            )
+            rows = cur.fetchall()
+        term = str(q or "").strip().lower()
+        out: list[UserLiteOut] = []
+        for row in rows:
+            user_uuid = str(row[0] or "").strip()
+            if not user_uuid:
+                continue
+            try:
+                payload = _fetch_keycloak_user(user_uuid)
+            except Exception:
+                continue
+            item = _user_lite_from_keycloak_payload(user_uuid, payload)
+            haystack = f"{item.full_name} {item.username} {item.email}".lower()
+            if term and term not in haystack:
+                continue
+            out.append(item)
+        out.sort(key=lambda item: (item.full_name.lower(), item.email.lower(), item.username.lower()))
+        return out[:50]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 @router.get("", response_model=OrderListOut)
 def list_orders(
+    request: Request,
     page: int = 1,
     page_size: int = 20,
     order_kind: str | None = None,
     service_category_id: UUID | None = None,
     work_type_id: UUID | None = None,
     warehouse_id: UUID | None = None,
+    created_by_uuid: str | None = None,
     search: str | None = None,
     created_from: str | None = None,  # YYYY-MM-DD
     created_to: str | None = None,  # YYYY-MM-DD
@@ -371,6 +517,27 @@ def list_orders(
         offset = (safe_page - 1) * safe_page_size
         where_parts: list[str] = []
         params: list = []
+
+        if not _is_superadmin(request):
+            user_uuid = _require_user_uuid(request)
+            accessible_warehouse_ids = _fetch_accessible_warehouse_ids(request)
+            if not accessible_warehouse_ids:
+                where_parts.append("FALSE")
+            else:
+                where_parts.append("o.warehouse_id IS NOT NULL")
+                where_parts.append("o.warehouse_id = ANY(%s::uuid[])")
+                params.append(accessible_warehouse_ids)
+            where_parts.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM service_category_access sca
+                    WHERE sca.service_category_id = o.service_category_id
+                      AND sca.user_uuid = %s
+                )
+                """
+            )
+            params.append(user_uuid)
 
         if order_kind and str(order_kind).strip():
             where_parts.append("o.order_kind = %s")
@@ -392,6 +559,10 @@ def list_orders(
         if warehouse_id:
             where_parts.append("o.warehouse_id = %s")
             params.append(warehouse_id)
+        if created_by_uuid and str(created_by_uuid).strip():
+            _require_superadmin(request)
+            where_parts.append("o.created_by_uuid = %s")
+            params.append(str(created_by_uuid).strip())
         if search and str(search).strip():
             term = f"%{str(search).strip()}%"
             where_parts.append(

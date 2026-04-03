@@ -42,6 +42,7 @@ class PsycopgWorkTypeRepository:
     def list_all(
         self,
         service_category_id: UUID | None = None,
+        accessible_category_ids: list[UUID] | None = None,
         name_query: str | None = None,
         limit: int = 100,
     ) -> list[WorkType]:
@@ -55,6 +56,11 @@ class PsycopgWorkTypeRepository:
         if service_category_id is not None:
             clauses.append("wt.service_category_id = %s")
             params_list.append(service_category_id)
+        if accessible_category_ids is not None:
+            if not accessible_category_ids:
+                return []
+            clauses.append("wt.service_category_id = ANY(%s)")
+            params_list.append(accessible_category_ids)
         if name_query:
             clauses.append("wt.name ILIKE %s")
             params_list.append(f"%{name_query}%")

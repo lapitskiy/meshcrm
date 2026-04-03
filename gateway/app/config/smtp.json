@@ -1,0 +1,10 @@
+{
+  "host": "smtp.yandex.ru",
+  "port": 587,
+  "username": "",
+  "password": "",
+  "from_email": "",
+  "from_name": "HubCRM",
+  "use_tls": true,
+  "app_public_url": "https://crm.central-service.ru:3443"
+}

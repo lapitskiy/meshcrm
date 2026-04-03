@@ -95,6 +95,48 @@ def init_db() -> None:
             ON order_finance_line_history(order_uuid, changed_at DESC);
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS buyback_finance_lines (
+              id UUID PRIMARY KEY,
+              deal_uuid UUID NOT NULL UNIQUE,
+              amount NUMERIC NOT NULL,
+              currency TEXT NOT NULL DEFAULT 'RUB',
+              payment_method TEXT NOT NULL DEFAULT 'cashbox',
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS buyback_finance_line_history (
+              id UUID PRIMARY KEY,
+              deal_uuid UUID NOT NULL,
+              old_amount NUMERIC,
+              new_amount NUMERIC,
+              old_payment_method TEXT,
+              new_payment_method TEXT,
+              changed_by_uuid TEXT,
+              changed_by_name TEXT NOT NULL DEFAULT '',
+              changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_buyback_finance_history_deal_changed_at
+            ON buyback_finance_line_history(deal_uuid, changed_at DESC);
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS finance_settings (
+              key TEXT PRIMARY KEY,
+              value JSONB NOT NULL DEFAULT '[]'::jsonb,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
 
 
 class PriceRuleIn(BaseModel):
@@ -145,6 +187,42 @@ class FinanceLineHistoryOut(BaseModel):
     changed_at: datetime
 
 
+class BuybackFinanceLineIn(BaseModel):
+    deal_uuid: uuid.UUID
+    amount: float
+    currency: str = Field(default="RUB", min_length=1, max_length=8)
+    payment_method: Literal["cashbox", "online_transfer"]
+
+
+class BuybackFinanceLineOut(BaseModel):
+    id: uuid.UUID
+    deal_uuid: uuid.UUID
+    amount: float
+    currency: str
+    payment_method: Literal["cashbox", "online_transfer"]
+    updated_at: datetime
+
+
+class BuybackFinanceHistoryOut(BaseModel):
+    id: uuid.UUID
+    deal_uuid: uuid.UUID
+    old_amount: float | None = None
+    new_amount: float | None = None
+    old_payment_method: str | None = None
+    new_payment_method: str | None = None
+    changed_by_uuid: str | None = None
+    changed_by_name: str = ""
+    changed_at: datetime
+
+
+class FinanceSettingsOut(BaseModel):
+    money_visible_related_modules: list[str] = Field(default_factory=list)
+
+
+class FinanceSettingsIn(BaseModel):
+    money_visible_related_modules: list[str] = Field(default_factory=list)
+
+
 app = FastAPI(title="finance", version="0.1.0")
 
 
@@ -157,6 +235,18 @@ def _startup() -> None:
         except Exception:
             time.sleep(1)
     raise RuntimeError("finance-db not ready")
+
+
+def _normalize_module_names(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        name = str(raw or "").strip().lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
 
 
 @app.get("/health")
@@ -172,6 +262,35 @@ def root() -> dict[str, str]:
 @app.get("/manifest")
 def manifest() -> dict:
     return MANIFEST
+
+
+@app.get("/finance/settings", response_model=FinanceSettingsOut)
+def get_finance_settings() -> FinanceSettingsOut:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT value FROM finance_settings WHERE key = 'money_visible_related_modules'")
+        row = cur.fetchone()
+    if not row:
+        return FinanceSettingsOut(money_visible_related_modules=[])
+    value = row[0]
+    if not isinstance(value, list):
+        return FinanceSettingsOut(money_visible_related_modules=[])
+    return FinanceSettingsOut(money_visible_related_modules=_normalize_module_names(value))
+
+
+@app.put("/finance/settings", response_model=FinanceSettingsOut)
+def update_finance_settings(body: FinanceSettingsIn) -> FinanceSettingsOut:
+    normalized = _normalize_module_names(body.money_visible_related_modules)
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO finance_settings (key, value, updated_at)
+            VALUES (%s, %s::jsonb, NOW())
+            ON CONFLICT (key)
+            DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+            """,
+            ("money_visible_related_modules", json.dumps(normalized, ensure_ascii=False)),
+        )
+    return FinanceSettingsOut(money_visible_related_modules=normalized)
 
 
 @app.put("/finance/price-rules/{work_type_uuid}", response_model=PriceRuleOut)
@@ -376,6 +495,130 @@ def list_order_lines(order_uuid: uuid.UUID) -> list[OrderFinanceLineOut]:
             is_paid=bool(row[6]),
             source=row[7],
             updated_at=row[8],
+        )
+        for row in rows
+    ]
+
+
+@app.put("/finance/buyback-lines", response_model=BuybackFinanceLineOut)
+def upsert_buyback_line(body: BuybackFinanceLineIn, request: Request) -> BuybackFinanceLineOut:
+    changed_by_uuid = str(request.headers.get("x-user-uuid", "")).strip() or None
+    changed_by_name = _resolve_user_name(changed_by_uuid)
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT amount, payment_method
+            FROM buyback_finance_lines
+            WHERE deal_uuid=%s
+            """,
+            (body.deal_uuid,),
+        )
+        previous = cur.fetchone()
+        cur.execute(
+            """
+            INSERT INTO buyback_finance_lines (id, deal_uuid, amount, currency, payment_method, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (deal_uuid)
+            DO UPDATE SET amount=EXCLUDED.amount, currency=EXCLUDED.currency, payment_method=EXCLUDED.payment_method, updated_at=NOW()
+            RETURNING id, deal_uuid, amount, currency, payment_method, updated_at
+            """,
+            (uuid.uuid4(), body.deal_uuid, body.amount, body.currency.strip(), body.payment_method),
+        )
+        row = cur.fetchone()
+        old_amount = float(previous[0]) if previous and previous[0] is not None else None
+        old_payment_method = str(previous[1]) if previous and previous[1] is not None else None
+        new_amount = float(row[2])
+        new_payment_method = str(row[4])
+        changed = previous is None or old_amount != new_amount or old_payment_method != new_payment_method
+        if changed:
+            cur.execute(
+                """
+                INSERT INTO buyback_finance_line_history (
+                  id, deal_uuid,
+                  old_amount, new_amount,
+                  old_payment_method, new_payment_method,
+                  changed_by_uuid, changed_by_name, changed_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (
+                    uuid.uuid4(),
+                    body.deal_uuid,
+                    old_amount,
+                    new_amount,
+                    old_payment_method,
+                    new_payment_method,
+                    changed_by_uuid,
+                    changed_by_name,
+                ),
+            )
+    return BuybackFinanceLineOut(
+        id=row[0],
+        deal_uuid=row[1],
+        amount=float(row[2]),
+        currency=row[3],
+        payment_method=row[4],
+        updated_at=row[5],
+    )
+
+
+@app.get("/finance/buyback-lines", response_model=list[BuybackFinanceLineOut])
+def list_buyback_lines(limit: int = 500) -> list[BuybackFinanceLineOut]:
+    safe_limit = max(1, min(int(limit), 2000))
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, deal_uuid, amount, currency, payment_method, updated_at
+            FROM buyback_finance_lines
+            ORDER BY updated_at DESC
+            LIMIT %s
+            """,
+            (safe_limit,),
+        )
+        rows = cur.fetchall()
+    return [
+        BuybackFinanceLineOut(
+            id=row[0],
+            deal_uuid=row[1],
+            amount=float(row[2]),
+            currency=row[3],
+            payment_method=row[4],
+            updated_at=row[5],
+        )
+        for row in rows
+    ]
+
+
+@app.get("/finance/buyback-lines/{deal_uuid}/history", response_model=list[BuybackFinanceHistoryOut])
+def list_buyback_history(deal_uuid: uuid.UUID, limit: int = 100) -> list[BuybackFinanceHistoryOut]:
+    safe_limit = max(1, min(int(limit), 500))
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              id, deal_uuid,
+              old_amount, new_amount,
+              old_payment_method, new_payment_method,
+              changed_by_uuid, changed_by_name, changed_at
+            FROM buyback_finance_line_history
+            WHERE deal_uuid=%s
+            ORDER BY changed_at DESC
+            LIMIT %s
+            """,
+            (deal_uuid, safe_limit),
+        )
+        rows = cur.fetchall()
+    return [
+        BuybackFinanceHistoryOut(
+            id=row[0],
+            deal_uuid=row[1],
+            old_amount=float(row[2]) if row[2] is not None else None,
+            new_amount=float(row[3]) if row[3] is not None else None,
+            old_payment_method=row[4],
+            new_payment_method=row[5],
+            changed_by_uuid=row[6],
+            changed_by_name=row[7] or "",
+            changed_at=row[8],
         )
         for row in rows
     ]

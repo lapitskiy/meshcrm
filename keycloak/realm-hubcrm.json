@@ -3,6 +3,13 @@
   "enabled": true,
   "displayName": "HubCRM",
   "registrationAllowed": false,
+  "rememberMe": true,
+  "ssoSessionIdleTimeout": 43200,
+  "ssoSessionMaxLifespan": 43200,
+  "ssoSessionIdleTimeoutRememberMe": 43200,
+  "ssoSessionMaxLifespanRememberMe": 43200,
+  "clientSessionIdleTimeout": 43200,
+  "clientSessionMaxLifespan": 43200,
   "loginWithEmailAllowed": true,
   "duplicateEmailsAllowed": false,
   "users": [

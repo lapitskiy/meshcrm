@@ -99,7 +99,11 @@ def init_db() -> None:
                   ('finance', 'total_amount', 'Итого сумма'),
                   ('warehouses', 'warehouse_name', 'Склад/точка'),
                   ('warehouses', 'warehouse_address', 'Адрес склада/точки'),
-                  ('warehouses', 'warehouse_point_phone', 'Телефон склада/точки')
+                  ('warehouses', 'warehouse_point_phone', 'Телефон склада/точки'),
+                  ('warehouses', 'warehouse_qr_site_svg', 'QR сайта склада (SVG)'),
+                  ('warehouses', 'warehouse_qr_yandex_svg', 'QR Яндекс склада (SVG)'),
+                  ('warehouses', 'warehouse_qr_vk_svg', 'QR VK склада (SVG)'),
+                  ('warehouses', 'warehouse_qr_telegram_svg', 'QR Telegram склада (SVG)')
                 ON CONFLICT (module_name, var_key) DO NOTHING;
                 """
             )

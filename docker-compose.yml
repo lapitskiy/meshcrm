@@ -47,7 +47,7 @@ services:
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
       # Make issuer stable for local dev
-      KC_HOSTNAME_URL: ${KEYCLOAK_PUBLIC_URL:-https://192.168.0.21:8083}
+      KC_HOSTNAME_URL: ${KEYCLOAK_PUBLIC_URL:-https://crm.central-service.ru:3443/auth}
       KC_HOSTNAME_STRICT: "false"
       KC_PROXY_HEADERS: "xforwarded"
     depends_on:
@@ -67,6 +67,7 @@ services:
     volumes:
       - ./nginx/keycloak.conf:/etc/nginx/conf.d/default.conf:ro
       - ./nginx/certs:/etc/nginx/certs:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
 
   cases-db:
     image: postgres:16-alpine
@@ -212,6 +213,38 @@ services:
       timeout: 5s
       retries: 5
 
+  skupka-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: skupka
+      POSTGRES_USER: skupka
+      POSTGRES_PASSWORD: ${SKUPKA_DB_PASSWORD:-skupka_pw}
+    ports:
+      - "5444:5432"
+    volumes:
+      - skupka-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skupka"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  social-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: social
+      POSTGRES_USER: social
+      POSTGRES_PASSWORD: ${SOCIAL_DB_PASSWORD:-social_pw}
+    ports:
+      - "5445:5432"
+    volumes:
+      - social-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U social"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   finance-db:
     image: postgres:16-alpine
     environment:
@@ -256,6 +289,10 @@ services:
     build: ./plugin-registry
     environment:
       DATABASE_URL: postgresql://registry:${REGISTRY_DB_PASSWORD:-registry_pw}@registry-db:5432/registry
+      KEYCLOAK_INTERNAL_URL: http://keycloak:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
     depends_on:
       registry-db:
         condition: service_healthy
@@ -340,6 +377,7 @@ services:
     build: ./orders
     environment:
       DATABASE_URL: postgresql://orders:${ORDERS_DB_PASSWORD:-orders_pw}@orders-db:5432/orders
+      WAREHOUSES_BASE_URL: http://warehouses:8000
     depends_on:
       orders-db:
         condition: service_healthy
@@ -361,6 +399,7 @@ services:
     build: ./ai-memory
     environment:
       DATABASE_URL: postgresql://ai_memory:${AI_MEMORY_DB_PASSWORD:-ai_memory_pw}@ai-memory-db:5432/ai_memory
+      MARKETPLACES_BASE_URL: http://marketplaces:8000
     depends_on:
       ai-memory-db:
         condition: service_healthy
@@ -379,6 +418,7 @@ services:
     build: ./marketplaces
     environment:
       DATABASE_URL: postgresql://marketplaces:${MARKETPLACES_DB_PASSWORD:-marketplaces_pw}@marketplaces-db:5432/marketplaces
+      MARKETPLACES_SCHEDULER_TOKEN: ${MARKETPLACES_SCHEDULER_TOKEN:-marketplaces_scheduler_secret}
     depends_on:
       marketplaces-db:
         condition: service_healthy
@@ -392,6 +432,24 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  marketplaces-scheduler:
+    image: python:3.12-slim
+    working_dir: /app
+    command: ["python", "-m", "app.scheduler"]
+    environment:
+      MARKETPLACES_INTERNAL_URL: http://marketplaces:8000
+      MARKETPLACES_SCHEDULER_TOKEN: ${MARKETPLACES_SCHEDULER_TOKEN:-marketplaces_scheduler_secret}
+      MARKETPLACES_SCHEDULER_DAY_OF_MONTH: ${MARKETPLACES_SCHEDULER_DAY_OF_MONTH:-10}
+      MARKETPLACES_SCHEDULER_RUN_HOUR_UTC: ${MARKETPLACES_SCHEDULER_RUN_HOUR_UTC:-3}
+      MARKETPLACES_SCHEDULER_RUN_MINUTE_UTC: ${MARKETPLACES_SCHEDULER_RUN_MINUTE_UTC:-0}
+      MARKETPLACES_SCHEDULER_RUN_ON_START: ${MARKETPLACES_SCHEDULER_RUN_ON_START:-false}
+    depends_on:
+      marketplaces:
+        condition: service_healthy
+    volumes:
+      - ./marketplaces/app:/app/app
+    restart: unless-stopped
 
   finance:
     build: ./finance
@@ -433,6 +491,42 @@ services:
       retries: 3
       start_period: 10s
 
+  skupka:
+    build: ./skupka
+    environment:
+      DATABASE_URL: postgresql://skupka:${SKUPKA_DB_PASSWORD:-skupka_pw}@skupka-db:5432/skupka
+    depends_on:
+      skupka-db:
+        condition: service_healthy
+    volumes:
+      - ./skupka/app:/app/app
+    ports:
+      - "8012:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  social:
+    build: ./social
+    environment:
+      DATABASE_URL: postgresql://social:${SOCIAL_DB_PASSWORD:-social_pw}@social-db:5432/social
+    depends_on:
+      social-db:
+        condition: service_healthy
+    volumes:
+      - ./social/app:/app/app
+    ports:
+      - "8013:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   # --- Analytics ---
   analytics-consumer:
     build: ./analytics-consumer
@@ -465,8 +559,11 @@ services:
       KEYCLOAK_INTERNAL_URL: http://keycloak:8080
       KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
       KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-hubcrm-ui}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
       # used for issuer validation; should match token "iss"
-      OIDC_ISSUER: ${KEYCLOAK_PUBLIC_URL:-https://192.168.0.21:8083}/realms/${KEYCLOAK_REALM:-hubcrm}
+      # Accept both internal and public issuer values to avoid browser flow mismatch.
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://keycloak:8080/realms/${KEYCLOAK_REALM:-hubcrm},https://crm.central-service.ru:3443/auth/realms/${KEYCLOAK_REALM:-hubcrm}}
       # if empty, audience is not verified (dev-friendly)
       OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
       CASES_BASE_URL: http://core-cases:8000
@@ -479,6 +576,8 @@ services:
       MARKETPLACES_BASE_URL: http://marketplaces:8000
       FINANCE_BASE_URL: http://finance:8000
       WAREHOUSES_BASE_URL: http://warehouses:8000
+      SKUPKA_BASE_URL: http://skupka:8000
+      SOCIAL_BASE_URL: http://social:8000
     depends_on:
       keycloak:
         condition: service_started
@@ -491,6 +590,10 @@ services:
       finance:
         condition: service_healthy
       warehouses:
+        condition: service_healthy
+      skupka:
+        condition: service_healthy
+      social:
         condition: service_healthy
     ports:
       - "8080:8000"
@@ -510,6 +613,7 @@ services:
     volumes:
       - ./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
       - ./nginx/certs:/etc/nginx/certs:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
 
   ui-shell:
     image: node:20-alpine
@@ -518,8 +622,8 @@ services:
       sh -lc "if [ ! -x node_modules/.bin/next ]; then npm install --no-audit --no-fund; fi &&
       npm run dev -- --hostname 0.0.0.0 --port 3000"
     environment:
-      NEXT_PUBLIC_GATEWAY_URL: http://localhost:8080
-      NEXT_PUBLIC_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-https://192.168.0.21:8083}
+      NEXT_PUBLIC_GATEWAY_URL: ${GATEWAY_PUBLIC_URL:-https://crm.central-service.ru:3443/api}
+      NEXT_PUBLIC_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-https://crm.central-service.ru:3443/auth}
       NEXT_PUBLIC_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
       NEXT_PUBLIC_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-hubcrm-ui}
       WATCHPACK_POLLING: "true"
@@ -536,10 +640,11 @@ services:
     depends_on:
       - ui-shell
     ports:
-      - "3000:3000"
+      - "3443:3443"
     volumes:
       - ./nginx/ui-shell.conf:/etc/nginx/conf.d/default.conf:ro
       - ./nginx/certs:/etc/nginx/certs:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
 
 volumes:
   redis-data:
@@ -555,4 +660,6 @@ volumes:
   marketplaces-db-data:
   finance-db-data:
   warehouses-db-data:
+  skupka-db-data:
+  social-db-data:
   ui-shell-node-modules:
