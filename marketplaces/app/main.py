@@ -363,6 +363,51 @@ def _ozon_post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) 
         raise HTTPException(status_code=502, detail="ozon upstream error") from e
 
 
+def _prepare_ozon_price_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    return f"{numeric:.2f}"
+
+
+def _update_ozon_prices(
+    ozon_hdrs: dict[str, str], offer_id: str, yourprice: int, minprice: int
+) -> dict[str, Any] | None:
+    price = _prepare_ozon_price_value(yourprice)
+    min_price = _prepare_ozon_price_value(minprice)
+    if price is None and min_price is None:
+        return None
+    response = _ozon_post_json(
+        "https://api-seller.ozon.ru/v1/product/import/prices",
+        ozon_hdrs,
+        {
+            "prices": [
+                {
+                    "offer_id": offer_id,
+                    **({"price": price} if price is not None else {}),
+                    **({"min_price": min_price} if min_price is not None else {}),
+                    "currency_code": "RUB",
+                }
+            ]
+        },
+    )
+    result_items = response.get("result") or []
+    if isinstance(result_items, list):
+        for item in result_items:
+            item_errors = item.get("errors") or []
+            if item_errors:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"ozon price update error: {json.dumps(item_errors, ensure_ascii=False)}",
+                )
+    return response
+
+
 def _ozon_get_products(ozon_hdrs: dict[str, str]) -> dict[str, Any]:
     # list offer_ids
     resp = _ozon_post_json(
@@ -474,6 +519,54 @@ def _update_ozon_promotion_timer(ozon_hdrs: dict[str, str], product_ids: list[in
     }
 
 
+def _ozon_list_discount_tasks(
+    ozon_hdrs: dict[str, str], statuses: list[str] | None = None, limit: int = 50
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for status in statuses or ["NEW"]:
+        page = 1
+        while True:
+            resp = _ozon_post_json(
+                "https://api-seller.ozon.ru/v1/actions/discounts-task/list",
+                ozon_hdrs,
+                {"status": status, "page": page, "limit": limit},
+            )
+            items = resp.get("result") or []
+            if not isinstance(items, list):
+                raise HTTPException(status_code=502, detail="ozon upstream error: invalid discounts-task/list response")
+            out.extend(items)
+            if len(items) < limit:
+                break
+            page += 1
+    return out
+
+
+def _ozon_decline_discount_tasks(ozon_hdrs: dict[str, str], tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    if not tasks:
+        return {"success": True, "result": {"success_count": 0, "fail_count": 0, "fail_details": []}}
+    return {
+        "success": True,
+        "result": _ozon_post_json(
+            "https://api-seller.ozon.ru/v1/actions/discounts-task/decline",
+            ozon_hdrs,
+            {"tasks": tasks},
+        ),
+    }
+
+
+def _ozon_approve_discount_tasks(ozon_hdrs: dict[str, str], tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    if not tasks:
+        return {"success": True, "result": {"success_count": 0, "fail_count": 0, "fail_details": []}}
+    return {
+        "success": True,
+        "result": _ozon_post_json(
+            "https://api-seller.ozon.ru/v1/actions/discounts-task/approve",
+            ozon_hdrs,
+            {"tasks": tasks},
+        ),
+    }
+
+
 def _run_user_timer_autoupdate(user_uuid_val: uuid.UUID) -> dict[str, Any]:
     with db() as conn, conn.cursor() as cur:
         cur.execute(
@@ -509,6 +602,87 @@ def _run_user_timer_autoupdate(user_uuid_val: uuid.UUID) -> dict[str, Any]:
         "offer_ids_total": len(offer_ids),
         "offer_ids_without_product_id": missed_offer_ids,
         "timer": timer_result,
+    }
+
+
+def _run_user_discount_autoprocess(user_uuid_val: uuid.UUID) -> dict[str, Any]:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT offer_id, min_price_discount
+            FROM ozon_promo_product_settings
+            WHERE user_uuid=%s AND use_discount = TRUE
+            """,
+            (user_uuid_val,),
+        )
+        rows = cur.fetchall()
+    settings_map: dict[str, int] = {}
+    for row in rows or []:
+        offer_id = str(row[0] or "").strip()
+        if not offer_id:
+            continue
+        settings_map[offer_id] = int(row[1] or 0)
+    if not settings_map:
+        return {
+            "user_uuid": str(user_uuid_val),
+            "products_total": 0,
+            "processed": 0,
+            "approved": 0,
+            "declined": 0,
+            "skipped": 0,
+            "approve_result": {"success": True, "result": {"success_count": 0, "fail_count": 0, "fail_details": []}},
+            "decline_result": {"success": True, "result": {"success_count": 0, "fail_count": 0, "fail_details": []}},
+        }
+    ozon_hdrs = _ozon_headers(user_uuid_val)
+    tasks = _ozon_list_discount_tasks(ozon_hdrs, ["NEW"], 50)
+    approve_payload: list[dict[str, Any]] = []
+    decline_payload: list[dict[str, Any]] = []
+    skipped = 0
+    for task in tasks:
+        offer_id = str(task.get("offer_id") or "").strip()
+        task_id = task.get("id")
+        if not offer_id or task_id is None:
+            skipped += 1
+            continue
+        min_price_discount = settings_map.get(offer_id)
+        if min_price_discount is None or min_price_discount <= 0:
+            skipped += 1
+            continue
+        try:
+            requested_price = float(task.get("requested_price"))
+        except Exception:
+            skipped += 1
+            continue
+        try:
+            requested_quantity_min = int(task.get("requested_quantity_min") or 1)
+        except Exception:
+            requested_quantity_min = 1
+        try:
+            requested_quantity_max = int(task.get("requested_quantity_max") or requested_quantity_min)
+        except Exception:
+            requested_quantity_max = requested_quantity_min
+        if requested_price < float(min_price_discount):
+            decline_payload.append({"id": task_id})
+            continue
+        approve_payload.append(
+            {
+                "id": task_id,
+                "approved_price": requested_price,
+                "approved_quantity_min": requested_quantity_min,
+                "approved_quantity_max": requested_quantity_max,
+            }
+        )
+    decline_result = _ozon_decline_discount_tasks(ozon_hdrs, decline_payload)
+    approve_result = _ozon_approve_discount_tasks(ozon_hdrs, approve_payload)
+    return {
+        "user_uuid": str(user_uuid_val),
+        "products_total": len(settings_map),
+        "processed": len(tasks),
+        "approved": len(approve_payload),
+        "declined": len(decline_payload),
+        "skipped": skipped,
+        "approve_result": approve_result,
+        "decline_result": decline_result,
     }
 
 
@@ -1320,6 +1494,37 @@ def run_ozon_promo_timer_autoupdate_for_user(x_user_uuid: str | None = Header(de
     return _run_user_timer_autoupdate(user_uuid_val)
 
 
+@app.post("/internal/jobs/ozon/promotions/discount-autoprocess")
+def run_ozon_discount_autoprocess(x_scheduler_token: str | None = Header(default=None)) -> dict[str, Any]:
+    if MARKETPLACES_SCHEDULER_TOKEN and x_scheduler_token != MARKETPLACES_SCHEDULER_TOKEN:
+        raise HTTPException(status_code=403, detail="invalid scheduler token")
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT user_uuid
+            FROM ozon_promo_product_settings
+            WHERE use_discount = TRUE
+            """
+        )
+        rows = cur.fetchall()
+    users = [uuid.UUID(str(r[0])) for r in rows if r and r[0]]
+    user_results: list[dict[str, Any]] = []
+    for user_uuid_val in users:
+        try:
+            user_results.append(_run_user_discount_autoprocess(user_uuid_val))
+        except HTTPException as e:
+            user_results.append(
+                {"user_uuid": str(user_uuid_val), "error": str(e.detail), "status_code": int(e.status_code)}
+            )
+    return {"users_total": len(users), "results": user_results}
+
+
+@app.post("/ozon/promotions/discount-autoprocess")
+def run_ozon_discount_autoprocess_for_user(x_user_uuid: str | None = Header(default=None)) -> dict[str, Any]:
+    user_uuid_val = _user_uuid(x_user_uuid)
+    return _run_user_discount_autoprocess(user_uuid_val)
+
+
 @app.get("/ozon/promotions")
 def ozon_promotions(
     x_user_uuid: str | None = Header(default=None),
@@ -1478,8 +1683,17 @@ def get_ozon_promotions_settings(x_user_uuid: str | None = Header(default=None))
 @app.post("/ozon/promotions/settings")
 def save_ozon_promotions_settings(
     body: OzonPromoProductSettingsIn, x_user_uuid: str | None = Header(default=None)
-) -> dict[str, str]:
-    _save_ozon_promo_settings(_user_uuid(x_user_uuid), body)
+) -> dict[str, Any]:
+    user_uuid_val = _user_uuid(x_user_uuid)
+    offer_id = (body.offer_id or "").strip()
+    if body.yourprice > 0 or body.minprice > 0:
+        _update_ozon_prices(
+            _ozon_headers(user_uuid_val),
+            offer_id=offer_id,
+            yourprice=body.yourprice,
+            minprice=body.minprice,
+        )
+    _save_ozon_promo_settings(user_uuid_val, body)
     return {"status": "ok"}
 
 

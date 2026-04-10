@@ -7,7 +7,8 @@ import { Dropdown } from "@/components/ui/dropdown/Dropdown";
 import { DropdownItem } from "@/components/ui/dropdown/DropdownItem";
 import { ChevronDownIcon } from "@/icons/index";
 import { getGatewayBaseUrl } from "@/lib/gateway";
-import React, { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 type BuybackCategory = {
   id: string;
@@ -34,12 +35,8 @@ type Warehouse = {
 
 type DeviceCondition = {
   id: string;
+  category_id: string;
   name: string;
-};
-
-type DeviceConditionRow = {
-  key: number;
-  selectedId: string;
 };
 
 function getToken(): string {
@@ -87,15 +84,18 @@ function phoneDigits(value: string): string {
 
 export default function SkupkaNewDealPage() {
   const base = useMemo(() => getGatewayBaseUrl(), []);
+  const router = useRouter();
+  const purchaseObjectBoxRef = useRef<HTMLDivElement | null>(null);
   const [dealType, setDealType] = useState("");
   const [isDealTypeOpen, setIsDealTypeOpen] = useState(false);
   const [categories, setCategories] = useState<BuybackCategory[]>([]);
   const [categoryId, setCategoryId] = useState("");
   const [purchaseObjects, setPurchaseObjects] = useState<PurchaseObject[]>([]);
   const [purchaseObjectId, setPurchaseObjectId] = useState("");
+  const [purchaseObjectQuery, setPurchaseObjectQuery] = useState("");
+  const [purchaseObjectOptionsOpen, setPurchaseObjectOptionsOpen] = useState(false);
   const [deviceConditionOptions, setDeviceConditionOptions] = useState<DeviceCondition[]>([]);
-  const [deviceConditionRows, setDeviceConditionRows] = useState<DeviceConditionRow[]>([{ key: 1, selectedId: "" }]);
-  const [nextDeviceConditionKey, setNextDeviceConditionKey] = useState(2);
+  const [selectedDeviceConditionIds, setSelectedDeviceConditionIds] = useState<string[]>([]);
   const [contactName, setContactName] = useState("");
   const [clientPhone, setClientPhone] = useState("+7");
   const [contactHasNoPhone, setContactHasNoPhone] = useState(false);
@@ -119,9 +119,9 @@ export default function SkupkaNewDealPage() {
   };
 
   const selectedPurchaseObject = purchaseObjects.find((item) => item.id === purchaseObjectId);
-  const selectedDeviceConditionIds = deviceConditionRows
-    .map((row) => row.selectedId)
-    .filter((id): id is string => !!id);
+  const visiblePurchaseObjects = purchaseObjects.filter((item) =>
+    item.name.toLowerCase().includes(purchaseObjectQuery.trim().toLowerCase())
+  );
   const hasSelectedDeviceConditions = selectedDeviceConditionIds.length > 0;
 
   const loadCategories = async () => {
@@ -163,8 +163,9 @@ export default function SkupkaNewDealPage() {
     setWarehouses((await resp.json()) as Warehouse[]);
   };
 
-  const loadDeviceConditions = async () => {
-    const resp = await fetch(`${base}/skupka/settings/device-conditions`, {
+  const loadDeviceConditions = async (nextCategoryId: string) => {
+    const qs = nextCategoryId ? `?category_id=${encodeURIComponent(nextCategoryId)}` : "";
+    const resp = await fetch(`${base}/skupka/settings/device-conditions${qs}`, {
       cache: "no-store",
       headers: authHeaders(),
     });
@@ -184,6 +185,16 @@ export default function SkupkaNewDealPage() {
       }
     })();
   }, [base]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (purchaseObjectBoxRef.current && !purchaseObjectBoxRef.current.contains(event.target as Node)) {
+        setPurchaseObjectOptionsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   useEffect(() => {
     if (!purchaseObjectId) {
@@ -230,9 +241,10 @@ export default function SkupkaNewDealPage() {
     setCategoryId("");
     setPurchaseObjects([]);
     setPurchaseObjectId("");
+    setPurchaseObjectQuery("");
+    setPurchaseObjectOptionsOpen(false);
     setDeviceConditionOptions([]);
-    setDeviceConditionRows([{ key: 1, selectedId: "" }]);
-    setNextDeviceConditionKey(2);
+    setSelectedDeviceConditionIds([]);
     setContactName("");
     setClientPhone("+7");
     setContactHasNoPhone(false);
@@ -256,10 +268,11 @@ export default function SkupkaNewDealPage() {
   const onSelectCategory = async (value: string) => {
     setCategoryId(value);
     setPurchaseObjectId("");
+    setPurchaseObjectQuery("");
+    setPurchaseObjectOptionsOpen(false);
     setPurchaseObjects([]);
     setDeviceConditionOptions([]);
-    setDeviceConditionRows([{ key: 1, selectedId: "" }]);
-    setNextDeviceConditionKey(2);
+    setSelectedDeviceConditionIds([]);
     setContactName("");
     setClientPhone("+7");
     setContactHasNoPhone(false);
@@ -281,10 +294,12 @@ export default function SkupkaNewDealPage() {
     }
   };
 
-  const onSelectPurchaseObject = (value: string) => {
+  const onSelectPurchaseObject = (item: PurchaseObject | null) => {
+    const value = item?.id || "";
     setPurchaseObjectId(value);
-    setDeviceConditionRows([{ key: 1, selectedId: "" }]);
-    setNextDeviceConditionKey(2);
+    setPurchaseObjectQuery(item?.name || "");
+    setPurchaseObjectOptionsOpen(false);
+    setSelectedDeviceConditionIds([]);
     setContactHasNoPhone(false);
     setSelectedContactId("");
     setContactMatches([]);
@@ -299,7 +314,7 @@ export default function SkupkaNewDealPage() {
       return;
     }
     setError(null);
-    void loadDeviceConditions().catch((e: any) => setError(e?.message || "failed to load device conditions"));
+    void loadDeviceConditions(categoryId).catch((e: any) => setError(e?.message || "failed to load device conditions"));
   };
 
   const resetAfterContactChange = () => {
@@ -321,28 +336,13 @@ export default function SkupkaNewDealPage() {
     resetAfterContactChange();
   };
 
-  const onSelectDeviceCondition = (rowKey: number, conditionId: string) => {
-    const alreadySelected = deviceConditionRows.some((row) => row.key !== rowKey && row.selectedId === conditionId);
-    if (alreadySelected && conditionId) return;
-    setDeviceConditionRows((prev) =>
-      prev.map((row) => (row.key === rowKey ? { ...row, selectedId: conditionId } : row))
-    );
-    resetAfterDeviceConditionsChange();
-    setError(null);
-  };
-
-  const onAddDeviceConditionRow = () => {
-    setDeviceConditionRows((prev) => [...prev, { key: nextDeviceConditionKey, selectedId: "" }]);
-    setNextDeviceConditionKey((prev) => prev + 1);
-    resetAfterDeviceConditionsChange();
-  };
-
-  const onRemoveDeviceConditionRow = (rowKey: number) => {
-    setDeviceConditionRows((prev) => {
-      const next = prev.filter((row) => row.key !== rowKey);
-      return next.length ? next : [{ key: 1, selectedId: "" }];
+  const onToggleDeviceCondition = (conditionId: string) => {
+    setSelectedDeviceConditionIds((prev) => {
+      const next = prev.includes(conditionId) ? prev.filter((id) => id !== conditionId) : [...prev, conditionId];
+      return next;
     });
     resetAfterDeviceConditionsChange();
+    setError(null);
   };
 
   const onPickContact = (contact: Contact) => {
@@ -464,9 +464,8 @@ export default function SkupkaNewDealPage() {
         const body = await financeResp.text().catch(() => "");
         throw new Error(`finance save failed: ${financeResp.status} ${body}`);
       }
-      setDealType("");
-      resetAfterDealType();
-      setOk(`Сделка создана: ${created.id}`);
+      router.push(`/modules/skupka/list?open_deal_id=${encodeURIComponent(created.id)}`);
+      return;
     } catch (e: any) {
       setError(e?.message || "failed to create deal");
     } finally {
@@ -482,11 +481,19 @@ export default function SkupkaNewDealPage() {
           <div>
             <Label>Тип сделки</Label>
             <div className="relative inline-block">
-              <Button size="md" onClick={() => setIsDealTypeOpen((prev) => !prev)} className="dropdown-toggle">
+              <Button
+                size="md"
+                onClick={() => setIsDealTypeOpen((prev) => !prev)}
+                className="dropdown-toggle w-[250px] justify-between"
+              >
                 {dealTypeLabel(dealType) || "Выберите тип сделки"}
                 <ChevronDownIcon />
               </Button>
-              <Dropdown isOpen={isDealTypeOpen} onClose={() => setIsDealTypeOpen(false)} className="w-56 p-2">
+              <Dropdown
+                isOpen={isDealTypeOpen}
+                onClose={() => setIsDealTypeOpen(false)}
+                className="left-0 right-auto w-[250px] p-2"
+              >
                 {dealTypeOptions.map((item) => (
                   <DropdownItem
                     key={item.id}
@@ -508,7 +515,7 @@ export default function SkupkaNewDealPage() {
                 value={categoryId}
                 onChange={(e) => void onSelectCategory(e.target.value)}
                 disabled={!categories.length}
-                className="h-11 w-full max-w-md rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
+                className="h-11 w-[250px] max-w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
               >
                 <option value="">Выберите категорию</option>
                 {categories.map((item) => (
@@ -533,68 +540,78 @@ export default function SkupkaNewDealPage() {
                   +
                 </button>
               </div>
-              <select
-                value={purchaseObjectId}
-                onChange={(e) => onSelectPurchaseObject(e.target.value)}
-                disabled={!purchaseObjects.length}
-                className="h-11 w-full max-w-md rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
-              >
-                <option value="">Выберите объект покупки</option>
-                {purchaseObjects.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name}
-                  </option>
-                ))}
-              </select>
+              <div className="relative w-[250px] max-w-full" ref={purchaseObjectBoxRef}>
+                <input
+                  value={purchaseObjectQuery}
+                  onChange={(e) => {
+                    const nextValue = e.target.value;
+                    setPurchaseObjectQuery(nextValue);
+                    setPurchaseObjectOptionsOpen(true);
+                    if (purchaseObjectId && selectedPurchaseObject?.name !== nextValue) {
+                      onSelectPurchaseObject(null);
+                      setPurchaseObjectQuery(nextValue);
+                      setPurchaseObjectOptionsOpen(true);
+                    }
+                  }}
+                  onFocus={() => setPurchaseObjectOptionsOpen(true)}
+                  disabled={!purchaseObjects.length}
+                  placeholder="Введите объект покупки для поиска"
+                  className="h-11 w-[250px] max-w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900 dark:text-white/90"
+                />
+                {purchaseObjectOptionsOpen && (
+                  <div className="absolute z-20 mt-1 w-full rounded-lg border border-gray-200 bg-white shadow-theme-lg dark:border-gray-800 dark:bg-gray-900 max-h-56 overflow-auto">
+                    {!visiblePurchaseObjects.length ? (
+                      <div className="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">Ничего не найдено</div>
+                    ) : (
+                      visiblePurchaseObjects.map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => onSelectPurchaseObject(item)}
+                          className="w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-white/10"
+                        >
+                          {item.name}
+                        </button>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           ) : null}
 
           {purchaseObjectId ? (
             <div className="rounded-lg border border-gray-100 dark:border-gray-800 px-4 py-4">
               <h4 className="mb-3 font-semibold text-gray-800 dark:text-white/90">Состояние устройства</h4>
-              <div className="space-y-3">
-                {deviceConditionRows.map((row) => {
-                  const selectedInOtherRows = new Set(
-                    deviceConditionRows.filter((x) => x.key !== row.key && x.selectedId).map((x) => x.selectedId)
-                  );
-                  return (
-                    <div key={row.key} className="flex gap-2 items-center">
-                      <select
-                        value={row.selectedId}
-                        onChange={(e) => onSelectDeviceCondition(row.key, e.target.value)}
-                        className="h-11 w-full max-w-md rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
+              {!deviceConditionOptions.length ? (
+                <div className="text-sm text-gray-500 dark:text-gray-400">Для выбранной категории состояния не созданы.</div>
+              ) : (
+                <ul className="inline-flex flex-wrap overflow-hidden rounded-lg border border-gray-300 text-sm font-medium text-gray-800 dark:border-gray-700 dark:text-white/90">
+                  {deviceConditionOptions.map((item, index) => (
+                    <li
+                      key={item.id}
+                      className={`w-[250px] ${index > 0 ? "border-l border-gray-300 dark:border-gray-700" : ""}`}
+                    >
+                      <label
+                        htmlFor={`device-condition-${item.id}`}
+                        className={`flex min-h-11 cursor-pointer items-center px-3 py-3 ${
+                          selectedDeviceConditionIds.includes(item.id) ? "bg-brand-50 dark:bg-brand-500/10" : ""
+                        }`}
                       >
-                        <option value="">Выберите состояние</option>
-                        {deviceConditionOptions
-                          .filter((item) => !selectedInOtherRows.has(item.id) || item.id === row.selectedId)
-                          .map((item) => (
-                            <option key={item.id} value={item.id}>
-                              {item.name}
-                            </option>
-                          ))}
-                      </select>
-                      {deviceConditionRows.length > 1 ? (
-                        <button
-                          type="button"
-                          className="h-11 px-3 rounded-lg border border-gray-300 text-sm text-gray-700 hover:bg-gray-100 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-white/10"
-                          onClick={() => onRemoveDeviceConditionRow(row.key)}
-                        >
-                          Удалить
-                        </button>
-                      ) : null}
-                    </div>
-                  );
-                })}
-              </div>
-              <div className="mt-3">
-                <button
-                  type="button"
-                  className="text-sm text-brand-600 hover:text-brand-700 dark:text-brand-400"
-                  onClick={onAddDeviceConditionRow}
-                >
-                  + Добавить ещё состояние
-                </button>
-              </div>
+                        <input
+                          id={`device-condition-${item.id}`}
+                          type="checkbox"
+                          value={item.id}
+                          checked={selectedDeviceConditionIds.includes(item.id)}
+                          onChange={() => onToggleDeviceCondition(item.id)}
+                          className="h-4 w-4 rounded border border-gray-300 focus:ring-2 focus:ring-brand-300 dark:border-gray-700 dark:bg-gray-900"
+                        />
+                        <span className="ml-2 break-words">{item.name}</span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           ) : null}
 
@@ -602,7 +619,7 @@ export default function SkupkaNewDealPage() {
             <div className="rounded-lg border border-gray-100 dark:border-gray-800 px-4 py-4">
               <h4 className="mb-3 font-semibold text-gray-800 dark:text-white/90">Контакт клиента</h4>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
-                <div>
+                <div className="w-[250px] max-w-full">
                   <Label>Имя клиента</Label>
                   <Input
                     value={contactName}
@@ -612,9 +629,10 @@ export default function SkupkaNewDealPage() {
                       resetAfterContactChange();
                     }}
                     placeholder="Имя клиента"
+                    className="w-[250px]"
                   />
                 </div>
-                <div>
+                <div className="w-[250px] max-w-full">
                   <Label>Телефон</Label>
                   <Input
                     value={clientPhone}
@@ -625,6 +643,7 @@ export default function SkupkaNewDealPage() {
                       resetAfterContactChange();
                     }}
                     placeholder="+7xxx-xxx-xx-xx"
+                    className="w-[250px]"
                   />
                   <label className="mt-2 flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
                     <input
@@ -678,6 +697,16 @@ export default function SkupkaNewDealPage() {
                   <Button
                     size="sm"
                     onClick={() => {
+                      const contactIsEmpty = !contactName.trim() && countPhoneDigits(clientPhone) <= 1;
+                      if (contactIsEmpty) {
+                        setContactHasNoPhone(true);
+                        setSelectedContactId("");
+                        setContactMatches([]);
+                        setClientPhone("+7");
+                        setError(null);
+                        setFinanceStepOpen(true);
+                        return;
+                      }
                       if (!canGoToFinance()) {
                         setError(contactHasNoPhone ? "Заполните имя клиента" : "Заполните имя и телефон клиента");
                         return;
@@ -702,7 +731,7 @@ export default function SkupkaNewDealPage() {
                   <select
                     value={paymentMethod}
                     onChange={(e) => setPaymentMethod(e.target.value)}
-                    className="h-11 w-full max-w-md rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
+                    className="h-11 w-[250px] max-w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
                   >
                     <option value="">Выберите способ оплаты</option>
                     {paymentMethodOptions.map((item) => (
@@ -712,19 +741,24 @@ export default function SkupkaNewDealPage() {
                     ))}
                   </select>
                 </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-end">
-                  <div className="text-sm text-gray-800 dark:text-white/90">
+                <div className="space-y-3">
+                  <div className="w-[250px] text-sm text-gray-800 dark:text-white/90">
                     Объект покупки: {selectedPurchaseObject?.name || "Объект"}
                   </div>
-                  <div>
+                  <div className="w-[250px] max-w-full">
                     <Label>Сумма</Label>
-                    <Input value={amount} onChange={(e: any) => setAmount(e.target.value)} placeholder="0.00" />
+                    <Input
+                      value={amount}
+                      onChange={(e: any) => setAmount(e.target.value)}
+                      placeholder="0.00"
+                      className="w-[250px]"
+                    />
                   </div>
                 </div>
               </div>
-              {!warehouseStepOpen ? (
+              {!warehouseStepOpen && canGoToWarehouse() ? (
                 <div className="mt-4">
-                  <Button size="sm" disabled={!canGoToWarehouse()} onClick={() => void onOpenWarehouse()}>
+                  <Button size="sm" onClick={() => void onOpenWarehouse()}>
                     Далее
                   </Button>
                 </div>
@@ -735,13 +769,13 @@ export default function SkupkaNewDealPage() {
           {warehouseStepOpen ? (
             <div className="rounded-lg border border-gray-100 dark:border-gray-800 px-4 py-4">
               <h4 className="mb-3 font-semibold text-gray-800 dark:text-white/90">Склад</h4>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
+              <div className="space-y-4">
+                <div className="w-[250px] max-w-full">
                   <Label>Склад</Label>
                   <select
                     value={warehouseId}
                     onChange={(e) => setWarehouseId(e.target.value)}
-                    className="h-11 w-full max-w-md rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
+                    className="h-11 w-[250px] max-w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
                   >
                     <option value="">Выберите склад</option>
                     {warehouses.map((item) => (
@@ -751,9 +785,14 @@ export default function SkupkaNewDealPage() {
                     ))}
                   </select>
                 </div>
-                <div>
+                <div className="w-[500px] max-w-full">
                   <Label>Комментарий</Label>
-                  <Input value={comment} onChange={(e: any) => setComment(e.target.value)} placeholder="Комментарий по сделке" />
+                  <Input
+                    value={comment}
+                    onChange={(e: any) => setComment(e.target.value)}
+                    placeholder="Комментарий по сделке"
+                    className="w-[500px]"
+                  />
                 </div>
               </div>
               {!warehouses.length ? (

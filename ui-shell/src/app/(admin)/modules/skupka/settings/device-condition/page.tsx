@@ -9,10 +9,16 @@ import React, { useEffect, useMemo, useState } from "react";
 
 type DeviceConditionItem = {
   id: string;
+  category_id: string;
   name: string;
   color: string;
   sort_order: number;
   created_at: string;
+};
+
+type BuybackCategory = {
+  id: string;
+  name: string;
 };
 
 function getToken(): string {
@@ -28,13 +34,17 @@ function moveItem<T>(arr: T[], fromIndex: number, toIndex: number): T[] {
 
 export default function SkupkaSettingsDeviceConditionPage() {
   const base = useMemo(() => getGatewayBaseUrl(), []);
+  const [categories, setCategories] = useState<BuybackCategory[]>([]);
   const [items, setItems] = useState<DeviceConditionItem[]>([]);
+  const [categoryId, setCategoryId] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingCategoryId, setEditingCategoryId] = useState("");
   const [editingName, setEditingName] = useState("");
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [filterCategoryId, setFilterCategoryId] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const authHeaders = () => {
@@ -42,8 +52,25 @@ export default function SkupkaSettingsDeviceConditionPage() {
     return token ? { authorization: `Bearer ${token}` } : {};
   };
 
+  const loadCategories = async () => {
+    const resp = await fetch(`${base}/skupka/settings/categories`, {
+      cache: "no-store",
+      headers: authHeaders(),
+    });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      throw new Error(`load categories failed: ${resp.status} ${body}`);
+    }
+    const data = (await resp.json()) as BuybackCategory[];
+    setCategories(data);
+    if (!categoryId && data.length) setCategoryId(data[0].id);
+    if (categoryId && !data.some((item) => item.id === categoryId)) setCategoryId(data[0]?.id || "");
+    if (filterCategoryId && !data.some((item) => item.id === filterCategoryId)) setFilterCategoryId("");
+  };
+
   const load = async () => {
-    const resp = await fetch(`${base}/skupka/settings/device-conditions`, {
+    const qs = filterCategoryId ? `?category_id=${encodeURIComponent(filterCategoryId)}` : "";
+    const resp = await fetch(`${base}/skupka/settings/device-conditions${qs}`, {
       cache: "no-store",
       headers: authHeaders(),
     });
@@ -57,12 +84,23 @@ export default function SkupkaSettingsDeviceConditionPage() {
   useEffect(() => {
     (async () => {
       try {
+        await loadCategories();
         await load();
       } catch (e: any) {
         setError(e?.message || "failed to load device conditions");
       }
     })();
   }, [base]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        await load();
+      } catch (e: any) {
+        setError(e?.message || "failed to load device conditions");
+      }
+    })();
+  }, [filterCategoryId]);
 
   const onCreate = async () => {
     setBusy(true);
@@ -71,7 +109,7 @@ export default function SkupkaSettingsDeviceConditionPage() {
       const resp = await fetch(`${base}/skupka/settings/device-conditions`, {
         method: "POST",
         headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ category_id: categoryId, name }),
       });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
@@ -88,11 +126,13 @@ export default function SkupkaSettingsDeviceConditionPage() {
 
   const onStartEdit = (item: DeviceConditionItem) => {
     setEditingId(item.id);
+    setEditingCategoryId(item.category_id);
     setEditingName(item.name);
   };
 
   const onCancelEdit = () => {
     setEditingId(null);
+    setEditingCategoryId("");
     setEditingName("");
   };
 
@@ -104,7 +144,7 @@ export default function SkupkaSettingsDeviceConditionPage() {
       const resp = await fetch(`${base}/skupka/settings/device-conditions/${editingId}`, {
         method: "PUT",
         headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ name: editingName }),
+        body: JSON.stringify({ category_id: editingCategoryId, name: editingName }),
       });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
@@ -174,17 +214,48 @@ export default function SkupkaSettingsDeviceConditionPage() {
     <div className="space-y-6">
       <div className="rounded-2xl border border-gray-200 bg-white px-5 py-6 dark:border-gray-800 dark:bg-white/[0.03]">
         <h3 className="mb-4 font-semibold text-gray-800 text-theme-xl dark:text-white/90">Новое состояние устройства</h3>
-        <div>
-          <Label>Название состояния</Label>
-          <Input value={name} onChange={(e: any) => setName(e.target.value)} placeholder="Например: Отличное" />
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <Label>Категория</Label>
+            <select
+              className="h-11 w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
+              value={categoryId}
+              onChange={(e) => setCategoryId(e.target.value)}
+              disabled={!categories.length}
+            >
+              {!categories.length ? <option value="">Нет категорий</option> : null}
+              {categories.map((item) => (
+                <option key={item.id} value={item.id}>{item.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <Label>Название состояния</Label>
+            <Input value={name} onChange={(e: any) => setName(e.target.value)} placeholder="Например: Отличное" />
+          </div>
         </div>
         <div className="mt-4">
-          <Button size="sm" disabled={busy} onClick={onCreate}>Добавить</Button>
+          <Button size="sm" disabled={busy || !categoryId} onClick={onCreate}>Добавить</Button>
         </div>
       </div>
 
       <div className="rounded-2xl border border-gray-200 bg-white px-5 py-6 dark:border-gray-800 dark:bg-white/[0.03]">
-        <h3 className="mb-4 font-semibold text-gray-800 text-theme-xl dark:text-white/90">Список состояний устройства</h3>
+        <div className="flex items-center justify-between gap-4 mb-4">
+          <h3 className="font-semibold text-gray-800 text-theme-xl dark:text-white/90">Список состояний устройства</h3>
+          <div className="min-w-[260px]">
+            <Label>Фильтр по категории</Label>
+            <select
+              className="h-11 w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
+              value={filterCategoryId}
+              onChange={(e) => setFilterCategoryId(e.target.value)}
+            >
+              <option value="">Все категории</option>
+              {categories.map((item) => (
+                <option key={item.id} value={item.id}>{item.name}</option>
+              ))}
+            </select>
+          </div>
+        </div>
         <div className="text-xs text-gray-500 dark:text-gray-400 mb-3">Перетащите строку мышью, чтобы изменить порядок вывода.</div>
         {error ? <div className="text-sm text-red-600 mb-4">Ошибка: {error}</div> : null}
         {!items.length ? (
@@ -201,12 +272,23 @@ export default function SkupkaSettingsDeviceConditionPage() {
                 className="flex items-center gap-3 justify-between rounded-lg border border-gray-100 dark:border-gray-800 px-3 py-2 cursor-move"
               >
                 {editingId === item.id ? (
-                  <div className="w-full">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 w-full">
+                    <select
+                      className="h-10 w-full rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
+                      value={editingCategoryId}
+                      onChange={(e) => setEditingCategoryId(e.target.value)}
+                    >
+                      {categories.map((c) => (
+                        <option key={c.id} value={c.id}>{c.name}</option>
+                      ))}
+                    </select>
                     <Input value={editingName} onChange={(e: any) => setEditingName(e.target.value)} />
                   </div>
                 ) : (
                   <div className="flex items-center gap-3">
-                    <span className="text-sm text-gray-800 dark:text-white/90">{item.name}</span>
+                    <span className="text-sm text-gray-800 dark:text-white/90">
+                      [{categories.find((c) => c.id === item.category_id)?.name || "-"}] {item.name}
+                    </span>
                   </div>
                 )}
                 <div className="flex items-center gap-2">

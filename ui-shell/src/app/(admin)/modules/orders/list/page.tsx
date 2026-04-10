@@ -20,6 +20,9 @@ type OrderItem = {
   id: string;
   order_number?: number | null;
   status: string;
+  status_selected_manually?: boolean;
+  display_status?: string | null;
+  issue_kind?: OrderIssueKind | null;
   order_kind: string;
   service_category_id: string | null;
   service_object_id: string | null;
@@ -44,7 +47,7 @@ type FinanceLine = {
   work_type_uuid: string;
   amount: number;
   currency: string;
-  payment_method: "card" | "cash";
+  payment_method: "card" | "cash" | null;
   is_paid: boolean;
 };
 
@@ -97,15 +100,49 @@ type WarehouseInfo = {
   qr_telegram_svg: string;
 };
 
+type WarehouseOption = {
+  id: string;
+  name: string;
+};
+
 type ListFilters = {
   order_kind: string;
   service_category_id: string;
   work_type_id: string;
+  warehouse_id: string;
   created_by_uuid: string;
   search: string;
   created_from: string;
   created_to: string;
 };
+
+type OrderIssueKind = "return" | "problem" | "issued";
+
+type OrderIssueHistoryItem = {
+  id: string;
+  issue_kind: OrderIssueKind;
+  reason: string;
+  created_by_uuid?: string | null;
+  created_by_name?: string;
+  created_at: string;
+};
+
+type OrderFeedItem =
+  | {
+      kind: "status";
+      id: string;
+      title: string;
+      created_at: string;
+    }
+  | {
+      kind: "issue";
+      id: string;
+      issue_kind: OrderIssueKind;
+      title: string;
+      reason: string;
+      created_at: string;
+      created_by_name?: string;
+    };
 
 function getToken(): string {
   return (window as any).__hubcrmAccessToken || "";
@@ -180,6 +217,7 @@ export default function OrdersListPage() {
   const [financeByOrder, setFinanceByOrder] = useState<Record<string, FinanceLine[]>>({});
   const [financeLoadingByOrder, setFinanceLoadingByOrder] = useState<Record<string, boolean>>({});
   const [financeErrorByOrder, setFinanceErrorByOrder] = useState<Record<string, string>>({});
+  const [warehouseOptions, setWarehouseOptions] = useState<WarehouseOption[]>([]);
   const [warehouseNameById, setWarehouseNameById] = useState<Record<string, string>>({});
   const [warehouseById, setWarehouseById] = useState<Record<string, WarehouseInfo>>({});
   const [categoryNameById, setCategoryNameById] = useState<Record<string, string>>({});
@@ -204,10 +242,18 @@ export default function OrdersListPage() {
   const [creatorFilterQuery, setCreatorFilterQuery] = useState("");
   const [creatorFilterOptions, setCreatorFilterOptions] = useState<UserLite[]>([]);
   const [creatorFilterOpen, setCreatorFilterOpen] = useState(false);
+  const [issueHistoryByOrder, setIssueHistoryByOrder] = useState<Record<string, OrderIssueHistoryItem[]>>({});
+  const [issueHistoryLoadingByOrder, setIssueHistoryLoadingByOrder] = useState<Record<string, boolean>>({});
+  const [issueHistoryErrorByOrder, setIssueHistoryErrorByOrder] = useState<Record<string, string>>({});
+  const [issueDraftKindByOrder, setIssueDraftKindByOrder] = useState<Record<string, OrderIssueKind | undefined>>({});
+  const [issueDraftReasonByOrder, setIssueDraftReasonByOrder] = useState<Record<string, string>>({});
+  const [issueSavingByOrder, setIssueSavingByOrder] = useState<Record<string, boolean>>({});
+  const [confirmIssuedByOrder, setConfirmIssuedByOrder] = useState<Record<string, boolean>>({});
   const [draftFilters, setDraftFilters] = useState<ListFilters>({
     order_kind: "",
     service_category_id: "",
     work_type_id: "",
+    warehouse_id: "",
     created_by_uuid: "",
     search: initialSearch,
     created_from: "",
@@ -217,6 +263,7 @@ export default function OrdersListPage() {
     order_kind: "",
     service_category_id: "",
     work_type_id: "",
+    warehouse_id: "",
     created_by_uuid: "",
     search: initialSearch,
     created_from: "",
@@ -270,6 +317,7 @@ export default function OrdersListPage() {
       if (f.order_kind) qs.set("order_kind", f.order_kind);
       if (f.service_category_id) qs.set("service_category_id", f.service_category_id);
       if (f.work_type_id) qs.set("work_type_id", f.work_type_id);
+      if (f.warehouse_id) qs.set("warehouse_id", f.warehouse_id);
       if (f.created_by_uuid) qs.set("created_by_uuid", f.created_by_uuid);
       if (f.search.trim()) qs.set("search", f.search.trim());
       if (f.created_from) qs.set("created_from", f.created_from);
@@ -292,6 +340,7 @@ export default function OrdersListPage() {
       if (pendingOpenOrderId && (data.items || []).some((x) => x.id === pendingOpenOrderId)) {
         setOpenOrderId(pendingOpenOrderId);
         void loadFinanceLines(pendingOpenOrderId);
+        void loadIssueHistory(pendingOpenOrderId);
         const autoOrder = (data.items || []).find((x) => x.id === pendingOpenOrderId);
         if (autoOrder?.contact_uuid) {
           void loadContactInfo(pendingOpenOrderId, autoOrder.contact_uuid);
@@ -387,7 +436,6 @@ export default function OrdersListPage() {
   }, []);
 
   const onChangeStatus = async (orderId: string, nextStatus: string) => {
-    if (!nextStatus) return;
     setStatusSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
     setError(null);
     try {
@@ -403,14 +451,17 @@ export default function OrdersListPage() {
         const body = await resp.text().catch(() => "");
         throw new Error(`status update failed: ${resp.status} ${body}`);
       }
-      setItems((prev) => prev.map((it) => (it.id === orderId ? { ...it, status: nextStatus } : it)));
-      setStatusHistoryByOrder((prev) => {
-        const existing = prev[orderId] || [];
-        return {
-          ...prev,
-          [orderId]: [{ status: nextStatus, changed_at: new Date().toISOString() }, ...existing],
-        };
-      });
+      const updatedOrder = (await resp.json()) as OrderItem;
+      setItems((prev) => prev.map((it) => (it.id === orderId ? { ...it, ...updatedOrder } : it)));
+      if (nextStatus) {
+        setStatusHistoryByOrder((prev) => {
+          const existing = prev[orderId] || [];
+          return {
+            ...prev,
+            [orderId]: [{ status: nextStatus, changed_at: new Date().toISOString() }, ...existing],
+          };
+        });
+      }
     } catch (e: any) {
       setError(e?.message || "failed to update status");
     } finally {
@@ -440,15 +491,191 @@ export default function OrdersListPage() {
     }
   };
 
+  const loadIssueHistory = async (orderId: string) => {
+    if (issueHistoryByOrder[orderId]) return;
+    setIssueHistoryLoadingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    try {
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/issues?limit=100`, {
+        cache: "no-store",
+        headers: authHeaders(),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`order issues failed: ${resp.status} ${body}`);
+      }
+      const history = (await resp.json()) as OrderIssueHistoryItem[];
+      setIssueHistoryByOrder((prev) => ({ ...prev, [orderId]: history }));
+    } catch (e: any) {
+      setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to load issues" }));
+    } finally {
+      setIssueHistoryLoadingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
+  };
+
+  const buildFeedItems = (orderId: string): OrderFeedItem[] => {
+    const statusItems: OrderFeedItem[] = (statusHistoryByOrder[orderId] || []).map((entry, index) => ({
+      kind: "status",
+      id: `status-${orderId}-${index}-${entry.changed_at}`,
+      title: entry.status,
+      created_at: entry.changed_at,
+    }));
+    const issueItems: OrderFeedItem[] = (issueHistoryByOrder[orderId] || []).map((entry) => ({
+      kind: "issue",
+      id: entry.id,
+      issue_kind: entry.issue_kind,
+      title: entry.issue_kind === "return" ? "Возврат" : entry.issue_kind === "problem" ? "Проблема" : "Выдано",
+      reason: entry.reason,
+      created_at: entry.created_at,
+      created_by_name: entry.created_by_name,
+    }));
+    return [...issueItems, ...statusItems].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+  };
+
   const onToggleOpen = (id: string) => {
     setOpenOrderId((prev) => (prev === id ? null : id));
     if (openOrderId !== id) {
       void loadFinanceLines(id);
+      void loadIssueHistory(id);
       const order = items.find((x) => x.id === id);
       if (order?.contact_uuid) {
         void loadContactInfo(id, order.contact_uuid);
       }
       void loadCreatorInfo(id);
+    }
+  };
+
+  const onStartIssue = (orderId: string, kind: OrderIssueKind) => {
+    setIssueDraftKindByOrder((prev) => ({ ...prev, [orderId]: kind }));
+    setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+  };
+
+  const onCancelIssue = (orderId: string) => {
+    setIssueDraftKindByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+    setIssueDraftReasonByOrder((prev) => ({ ...prev, [orderId]: "" }));
+  };
+
+  const onSaveIssue = async (orderId: string) => {
+    const issueKind = issueDraftKindByOrder[orderId];
+    const reason = String(issueDraftReasonByOrder[orderId] || "").trim();
+    if (!issueKind) return;
+    if (!reason) {
+      setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "Укажите причину." }));
+      return;
+    }
+    setIssueSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    try {
+      if (issueKind === "return") {
+        const displayResp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/display-status`, {
+          method: "PUT",
+          headers: {
+            "content-type": "application/json",
+            ...authHeaders(),
+          },
+          body: JSON.stringify({ display_status: "Принято в работу" }),
+        });
+        if (!displayResp.ok) {
+          const body = await displayResp.text().catch(() => "");
+          throw new Error(`display status save failed: ${displayResp.status} ${body}`);
+        }
+        const updatedOrder = (await displayResp.json()) as OrderItem;
+        setItems((prev) => prev.map((it) => (it.id === orderId ? { ...it, ...updatedOrder } : it)));
+      }
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/issues`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders(),
+        },
+        body: JSON.stringify({ issue_kind: issueKind, reason }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`order issue save failed: ${resp.status} ${body}`);
+      }
+      const entry = (await resp.json()) as OrderIssueHistoryItem;
+      setItems((prev) => prev.map((it) => (it.id === orderId ? { ...it, issue_kind: entry.issue_kind } : it)));
+      setIssueHistoryByOrder((prev) => ({ ...prev, [orderId]: [entry, ...(prev[orderId] || [])] }));
+      if (issueKind === "return") {
+        setStatusHistoryByOrder((prev) => ({
+          ...prev,
+          [orderId]: [{ status: "Принято в работу", changed_at: new Date().toISOString() }, ...(prev[orderId] || [])],
+        }));
+      }
+      setIssueDraftKindByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+      setIssueDraftReasonByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    } catch (e: any) {
+      setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to save issue" }));
+    } finally {
+      setIssueSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
+  };
+
+  const onSetDisplayStatus = async (orderId: string, nextDisplayStatus: string) => {
+    setIssueSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    try {
+      const requests =
+        nextDisplayStatus === "Выдано"
+          ? await Promise.all([
+              fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/display-status`, {
+                method: "PUT",
+                headers: {
+                  "content-type": "application/json",
+                  ...authHeaders(),
+                },
+                body: JSON.stringify({ display_status: nextDisplayStatus }),
+              }),
+              fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/issue-kind`, {
+                method: "PUT",
+                headers: {
+                  "content-type": "application/json",
+                  ...authHeaders(),
+                },
+                body: JSON.stringify({ issue_kind: null }),
+              }),
+            ])
+          : [
+              await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/display-status`, {
+                method: "PUT",
+                headers: {
+                  "content-type": "application/json",
+                  ...authHeaders(),
+                },
+                body: JSON.stringify({ display_status: nextDisplayStatus }),
+              }),
+            ];
+      const resp = requests[0];
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`order display status save failed: ${resp.status} ${body}`);
+      }
+      if (requests[1] && !requests[1].ok) {
+        const body = await requests[1].text().catch(() => "");
+        throw new Error(`order issue kind reset failed: ${requests[1].status} ${body}`);
+      }
+      const updatedOrder = (await resp.json()) as OrderItem;
+      setItems((prev) =>
+        prev.map((it) =>
+          it.id === orderId
+            ? { ...it, ...updatedOrder, ...(nextDisplayStatus === "Выдано" ? { issue_kind: null } : {}) }
+            : it
+        )
+      );
+      setStatusHistoryByOrder((prev) => ({
+        ...prev,
+        [orderId]: [{ status: nextDisplayStatus, changed_at: new Date().toISOString() }, ...(prev[orderId] || [])],
+      }));
+      setConfirmIssuedByOrder((prev) => ({ ...prev, [orderId]: false }));
+      setIssueDraftKindByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+      setIssueDraftReasonByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    } catch (e: any) {
+      setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to save display status" }));
+    } finally {
+      setIssueSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
     }
   };
 
@@ -533,21 +760,32 @@ export default function OrdersListPage() {
     for (const [k, v] of Object.entries(ctx)) ctxLower[k.toLowerCase()] = String(v ?? "");
     return source.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_m, keyRaw: string) => {
       const key = String(keyRaw || "").trim().toLowerCase();
-      return Object.prototype.hasOwnProperty.call(ctxLower, key) ? ctxLower[key] : _m;
+      if (Object.prototype.hasOwnProperty.call(ctxLower, key)) return ctxLower[key];
+      const sizedQr = key.match(/^warehouse_qr_(site|yandex|vk|telegram)_svg_(\d{1,4})$/i);
+      if (sizedQr) {
+        const channel = String(sizedQr[1] || "").toLowerCase();
+        const px = Math.max(32, Math.min(600, Number.parseInt(String(sizedQr[2] || "100"), 10) || 100));
+        const rawKey = `warehouse_qr_${channel}_svg_raw`;
+        const rawSvg = String(ctxLower[rawKey] || "");
+        return fitSvgForPrint(rawSvg, px);
+      }
+      return _m;
     });
   };
 
-  const fitSvgForPrint = (rawSvg: string, targetPx = 200): string => {
+  const fitSvgForPrint = (rawSvg: string, targetPx = 100): string => {
     const source = String(rawSvg || "").trim();
     if (!source || !source.toLowerCase().includes("<svg")) return source;
-    return source.replace(/<svg\b([^>]*)>/i, (_m, attrs: string) => {
-      let nextAttrs = String(attrs || "");
-      nextAttrs = nextAttrs.replace(/\swidth=(['"]).*?\1/i, "");
-      nextAttrs = nextAttrs.replace(/\sheight=(['"]).*?\1/i, "");
-      nextAttrs = nextAttrs.replace(/\spreserveAspectRatio=(['"]).*?\1/i, "");
-      nextAttrs = nextAttrs.replace(/\sstyle=(['"]).*?\1/i, "");
-      return `<svg${nextAttrs} width="${targetPx}" height="${targetPx}" preserveAspectRatio="xMidYMid meet" style="display:block; width:${targetPx}px; max-width:100%; height:auto;">`;
-    });
+    const asBase64 = (() => {
+      try {
+        return window.btoa(unescape(encodeURIComponent(source)));
+      } catch {
+        return "";
+      }
+    })();
+    if (!asBase64) return source;
+    const uri = `data:image/svg+xml;base64,${asBase64}`;
+    return `<img src="${uri}" width="${targetPx}" height="${targetPx}" style="display:block; width:${targetPx}px; height:${targetPx}px; object-fit:contain;" />`;
   };
 
   const fetchWithRetry = async (url: string, init?: RequestInit, retries = 1, delayMs = 350): Promise<Response> => {
@@ -636,6 +874,10 @@ export default function OrdersListPage() {
         warehouse_name: String(warehouseNameById[order.warehouse_id || ""] || "-"),
         warehouse_address: String(warehouseById[order.warehouse_id || ""]?.address || "-"),
         warehouse_point_phone: String(warehouseById[order.warehouse_id || ""]?.point_phone || "-"),
+        warehouse_qr_site_svg_raw: String(warehouseById[order.warehouse_id || ""]?.qr_site_svg || ""),
+        warehouse_qr_yandex_svg_raw: String(warehouseById[order.warehouse_id || ""]?.qr_yandex_svg || ""),
+        warehouse_qr_vk_svg_raw: String(warehouseById[order.warehouse_id || ""]?.qr_vk_svg || ""),
+        warehouse_qr_telegram_svg_raw: String(warehouseById[order.warehouse_id || ""]?.qr_telegram_svg || ""),
         warehouse_qr_site_svg: fitSvgForPrint(String(warehouseById[order.warehouse_id || ""]?.qr_site_svg || ""), 100),
         warehouse_qr_yandex_svg: fitSvgForPrint(String(warehouseById[order.warehouse_id || ""]?.qr_yandex_svg || ""), 100),
         warehouse_qr_vk_svg: fitSvgForPrint(String(warehouseById[order.warehouse_id || ""]?.qr_vk_svg || ""), 100),
@@ -655,7 +897,12 @@ export default function OrdersListPage() {
           .print-root table{width:100% !important; table-layout:fixed !important; border-collapse:collapse !important;}
           .print-root td,.print-root th{overflow:hidden; vertical-align:top; word-break:break-word;}
           .print-root p{margin:0;}
-          .print-root img,.print-root svg{
+          .print-root img{
+            display:block;
+            max-width:100%;
+            height:auto;
+          }
+          .print-root svg{
             display:block;
             width:100% !important;
             max-width:100% !important;
@@ -734,12 +981,14 @@ export default function OrdersListPage() {
           qr_vk_svg?: string;
           qr_telegram_svg?: string;
         }>;
+        const nextOptions: WarehouseOption[] = [];
         const nextNames: Record<string, string> = {};
         const nextMap: Record<string, WarehouseInfo> = {};
         for (const row of rows || []) {
           const id = String(row.id || "");
           if (!id) continue;
           const name = String(row.name || "");
+          nextOptions.push({ id, name });
           nextNames[id] = name;
           nextMap[id] = {
             name,
@@ -751,6 +1000,7 @@ export default function OrdersListPage() {
             qr_telegram_svg: String(row.qr_telegram_svg || ""),
           };
         }
+        setWarehouseOptions(nextOptions);
         setWarehouseNameById(nextNames);
         setWarehouseById(nextMap);
       } catch {
@@ -758,7 +1008,7 @@ export default function OrdersListPage() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page]);
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -805,7 +1055,7 @@ export default function OrdersListPage() {
       <div className="rounded-2xl border border-gray-200 bg-white px-5 py-6 dark:border-gray-800 dark:bg-white/[0.03]">
         <h3 className="mb-4 font-semibold text-gray-800 text-theme-xl dark:text-white/90">Список заказов</h3>
         <div className="mb-4 rounded-xl border border-gray-200 p-4 dark:border-gray-800">
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-6">
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8">
             <select
               className="h-10 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
               value={draftFilters.order_kind}
@@ -864,6 +1114,20 @@ export default function OrdersListPage() {
                 </div>
               )}
             </div>
+            {warehouseOptions.length ? (
+              <select
+                className="h-10 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
+                value={draftFilters.warehouse_id}
+                onChange={(e) => setDraftFilters((prev) => ({ ...prev, warehouse_id: e.target.value }))}
+              >
+                <option value="">Склад</option>
+                {warehouseOptions.map((warehouse) => (
+                  <option key={warehouse.id} value={warehouse.id}>
+                    {warehouse.name}
+                  </option>
+                ))}
+              </select>
+            ) : null}
             {isSuperadmin ? (
               <div className="relative">
                 <input
@@ -960,10 +1224,25 @@ export default function OrdersListPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody className="divide-y divide-gray-100 dark:divide-white/[0.05]">
-                  {items.map((order) => (
+                  {items.map((order) => {
+                    const isOpen = openOrderId === order.id;
+                    const issueKind = order.issue_kind || null;
+                    const displayStatus = String(order.display_status || "").trim() || (issueKind === "issued" ? "Выдано" : "");
+                    const hasProblemMark = issueKind === "return" || issueKind === "problem";
+                    const isIssued = displayStatus === "Выдано";
+                    const shouldShowInternalStatus = !!order.status_selected_manually;
+                    const confirmIssued = !!confirmIssuedByOrder[order.id];
+                    const issueDraftKind = issueDraftKindByOrder[order.id];
+                    return (
                     <React.Fragment key={order.id}>
                       <tr
-                        className="cursor-pointer hover:bg-gray-50 dark:hover:bg-white/[0.02]"
+                        className={`cursor-pointer hover:bg-gray-50 dark:hover:bg-white/[0.02] ${
+                          hasProblemMark
+                            ? "bg-red-50 dark:bg-red-500/10"
+                            : isOpen
+                            ? "bg-gray-50 dark:bg-white/[0.06]"
+                            : ""
+                        }`}
                         onClick={() => onToggleOpen(order.id)}
                       >
                         <td className="px-5 py-4 text-start text-theme-sm text-gray-800 dark:text-white/90">
@@ -971,39 +1250,33 @@ export default function OrdersListPage() {
                         </td>
                         <td className="px-5 py-4 text-start">
                           <div className="inline-flex items-center gap-2">
-                            <span
-                              className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium"
-                              style={{
-                                backgroundColor: statusColorByName[order.status] || "#22c55e",
-                                color: textColorForBg(statusColorByName[order.status] || "#22c55e"),
-                              }}
-                            >
-                              {order.status}
-                            </span>
-                            <span
-                              className="group relative inline-flex items-center justify-center w-5 h-5 rounded-full border border-gray-300 text-xs text-gray-600 dark:border-gray-600 dark:text-gray-300 cursor-help"
-                              onMouseEnter={() => void loadStatusHistory(order.id)}
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              ?
-                              <div className="hidden group-hover:block absolute left-6 top-1/2 -translate-y-1/2 z-20 w-72 rounded-lg border border-gray-200 bg-white p-2 shadow-lg dark:border-gray-700 dark:bg-gray-900">
-                                {statusHistoryLoadingByOrder[order.id] ? (
-                                  <div className="text-xs text-gray-500 dark:text-gray-400">Загрузка...</div>
-                                ) : statusHistoryErrorByOrder[order.id] ? (
-                                  <div className="text-xs text-red-600">Ошибка: {statusHistoryErrorByOrder[order.id]}</div>
-                                ) : !(statusHistoryByOrder[order.id] || []).length ? (
-                                  <div className="text-xs text-gray-500 dark:text-gray-400">История статусов пуста.</div>
-                                ) : (
-                                  <div className="space-y-1">
-                                    {(statusHistoryByOrder[order.id] || []).map((h, idx) => (
-                                      <div key={`${order.id}-h-${idx}`} className="text-xs text-gray-700 dark:text-gray-300">
-                                        {h.status} — {new Date(h.changed_at).toLocaleString()}
-                                      </div>
-                                    ))}
-                                  </div>
-                                )}
-                              </div>
-                            </span>
+                            {displayStatus && (
+                              <span
+                                className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                                  displayStatus === "Выполнено" || displayStatus === "Выдано"
+                                    ? "bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300"
+                                    : "bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300"
+                                }`}
+                              >
+                                {displayStatus}
+                              </span>
+                            )}
+                            {hasProblemMark && (
+                              <span className="inline-flex items-center rounded-full bg-red-100 px-2.5 py-0.5 text-xs font-medium text-red-700 dark:bg-red-500/15 dark:text-red-300">
+                                Проблемы
+                              </span>
+                            )}
+                            {shouldShowInternalStatus && (
+                              <span
+                                className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium"
+                                style={{
+                                  backgroundColor: statusColorByName[order.status] || "#22c55e",
+                                  color: textColorForBg(statusColorByName[order.status] || "#22c55e"),
+                                }}
+                              >
+                                {order.status}
+                              </span>
+                            )}
                           </div>
                         </td>
                         <td className="px-5 py-4 text-start text-theme-sm text-gray-500 dark:text-gray-400">
@@ -1026,21 +1299,25 @@ export default function OrdersListPage() {
                           )}
                         </td>
                       </tr>
-                      {openOrderId === order.id && (
-                        <tr>
-                          <td className="px-5 py-4 text-start text-theme-sm text-gray-700 dark:text-gray-300" colSpan={4}>
+                      {isOpen && (
+                        <tr className={hasProblemMark ? "bg-red-50 dark:bg-red-500/10" : "bg-gray-50 dark:bg-white/[0.06]"}>
+                          <td
+                            className="px-5 py-4 text-start text-theme-sm text-gray-700 dark:text-gray-300"
+                            colSpan={4}
+                          >
                             <div className="space-y-3">
                               <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Основные данные</div>
                               <div className="flex items-center gap-2">
-                                <span>Статус:</span>
+                                <span>Дополнительный статус:</span>
                                 <select
                                   className="h-9 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
-                                  value={order.status}
+                                  value={order.status_selected_manually ? order.status : ""}
                                   disabled={!!statusSavingByOrder[order.id]}
                                   onChange={(e) => void onChangeStatus(order.id, e.target.value)}
                                 >
+                                  <option value="">Нет</option>
                                   {!statusOptions.length ? (
-                                    <option value={order.status}>{order.status}</option>
+                                    order.status_selected_manually ? <option value={order.status}>{order.status}</option> : null
                                   ) : (
                                     statusOptions.map((s) => (
                                       <option key={s.id} value={s.name}>
@@ -1122,7 +1399,11 @@ export default function OrdersListPage() {
                                   {(financeByOrder[order.id] || []).map((line) => (
                                     <div key={line.id}>
                                       {workTypeNameById[line.work_type_uuid] || line.work_type_uuid} | {line.amount} {line.currency} |{" "}
-                                      {line.payment_method === "card" ? "Оплата по карте" : "Наличкой"} |{" "}
+                                      {line.payment_method
+                                        ? line.payment_method === "card"
+                                          ? "Оплата по карте"
+                                          : "Наличкой"
+                                        : "Не указан"} |{" "}
                                       {line.is_paid ? "Оплачен" : "Не оплачен"}
                                     </div>
                                   ))}
@@ -1182,12 +1463,177 @@ export default function OrdersListPage() {
                                   </Dropdown>
                                 </div>
                               </div>
+
+                              <div className="pt-2 border-t border-gray-200 dark:border-gray-800 space-y-3">
+                                <div className="flex justify-end gap-2">
+                                  {confirmIssued ? (
+                                    <>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          void onSetDisplayStatus(order.id, "Выдано");
+                                        }}
+                                        className="rounded-lg border border-green-300 bg-green-100 px-3 py-1.5 text-sm text-green-700 dark:border-green-500/40 dark:bg-green-500/15 dark:text-green-300"
+                                      >
+                                        Подтвердить
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                        }}
+                                        className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                      >
+                                        Нет
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: true }));
+                                      }}
+                                      className={`rounded-lg border px-3 py-1.5 text-sm ${
+                                        isIssued
+                                          ? "border-green-300 bg-green-100 text-green-700 dark:border-green-500/40 dark:bg-green-500/15 dark:text-green-300"
+                                          : "border-gray-300 text-gray-700 hover:bg-green-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-green-500/10"
+                                      }`}
+                                    >
+                                      Выдано
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                      onStartIssue(order.id, "return");
+                                    }}
+                                    className={`rounded-lg border px-3 py-1.5 text-sm ${
+                                      issueDraftKind === "return"
+                                        ? "border-red-300 bg-red-100 text-red-700 dark:border-red-500/40 dark:bg-red-500/15 dark:text-red-300"
+                                        : "border-gray-300 text-gray-700 hover:bg-red-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-red-500/10"
+                                    }`}
+                                  >
+                                    Возврат
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                      onStartIssue(order.id, "problem");
+                                    }}
+                                    className={`rounded-lg border px-3 py-1.5 text-sm ${
+                                      issueDraftKind === "problem"
+                                        ? "border-red-300 bg-red-100 text-red-700 dark:border-red-500/40 dark:bg-red-500/15 dark:text-red-300"
+                                        : "border-gray-300 text-gray-700 hover:bg-red-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-red-500/10"
+                                    }`}
+                                  >
+                                    Проблема
+                                  </button>
+                                </div>
+
+                                {issueDraftKind && (
+                                  <div className="flex justify-end">
+                                    <div className="w-[250px] rounded-lg border border-red-200 bg-white/80 p-3 dark:border-red-500/20 dark:bg-white/[0.03]">
+                                      <div className="mb-2 text-sm font-medium text-gray-800 dark:text-white/90">
+                                        {issueDraftKind === "return" ? "Причина возврата" : "Описание проблемы"}
+                                      </div>
+                                      <textarea
+                                        value={issueDraftReasonByOrder[order.id] || ""}
+                                        onChange={(e) =>
+                                          setIssueDraftReasonByOrder((prev) => ({ ...prev, [order.id]: e.target.value }))
+                                        }
+                                        placeholder={
+                                          issueDraftKind === "return"
+                                            ? "Укажите причину возврата"
+                                            : "Опишите проблему"
+                                        }
+                                        rows={3}
+                                        className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-800 outline-none focus:border-brand-500 dark:border-gray-700 dark:bg-gray-900 dark:text-white/90"
+                                      />
+                                      <div className="mt-2 space-y-2">
+                                        {issueHistoryErrorByOrder[order.id] ? (
+                                          <div className="text-sm text-red-600">Ошибка: {issueHistoryErrorByOrder[order.id]}</div>
+                                        ) : null}
+                                        <div className="flex justify-end gap-2">
+                                          <button
+                                            type="button"
+                                            onClick={() => onCancelIssue(order.id)}
+                                            className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                          >
+                                            Отмена
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => void onSaveIssue(order.id)}
+                                            disabled={!!issueSavingByOrder[order.id]}
+                                            className="rounded-lg border border-red-300 bg-red-100 px-3 py-1.5 text-sm text-red-700 disabled:opacity-60 dark:border-red-500/40 dark:bg-red-500/15 dark:text-red-300"
+                                          >
+                                            Сохранить
+                                          </button>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+
+                                {(issueHistoryLoadingByOrder[order.id] ||
+                                  statusHistoryLoadingByOrder[order.id] ||
+                                  (issueHistoryErrorByOrder[order.id] && !issueDraftKind) ||
+                                  statusHistoryErrorByOrder[order.id] ||
+                                  buildFeedItems(order.id).length > 0) && (
+                                  <div className="flex justify-end">
+                                    <div className="w-full max-w-xl space-y-2">
+                                      <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Лента</div>
+                                      {issueHistoryLoadingByOrder[order.id] || statusHistoryLoadingByOrder[order.id] ? (
+                                        <div className="text-sm text-gray-500 dark:text-gray-400">Загрузка...</div>
+                                      ) : issueHistoryErrorByOrder[order.id] && !issueDraftKind ? (
+                                        <div className="text-sm text-red-600">Ошибка: {issueHistoryErrorByOrder[order.id]}</div>
+                                      ) : statusHistoryErrorByOrder[order.id] ? (
+                                        <div className="text-sm text-red-600">Ошибка: {statusHistoryErrorByOrder[order.id]}</div>
+                                      ) : (
+                                        <div className="space-y-2">
+                                          {buildFeedItems(order.id).map((entry) => (
+                                            <div
+                                              key={entry.id}
+                                              className="rounded-lg border border-red-100 bg-white/80 px-3 py-2 dark:border-red-500/20 dark:bg-white/[0.03]"
+                                            >
+                                              <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                                                {entry.kind === "issue" ? (
+                                                  <span className="inline-flex items-center rounded-full bg-red-100 px-2 py-0.5 font-medium text-red-700 dark:bg-red-500/15 dark:text-red-300">
+                                                    {entry.title}
+                                                  </span>
+                                                ) : (
+                                                  <span className="inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 font-medium text-gray-700 dark:bg-white/10 dark:text-gray-300">
+                                                    Статус
+                                                  </span>
+                                                )}
+                                                <span>{new Date(entry.created_at).toLocaleString()}</span>
+                                                {entry.kind === "issue" && entry.created_by_name ? <span>{entry.created_by_name}</span> : null}
+                                              </div>
+                                              <div className="mt-1 text-sm text-gray-800 dark:text-white/90">
+                                                {entry.kind === "issue" ? entry.reason : entry.title}
+                                              </div>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
                             </div>
                           </td>
                         </tr>
                       )}
                     </React.Fragment>
-                  ))}
+                    );
+                  })}
                 </TableBody>
               </Table>
             </div>

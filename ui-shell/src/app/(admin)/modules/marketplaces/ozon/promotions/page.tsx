@@ -22,6 +22,8 @@ type PromoItem = {
   avg_list?: any[];
 };
 
+const PAGE_SIZE = 50;
+
 const pickPositiveOr = (value: any, fallback: number): number => {
   const n = Number(value ?? 0);
   return n > 0 ? n : Number(fallback ?? 0);
@@ -32,6 +34,7 @@ export default function OzonPromotionsPage() {
   const [error, setError] = React.useState("");
   const [query, setQuery] = React.useState("");
   const [color, setColor] = React.useState<"" | "green" | "yellow" | "red">("");
+  const [page, setPage] = React.useState(1);
   const [items, setItems] = React.useState<PromoItem[]>([]);
   const [savingOfferId, setSavingOfferId] = React.useState<string>("");
   const [timerUpdating, setTimerUpdating] = React.useState(false);
@@ -102,6 +105,22 @@ export default function OzonPromotionsPage() {
     ? items.filter((x) => x.offer_id.toLowerCase().includes(query.toLowerCase()))
     : items;
 
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const pagedItems = React.useMemo(() => {
+    const start = (page - 1) * PAGE_SIZE;
+    return filtered.slice(start, start + PAGE_SIZE);
+  }, [filtered, page]);
+
+  React.useEffect(() => {
+    setPage(1);
+  }, [query, color]);
+
+  React.useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
+
   const saveRow = async (offerId: string, patch: any) => {
     setSavingOfferId(offerId);
     setError("");
@@ -120,7 +139,16 @@ export default function OzonPromotionsPage() {
         return;
       }
       setItems((prev) =>
-        prev.map((it) => (it.offer_id === offerId ? { ...it, settings: { ...(it.settings || {}), ...patch } } : it))
+        prev.map((it) =>
+          it.offer_id === offerId
+            ? {
+                ...it,
+                price: Number(patch.yourprice || it.price),
+                min_price: Number(patch.minprice || it.min_price),
+                settings: { ...(it.settings || {}), ...patch },
+              }
+            : it
+        )
       );
     } catch (e: any) {
       setError(e?.message || String(e));
@@ -239,11 +267,46 @@ export default function OzonPromotionsPage() {
         </div>
       )}
 
-      <div className="text-sm text-gray-600 mb-3">Товаров: {filtered.length}</div>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3 text-sm text-gray-600">
+        <div>
+          Товаров: {filtered.length}
+          {filtered.length > 0 && (
+            <span>
+              {" "}
+              • показано {Math.min((page - 1) * PAGE_SIZE + 1, filtered.length)}-
+              {Math.min(page * PAGE_SIZE, filtered.length)}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="px-3 py-1.5 rounded border border-gray-300 disabled:opacity-50 dark:border-gray-700"
+            onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+            disabled={loading || page <= 1}
+          >
+            Назад
+          </button>
+          <span>
+            Страница {page} из {totalPages}
+          </span>
+          <button
+            type="button"
+            className="px-3 py-1.5 rounded bg-brand-500 text-white disabled:opacity-50"
+            onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
+            disabled={loading || page >= totalPages}
+          >
+            Далее
+          </button>
+        </div>
+      </div>
 
       <div className="space-y-3">
-        {filtered.map((it) => (
-          <details key={it.offer_id} className="rounded-xl border border-gray-200 p-4 dark:border-gray-800">
+        {pagedItems.map((it) => (
+          <details
+            key={it.offer_id}
+            className="rounded-xl border border-gray-200 p-4 transition-colors open:bg-gray-100 dark:border-gray-800 dark:open:bg-white/[0.06]"
+          >
             <summary className="cursor-pointer select-none">
               <span className="font-semibold text-lg">{it.offer_id}</span>
               <span className="ml-3 text-sm text-gray-600">
@@ -286,7 +349,7 @@ export default function OzonPromotionsPage() {
                 disabled={savingOfferId === it.offer_id}
                 onClick={() => saveOffer(it)}
               >
-                {savingOfferId === it.offer_id ? "Сохраняю..." : "Сохранить"}
+                {savingOfferId === it.offer_id ? "Сохраняю..." : "Сохранить в Ozon"}
               </button>
               {it.product_id ? (
                 <a
@@ -426,6 +489,19 @@ export default function OzonPromotionsPage() {
           </details>
         ))}
       </div>
+
+      {filtered.length > PAGE_SIZE && (
+        <div className="mt-4 flex justify-end">
+          <button
+            type="button"
+            className="px-4 py-2 rounded bg-brand-500 text-white disabled:opacity-50"
+            onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
+            disabled={loading || page >= totalPages}
+          >
+            Далее
+          </button>
+        </div>
+      )}
     </div>
   );
 }

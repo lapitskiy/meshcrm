@@ -81,11 +81,6 @@ const orderKinds = [
   { id: "repair", label: "Оставляют в ремонт" },
 ] as const;
 
-const paymentMethods = [
-  { id: "card", label: "Оплата по карте" },
-  { id: "cash", label: "Наличкой" },
-] as const;
-
 const paidOptions = [
   { id: "yes", label: "Да" },
   { id: "no", label: "Нет" },
@@ -409,11 +404,64 @@ export default function OrdersCreatePage() {
     });
   };
 
+  const onClearWorkTypeRow = (rowKey: number) => {
+    const targetRow = workTypeRows.find((row) => row.key === rowKey);
+    if (!targetRow) return;
+    if (!targetRow.query && workTypeRows.length > 1) {
+      onRemoveWorkTypeRow(rowKey);
+      setContactsStepOpen(false);
+      setContacts([]);
+      setSelectedContactId("");
+      setContactConfig(defaultContactConfig);
+      setRelatedModuleConfigs([]);
+      setRelatedModuleIndex(0);
+      setModuleFieldValues({});
+      setContactHasNoPhone(false);
+      setWarehouseOptions([]);
+      setError(null);
+      return;
+    }
+    setWorkTypeRows((prev) =>
+      prev.map((row) =>
+        row.key === rowKey ? { ...row, selectedId: "", query: "", label: "", options: [], open: false } : row
+      )
+    );
+    setContactsStepOpen(false);
+    setContacts([]);
+    setSelectedContactId("");
+    setContactConfig(defaultContactConfig);
+    setRelatedModuleConfigs([]);
+    setRelatedModuleIndex(0);
+    setModuleFieldValues({});
+    setContactHasNoPhone(false);
+    setWarehouseOptions([]);
+    setError(null);
+  };
+
   const onSelectServiceObject = (item: ServiceObject) => {
     setServiceObjectId(item.id);
     setServiceObjectQuery(item.name);
     setServiceObjectLabel(item.name);
     setServiceObjectOptionsOpen(false);
+  };
+
+  const onClearServiceObject = () => {
+    setServiceObjectId("");
+    setServiceObjectQuery("");
+    setServiceObjectLabel("");
+    setServiceObjectOptionsOpen(false);
+    setServiceObjects([]);
+    resetWorkTypeRows();
+    setContactsStepOpen(false);
+    setContacts([]);
+    setSelectedContactId("");
+    setContactConfig(defaultContactConfig);
+    setRelatedModuleConfigs([]);
+    setRelatedModuleIndex(0);
+    setModuleFieldValues({});
+    setContactHasNoPhone(false);
+    setWarehouseOptions([]);
+    setError(null);
   };
 
   const onChangeServiceObjectQuery = async (value: string) => {
@@ -437,6 +485,12 @@ export default function OrdersCreatePage() {
   const hasSelectedWorkTypes = selectedWorkTypeLabels.length > 0;
   const currentModuleValues = moduleFieldValues[contactConfig.moduleName] || {};
   const currentPhoneValue = currentModuleValues.phone || "+7";
+  const isPricingByWorkTypesReady = (values: Record<string, any>) => {
+    if (!values.is_paid) return false;
+    return selectedWorkTypes.some((wt) => String(values[`amount:${wt.id}`] || "").trim().length > 0);
+  };
+  const canGoNextRelatedModule =
+    !contactConfig.pricingByWorkTypes || isPricingByWorkTypesReady(currentModuleValues);
 
   const onNextToContacts = async () => {
     if (!hasSelectedWorkTypes) return;
@@ -512,7 +566,6 @@ export default function OrdersCreatePage() {
       for (const cfg of resolvedConfigs) {
         initialValues[cfg.moduleName] = {};
         if (cfg.pricingByWorkTypes) {
-          initialValues[cfg.moduleName]["payment_method"] = "";
           initialValues[cfg.moduleName]["is_paid"] = "";
           for (const wt of selectedWorkTypes) {
             initialValues[cfg.moduleName][`amount:${wt.id}`] = "";
@@ -560,6 +613,7 @@ export default function OrdersCreatePage() {
 
   const onNextRelatedModule = () => {
     if (relatedModuleIndex >= relatedModuleConfigs.length - 1) return;
+    if (!canGoNextRelatedModule) return;
     const nextIndex = relatedModuleIndex + 1;
     const nextConfig = relatedModuleConfigs[nextIndex];
     setRelatedModuleIndex(nextIndex);
@@ -577,7 +631,7 @@ export default function OrdersCreatePage() {
     for (const cfg of relatedModuleConfigs) {
       const values = moduleFieldValues[cfg.moduleName] || {};
       if (cfg.pricingByWorkTypes) {
-        if (!values.payment_method || !values.is_paid) return false;
+        if (!isPricingByWorkTypesReady(values)) return false;
       }
       if (cfg.warehouseByAccess && !values.warehouse_id) return false;
     }
@@ -672,9 +726,8 @@ export default function OrdersCreatePage() {
       const financeCfg = relatedModuleConfigs.find((cfg) => cfg.pricingByWorkTypes);
       if (financeCfg) {
         const financeValues = moduleFieldValues[financeCfg.moduleName] || {};
-        const paymentMethod = financeValues.payment_method || "";
         const isPaid = financeValues.is_paid === "yes";
-        if (paymentMethod) {
+        if (financeValues.is_paid === "yes" || financeValues.is_paid === "no") {
           for (const wt of selectedWorkTypes) {
             const amountRaw = String(financeValues[`amount:${wt.id}`] || "").replace(",", ".").trim();
             if (!amountRaw) continue;
@@ -689,7 +742,7 @@ export default function OrdersCreatePage() {
                 order_uuid: orderUuid,
                 work_type_uuid: wt.id,
                 amount: amountNum,
-                payment_method: paymentMethod,
+                payment_method: null,
                 is_paid: isPaid,
               }),
             });
@@ -831,9 +884,6 @@ export default function OrdersCreatePage() {
       const values = moduleFieldValues[cfg.moduleName] || {};
       const filled = cfg.pricingByWorkTypes
         ? [
-            `Способ оплаты: ${
-              paymentMethods.find((p) => p.id === values.payment_method)?.label || "-"
-            }`,
             `Оплачен заказ: ${paidOptions.find((p) => p.id === values.is_paid)?.label || "-"}`,
             ...selectedWorkTypes.map((wt) => `${wt.label}: ${String(values[`amount:${wt.id}`] || "-")}`),
           ].join(", ")
@@ -857,11 +907,11 @@ export default function OrdersCreatePage() {
           <div>
             <Label>Тип заказа</Label>
             <div className="relative inline-block">
-              <Button size="md" onClick={toggleDropdown} className="dropdown-toggle">
+              <Button size="md" onClick={toggleDropdown} className="dropdown-toggle w-[250px] justify-between">
                 {orderKinds.find((x) => x.id === orderKind)?.label || "Выберите тип"}
                 <ChevronDownIcon />
               </Button>
-              <Dropdown isOpen={isOpen} onClose={closeDropdown} className="w-56 p-2">
+              <Dropdown isOpen={isOpen} onClose={closeDropdown} className="left-0 right-auto w-[250px] p-2">
                 {orderKinds.map((kind) => (
                   <DropdownItem
                     key={kind.id}
@@ -883,7 +933,7 @@ export default function OrdersCreatePage() {
                 value={categoryId}
                 onChange={(e) => void onSelectCategory(e.target.value)}
                 disabled={categories.length === 0}
-                className="h-11 w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
+                className="h-11 w-[250px] max-w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
               >
                 <option value="">Выберите категорию</option>
                 {categories.map((category) => (
@@ -902,22 +952,11 @@ export default function OrdersCreatePage() {
 
           {categoryId && (
             <div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-4">
                 <div>
-                  <div className="mb-1 flex items-center justify-between gap-2">
-                    <Label>Объект ремонта услуги</Label>
-                    <a
-                      href="/modules/orders/settings/service-object"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-gray-300 text-gray-600 hover:bg-gray-100 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-white/10"
-                      title="Добавить объект ремонта"
-                      aria-label="Добавить объект ремонта"
-                    >
-                      <PlusIcon className="h-4 w-4" />
-                    </a>
-                  </div>
-                  <div className="relative" ref={serviceObjectBoxRef}>
+                  <Label>Объект ремонта услуги</Label>
+                  <div className="mt-1 flex items-center gap-2">
+                    <div className="relative w-[250px] max-w-full" ref={serviceObjectBoxRef}>
                     <input
                       value={serviceObjectQuery}
                       onChange={(e) => void onChangeServiceObjectQuery(e.target.value)}
@@ -932,8 +971,19 @@ export default function OrdersCreatePage() {
                         }
                       }}
                       placeholder="Введите объект ремонта для поиска"
-                      className="h-11 w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900 dark:text-white/90"
+                      className="h-11 w-[250px] max-w-full rounded-lg border border-gray-300 px-4 pr-10 text-sm dark:border-gray-700 dark:bg-gray-900 dark:text-white/90"
                     />
+                    {serviceObjectQuery ? (
+                      <button
+                        type="button"
+                        onClick={onClearServiceObject}
+                        className="absolute right-3 top-1/2 z-10 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-gray-400 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-500 dark:hover:bg-white/10 dark:hover:text-gray-200"
+                        aria-label="Очистить объект ремонта"
+                        title="Очистить"
+                      >
+                        <span className="text-base leading-none">&times;</span>
+                      </button>
+                    ) : null}
                     {serviceObjectOptionsOpen && (
                       <div className="absolute z-20 mt-1 w-full rounded-lg border border-gray-200 bg-white shadow-theme-lg dark:border-gray-800 dark:bg-gray-900 max-h-56 overflow-auto">
                         {!serviceObjects.length ? (
@@ -952,9 +1002,20 @@ export default function OrdersCreatePage() {
                         )}
                       </div>
                     )}
+                    </div>
+                    <a
+                      href="/modules/orders/settings/service-object"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-100 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-white/10"
+                      title="Добавить объект ремонта"
+                      aria-label="Добавить объект ремонта"
+                    >
+                      <PlusIcon className="h-4 w-4" />
+                    </a>
                   </div>
                 </div>
-                <div>
+                <div className="w-[250px] max-w-full">
                   <Label>Серийный/Модель:</Label>
                   <Input
                     name="order-serial-model"
@@ -965,6 +1026,7 @@ export default function OrdersCreatePage() {
                     autoCorrect="off"
                     autoCapitalize="off"
                     spellCheck={false}
+                    className="w-[250px]"
                   />
                 </div>
               </div>
@@ -973,19 +1035,7 @@ export default function OrdersCreatePage() {
 
           {categoryId && serviceObjectId && (
             <div>
-              <div className="mb-1 flex items-center justify-between gap-2">
-                <Label>Вид работы</Label>
-                <a
-                  href="/modules/orders/settings/work-types"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-gray-300 text-gray-600 hover:bg-gray-100 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-white/10"
-                  title="Добавить вид работы"
-                  aria-label="Добавить вид работы"
-                >
-                  <PlusIcon className="h-4 w-4" />
-                </a>
-              </div>
+              <Label>Вид работы</Label>
               <div ref={workTypesBlockRef} className="space-y-3">
                 {workTypeRows.map((row, index) => {
                   const selectedIdsExceptCurrent = new Set(
@@ -994,14 +1044,37 @@ export default function OrdersCreatePage() {
                   const visibleOptions = row.options.filter((item) => !selectedIdsExceptCurrent.has(item.id));
                   return (
                     <div key={row.key} className="relative">
-                      <div className="flex gap-2">
-                        <input
-                          value={row.query}
-                          onChange={(e) => void onChangeWorkTypeQuery(row.key, e.target.value)}
-                          onFocus={() => void onFocusWorkTypeInput(row.key)}
-                          placeholder={`Введите вид работы${index ? ` #${index + 1}` : ""}`}
-                          className="h-11 w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900 dark:text-white/90"
-                        />
+                      <div className="mt-1 flex items-center gap-2">
+                        <div className="relative w-[250px] max-w-full">
+                          <input
+                            value={row.query}
+                            onChange={(e) => void onChangeWorkTypeQuery(row.key, e.target.value)}
+                            onFocus={() => void onFocusWorkTypeInput(row.key)}
+                            placeholder={`Введите вид работы${index ? ` #${index + 1}` : ""}`}
+                            className="h-11 w-[250px] max-w-full rounded-lg border border-gray-300 px-4 pr-10 text-sm dark:border-gray-700 dark:bg-gray-900 dark:text-white/90"
+                          />
+                          {(row.query || workTypeRows.length > 1) ? (
+                            <button
+                              type="button"
+                              onClick={() => onClearWorkTypeRow(row.key)}
+                              className="absolute right-3 top-1/2 z-10 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-gray-400 hover:bg-gray-100 hover:text-gray-700 dark:text-gray-500 dark:hover:bg-white/10 dark:hover:text-gray-200"
+                              aria-label="Очистить вид работы"
+                              title="Очистить"
+                            >
+                              <span className="text-base leading-none">&times;</span>
+                            </button>
+                          ) : null}
+                        </div>
+                        <a
+                          href="/modules/orders/settings/work-types"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-100 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-white/10"
+                          title="Добавить вид работы"
+                          aria-label="Добавить вид работы"
+                        >
+                          <PlusIcon className="h-4 w-4" />
+                        </a>
                         {workTypeRows.length > 1 && (
                           <Button size="sm" variant="outline" onClick={() => onRemoveWorkTypeRow(row.key)}>
                             -
@@ -1056,12 +1129,6 @@ export default function OrdersCreatePage() {
                     {cfg.pricingByWorkTypes ? (
                       <div className="space-y-2">
                         <div className="text-sm">
-                          <span className="text-gray-500 dark:text-gray-400">Способ оплаты: </span>
-                          <span className="text-gray-800 dark:text-white/90">
-                            {paymentMethods.find((p) => p.id === values.payment_method)?.label || "-"}
-                          </span>
-                        </div>
-                        <div className="text-sm">
                           <span className="text-gray-500 dark:text-gray-400">Оплачен заказ: </span>
                           <span className="text-gray-800 dark:text-white/90">
                             {paidOptions.find((p) => p.id === values.is_paid)?.label || "-"}
@@ -1104,61 +1171,52 @@ export default function OrdersCreatePage() {
                 {contactConfig.pricingByWorkTypes ? (
                   <div className="space-y-3 mb-3">
                     <div>
-                      <Label>Способ оплаты</Label>
-                      <select
-                        value={currentModuleValues.payment_method || ""}
-                        onChange={(e) => onChangeModuleField("payment_method", e.target.value)}
-                        className="h-11 w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
-                      >
-                        <option value="">Выберите способ оплаты</option>
-                        {paymentMethods.map((method) => (
-                          <option key={method.id} value={method.id}>
-                            {method.label}
-                          </option>
+                      <Label>Оплачен заказ</Label>
+                      <ul className="mt-2 inline-flex overflow-hidden rounded-lg border border-gray-300 text-sm font-medium text-gray-800 dark:border-gray-700 dark:text-white/90">
+                        {paidOptions.map((opt, index) => (
+                          <li
+                            key={opt.id}
+                            className={`w-[125px] ${index > 0 ? "border-l border-gray-300 dark:border-gray-700" : ""}`}
+                          >
+                            <label
+                              htmlFor={`finance-is-paid-${contactConfig.moduleName}-${opt.id}`}
+                              className={`flex cursor-pointer items-center px-3 py-3 ${
+                                currentModuleValues.is_paid === opt.id ? "bg-brand-50 dark:bg-brand-500/10" : ""
+                              }`}
+                            >
+                              <input
+                                id={`finance-is-paid-${contactConfig.moduleName}-${opt.id}`}
+                                type="radio"
+                                name={`finance-is-paid-${contactConfig.moduleName}`}
+                                value={opt.id}
+                                checked={currentModuleValues.is_paid === opt.id}
+                                onChange={(e) => onChangeModuleField("is_paid", e.target.value)}
+                                className="h-4 w-4 border border-gray-300 text-brand-500 focus:ring-2 focus:ring-brand-300 dark:border-gray-700 dark:bg-gray-900"
+                              />
+                              <span className="ml-2 select-none">{opt.label}</span>
+                            </label>
+                          </li>
                         ))}
-                      </select>
+                      </ul>
                     </div>
-                    {!!currentModuleValues.payment_method && (
-                      <div>
-                        <Label>Оплачен заказ</Label>
-                        <select
-                          value={currentModuleValues.is_paid || ""}
-                          onChange={(e) => onChangeModuleField("is_paid", e.target.value)}
-                          className="h-11 w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
-                        >
-                          <option value="">Выберите</option>
-                          {paidOptions.map((opt) => (
-                            <option key={opt.id} value={opt.id}>
-                              {opt.label}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    )}
-                    {!!currentModuleValues.payment_method && !!currentModuleValues.is_paid && (
+                    {!!currentModuleValues.is_paid && (
                       <div className="space-y-3">
                         {selectedWorkTypes.map((wt) => (
-                          <div key={wt.id} className="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
-                            <div className="text-sm text-gray-800 dark:text-white/90">{wt.label}</div>
-                            <div>
-                              <Label>Сумма</Label>
-                              <Input
-                                value={currentModuleValues[`amount:${wt.id}`] || ""}
-                                onChange={(e: any) => onChangeModuleField(`amount:${wt.id}`, e.target.value)}
-                                placeholder="Введите сумму"
-                              />
-                            </div>
+                          <div key={wt.id} className="flex items-center gap-3">
+                            <div className="w-[250px] text-sm text-gray-800 dark:text-white/90">{wt.label}</div>
+                            <Input
+                              value={currentModuleValues[`amount:${wt.id}`] || ""}
+                              onChange={(e: any) => onChangeModuleField(`amount:${wt.id}`, e.target.value)}
+                              placeholder="Сумма"
+                              className="w-[250px]"
+                            />
                           </div>
                         ))}
                       </div>
                     )}
-                    {!currentModuleValues.payment_method ? (
+                    {!currentModuleValues.is_paid ? (
                       <div className="text-sm text-gray-500 dark:text-gray-400">
-                        Сначала выберите способ оплаты.
-                      </div>
-                    ) : !currentModuleValues.is_paid ? (
-                      <div className="text-sm text-gray-500 dark:text-gray-400">
-                        Теперь выберите, оплачен заказ или нет.
+                        Сначала выберите, оплачен заказ или нет.
                       </div>
                     ) : null}
                   </div>
@@ -1166,18 +1224,32 @@ export default function OrdersCreatePage() {
                   <div className="space-y-3 mb-3">
                     <div>
                       <Label>Склад</Label>
-                      <select
-                        value={currentModuleValues.warehouse_id || ""}
-                        onChange={(e) => onChangeModuleField("warehouse_id", e.target.value)}
-                        className="h-11 w-full rounded-lg border border-gray-300 px-4 text-sm dark:border-gray-700 dark:bg-gray-900"
-                      >
-                        <option value="">Выберите склад</option>
-                        {warehouseOptions.map((w) => (
-                          <option key={w.id} value={w.id}>
-                            {w.name}
-                          </option>
+                      <ul className="mt-2 inline-flex flex-wrap overflow-hidden rounded-lg border border-gray-300 text-sm font-medium text-gray-800 dark:border-gray-700 dark:text-white/90">
+                        {warehouseOptions.map((w, index) => (
+                          <li
+                            key={w.id}
+                            className={`w-[250px] ${index > 0 ? "border-l border-gray-300 dark:border-gray-700" : ""}`}
+                          >
+                            <label
+                              htmlFor={`warehouse-${contactConfig.moduleName}-${w.id}`}
+                              className={`flex min-h-11 cursor-pointer items-center px-3 py-3 ${
+                                currentModuleValues.warehouse_id === w.id ? "bg-brand-50 dark:bg-brand-500/10" : ""
+                              }`}
+                            >
+                              <input
+                                id={`warehouse-${contactConfig.moduleName}-${w.id}`}
+                                type="radio"
+                                name={`warehouse-${contactConfig.moduleName}`}
+                                value={w.id}
+                                checked={currentModuleValues.warehouse_id === w.id}
+                                onChange={(e) => onChangeModuleField("warehouse_id", e.target.value)}
+                                className="h-4 w-4 border border-gray-300 text-brand-500 focus:ring-2 focus:ring-brand-300 dark:border-gray-700 dark:bg-gray-900"
+                              />
+                              <span className="ml-2 break-words">{w.name}</span>
+                            </label>
+                          </li>
                         ))}
-                      </select>
+                      </ul>
                     </div>
                     {!warehouseOptions.length ? (
                       <div className="text-sm text-gray-500 dark:text-gray-400">
@@ -1191,7 +1263,7 @@ export default function OrdersCreatePage() {
                       const isPhone = field.key === "phone";
                       const value = currentModuleValues[field.key] || (isPhone ? "+7" : "");
                       return (
-                        <div key={field.key}>
+                        <div key={field.key} className="w-[250px] max-w-full">
                           <Label>{field.label}</Label>
                           <Input
                             name={isPhone ? `order-contact-p-${contactConfig.moduleName}` : `order-contact-f-${field.key}`}
@@ -1207,6 +1279,7 @@ export default function OrdersCreatePage() {
                             autoCapitalize="off"
                             spellCheck={false}
                             inputMode={isPhone ? "numeric" : "text"}
+                            className="w-[250px]"
                           />
                           {isPhone && (
                             <label className="mt-2 flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
@@ -1271,7 +1344,7 @@ export default function OrdersCreatePage() {
                   </div>
                 )}
 
-                {hasNextRelatedModule && (
+                {hasNextRelatedModule && canGoNextRelatedModule && (
                   <div className="mt-4">
                     <Button size="sm" onClick={onNextRelatedModule}>
                       Далее

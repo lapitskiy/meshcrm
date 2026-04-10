@@ -222,6 +222,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS buyback_device_conditions (
               id UUID PRIMARY KEY,
+              category_id UUID,
               name TEXT NOT NULL,
               color TEXT NOT NULL DEFAULT '#3B82F6',
               sort_order INTEGER NOT NULL DEFAULT 0,
@@ -241,14 +242,38 @@ def init_db() -> None:
         )
         cur.execute(
             """
+            ALTER TABLE buyback_device_conditions
+            ADD COLUMN IF NOT EXISTS category_id UUID;
+            """
+        )
+        cur.execute(
+            """
+            UPDATE buyback_device_conditions dc
+            SET category_id = first_cat.id
+            FROM (
+              SELECT id
+              FROM buyback_categories
+              ORDER BY created_at ASC, name ASC
+              LIMIT 1
+            ) AS first_cat
+            WHERE dc.category_id IS NULL;
+            """
+        )
+        cur.execute(
+            """
             CREATE UNIQUE INDEX IF NOT EXISTS uniq_buyback_statuses_name_ci
             ON buyback_statuses (LOWER(name));
             """
         )
         cur.execute(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS uniq_buyback_device_conditions_name_ci
-            ON buyback_device_conditions (LOWER(name));
+            DROP INDEX IF EXISTS uniq_buyback_device_conditions_name_ci;
+            """
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_buyback_device_conditions_category_name_ci
+            ON buyback_device_conditions (category_id, LOWER(name));
             """
         )
         cur.execute(
@@ -422,12 +447,14 @@ class BuybackStatusReorderIn(BaseModel):
 
 
 class BuybackDeviceConditionIn(BaseModel):
+    category_id: uuid.UUID
     name: str = Field(min_length=1, max_length=255)
     color: str = Field(default="#3B82F6", min_length=4, max_length=20)
 
 
 class BuybackDeviceConditionOut(BaseModel):
     id: uuid.UUID
+    category_id: uuid.UUID | None = None
     name: str
     color: str
     sort_order: int
@@ -1015,19 +1042,34 @@ def reorder_buyback_statuses(body: BuybackStatusReorderIn, request: Request) -> 
 
 @app.get("/settings/device-conditions", response_model=list[BuybackDeviceConditionOut])
 @app.get("/skupka/settings/device-conditions", response_model=list[BuybackDeviceConditionOut])
-def list_buyback_device_conditions(request: Request) -> list[BuybackDeviceConditionOut]:
+def list_buyback_device_conditions(
+    request: Request, category_id: uuid.UUID | None = None
+) -> list[BuybackDeviceConditionOut]:
     require_user_uuid(request)
     with db() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT id, name, color, sort_order, created_at
-            FROM buyback_device_conditions
-            ORDER BY sort_order ASC, created_at ASC
-            """
-        )
+        if category_id:
+            cur.execute(
+                """
+                SELECT id, category_id, name, color, sort_order, created_at
+                FROM buyback_device_conditions
+                WHERE category_id = %s
+                ORDER BY sort_order ASC, created_at ASC
+                """,
+                (category_id,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, category_id, name, color, sort_order, created_at
+                FROM buyback_device_conditions
+                ORDER BY sort_order ASC, created_at ASC
+                """
+            )
         rows = cur.fetchall()
     return [
-        BuybackDeviceConditionOut(id=row[0], name=row[1], color=row[2], sort_order=row[3], created_at=row[4])
+        BuybackDeviceConditionOut(
+            id=row[0], category_id=row[1], name=row[2], color=row[3], sort_order=row[4], created_at=row[5]
+        )
         for row in rows
     ]
 
@@ -1037,18 +1079,26 @@ def list_buyback_device_conditions(request: Request) -> list[BuybackDeviceCondit
 def create_buyback_device_condition(body: BuybackDeviceConditionIn, request: Request) -> BuybackDeviceConditionOut:
     require_admin(request)
     with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM buyback_device_conditions")
+        cur.execute("SELECT name FROM buyback_categories WHERE id=%s", (body.category_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=400, detail="category_id not found")
+        cur.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM buyback_device_conditions WHERE category_id=%s",
+            (body.category_id,),
+        )
         next_sort_order = int(cur.fetchone()[0] or 1)
         cur.execute(
             """
-            INSERT INTO buyback_device_conditions (id, name, color, sort_order, created_at)
-            VALUES (%s, %s, %s, %s, NOW())
-            RETURNING id, name, color, sort_order, created_at
+            INSERT INTO buyback_device_conditions (id, category_id, name, color, sort_order, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            RETURNING id, category_id, name, color, sort_order, created_at
             """,
-            (uuid.uuid4(), body.name.strip(), body.color.strip(), next_sort_order),
+            (uuid.uuid4(), body.category_id, body.name.strip(), body.color.strip(), next_sort_order),
         )
         row = cur.fetchone()
-    return BuybackDeviceConditionOut(id=row[0], name=row[1], color=row[2], sort_order=row[3], created_at=row[4])
+    return BuybackDeviceConditionOut(
+        id=row[0], category_id=row[1], name=row[2], color=row[3], sort_order=row[4], created_at=row[5]
+    )
 
 
 @app.put("/settings/device-conditions/{condition_id}", response_model=BuybackDeviceConditionOut)
@@ -1058,19 +1108,24 @@ def update_buyback_device_condition(
 ) -> BuybackDeviceConditionOut:
     require_admin(request)
     with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT name FROM buyback_categories WHERE id=%s", (body.category_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=400, detail="category_id not found")
         cur.execute(
             """
             UPDATE buyback_device_conditions
-            SET name=%s, color=%s
+            SET category_id=%s, name=%s, color=%s
             WHERE id=%s
-            RETURNING id, name, color, sort_order, created_at
+            RETURNING id, category_id, name, color, sort_order, created_at
             """,
-            (body.name.strip(), body.color.strip(), condition_id),
+            (body.category_id, body.name.strip(), body.color.strip(), condition_id),
         )
         row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="device condition not found")
-    return BuybackDeviceConditionOut(id=row[0], name=row[1], color=row[2], sort_order=row[3], created_at=row[4])
+    return BuybackDeviceConditionOut(
+        id=row[0], category_id=row[1], name=row[2], color=row[3], sort_order=row[4], created_at=row[5]
+    )
 
 
 @app.delete("/settings/device-conditions/{condition_id}", status_code=204)

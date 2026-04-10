@@ -35,7 +35,7 @@ type FinanceLine = {
   work_type_uuid: string;
   amount: number;
   currency: string;
-  payment_method: "card" | "cash";
+  payment_method: "card" | "cash" | null;
   is_paid: boolean;
 };
 
@@ -539,7 +539,15 @@ export default function FinanceMoneyPage() {
                                         }
                                       />
                                       <span>{line.currency}</span>
-                                      <span>| {line.payment_method === "card" ? "Оплата по карте" : "Наличкой"} |</span>
+                                      <span>
+                                        |{" "}
+                                        {line.payment_method
+                                          ? line.payment_method === "card"
+                                            ? "Оплата по карте"
+                                            : "Наличкой"
+                                          : "Не указан"}{" "}
+                                        |
+                                      </span>
                                       <select
                                         className="h-9 rounded-lg border border-gray-300 px-2 text-sm dark:border-gray-700 dark:bg-gray-900"
                                         value={lineDraftById[line.id]?.is_paid ?? (line.is_paid ? "yes" : "no")}

@@ -68,6 +68,12 @@ def init_db() -> None:
         cur.execute(
             """
             ALTER TABLE order_finance_lines
+            ALTER COLUMN payment_method DROP NOT NULL;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE order_finance_lines
             ADD COLUMN IF NOT EXISTS is_paid BOOLEAN NOT NULL DEFAULT FALSE;
             """
         )
@@ -166,7 +172,7 @@ class OrderFinanceLineOut(BaseModel):
     work_type_uuid: uuid.UUID
     amount: float
     currency: str
-    payment_method: Literal["card", "cash"]
+    payment_method: Literal["card", "cash"] | None
     is_paid: bool
     source: str
     updated_at: datetime
@@ -337,7 +343,7 @@ def get_price_rule(work_type_uuid: uuid.UUID) -> PriceRuleOut:
 def upsert_order_line(body: OrderFinanceLineIn, request: Request) -> OrderFinanceLineOut:
     amount = body.amount
     currency = body.currency.strip() if body.currency else None
-    payment_method = body.payment_method or "cash"
+    payment_method = body.payment_method
     is_paid = bool(body.is_paid) if body.is_paid is not None else False
     source = "manual"
     changed_by_uuid = str(request.headers.get("x-user-uuid", "")).strip() or None

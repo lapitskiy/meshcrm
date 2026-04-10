@@ -100,6 +100,16 @@ function getToken(): string {
   return (window as any).__hubcrmAccessToken || "";
 }
 
+function moduleLabel(moduleName: string): string {
+  const key = String(moduleName || "").trim().toLowerCase();
+  if (key === "contacts") return "Контакты";
+  if (key === "orders") return "Заказы";
+  if (key === "finance") return "Финансы";
+  if (key === "warehouses") return "Склады";
+  if (key === "skupka") return "Скупка";
+  return moduleName;
+}
+
 export default function PrintCreateFormPage() {
   const base = useMemo(() => getGatewayBaseUrl(), []);
   const search = useSearchParams();
@@ -506,6 +516,9 @@ export default function PrintCreateFormPage() {
 
       <div className="mt-6 rounded-2xl border border-gray-200 bg-white px-5 py-6 dark:border-gray-800 dark:bg-white/[0.03]">
         <div className="mb-3 font-semibold text-gray-800 dark:text-white/90">Подсказки (переменные)</div>
+        <div className="mb-3 text-sm text-gray-600 dark:text-white/70">
+          Переменные ниже сгруппированы по модулям. Для `Скупка` добавлены отдельные подсказки.
+        </div>
         {!vars.length ? (
           <div className="text-sm text-gray-600 dark:text-white/70">
             Переменные не найдены. Проверь, что в `documents` есть переменные и настроены связи documents → модули.
@@ -516,7 +529,9 @@ export default function PrintCreateFormPage() {
               .sort()
               .map((moduleName) => (
                 <div key={moduleName}>
-                  <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-2">{moduleName}</div>
+                  <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-2">
+                    {moduleLabel(moduleName)} · модуль `{moduleName}`
+                  </div>
                   <div className="flex flex-wrap gap-2">
                     {varsByModule[moduleName].map((v) => (
                       <button
