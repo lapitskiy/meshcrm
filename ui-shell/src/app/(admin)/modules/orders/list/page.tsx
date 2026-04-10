@@ -340,6 +340,7 @@ export default function OrdersListPage() {
       if (pendingOpenOrderId && (data.items || []).some((x) => x.id === pendingOpenOrderId)) {
         setOpenOrderId(pendingOpenOrderId);
         void loadFinanceLines(pendingOpenOrderId);
+        void loadStatusHistory(pendingOpenOrderId);
         void loadIssueHistory(pendingOpenOrderId);
         const autoOrder = (data.items || []).find((x) => x.id === pendingOpenOrderId);
         if (autoOrder?.contact_uuid) {
@@ -538,6 +539,7 @@ export default function OrdersListPage() {
     setOpenOrderId((prev) => (prev === id ? null : id));
     if (openOrderId !== id) {
       void loadFinanceLines(id);
+      void loadStatusHistory(id);
       void loadIssueHistory(id);
       const order = items.find((x) => x.id === id);
       if (order?.contact_uuid) {
