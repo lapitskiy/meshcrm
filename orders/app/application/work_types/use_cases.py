@@ -5,12 +5,17 @@ from app.domain.work_types.entity import WorkType
 from app.domain.work_types.repository import WorkTypeRepository
 
 
+def _capitalize_first_letter(value: str) -> str:
+    value = value.strip()
+    return value[:1].upper() + value[1:] if value else ""
+
+
 class WorkTypeUseCases:
     def __init__(self, repo: WorkTypeRepository) -> None:
         self._repo = repo
 
     def create(self, payload: CreateWorkTypeIn) -> WorkType:
-        name = payload.name.strip()
+        name = _capitalize_first_letter(payload.name)
         if not name:
             raise ValueError("Work type name must not be empty")
         return self._repo.create(service_category_id=payload.service_category_id, name=name)
@@ -30,7 +35,7 @@ class WorkTypeUseCases:
         )
 
     def update(self, work_type_id: UUID, payload: UpdateWorkTypeIn) -> WorkType:
-        name = payload.name.strip()
+        name = _capitalize_first_letter(payload.name)
         if not name:
             raise ValueError("Work type name must not be empty")
         return self._repo.update(

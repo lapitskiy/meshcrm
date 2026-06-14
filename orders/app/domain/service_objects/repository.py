@@ -10,6 +10,7 @@ class ServiceObjectRepository(Protocol):
     def list_all(
         self,
         service_category_id: UUID | None = None,
+        accessible_category_ids: list[UUID] | None = None,
         name_query: str | None = None,
         limit: int = 100,
     ) -> list[ServiceObject]: ...

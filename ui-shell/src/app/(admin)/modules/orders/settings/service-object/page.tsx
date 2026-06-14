@@ -17,6 +17,7 @@ type ServiceObject = {
   service_category_id: string;
   service_category_name: string;
   name: string;
+  usage_count: number;
   created_at: string;
 };
 
@@ -285,7 +286,9 @@ export default function OrdersSettingsServiceObjectPage() {
                 ) : (
                   <div className="flex flex-col">
                     <span className="text-sm text-gray-800 dark:text-white/90">{item.name}</span>
-                    <span className="text-xs text-gray-500 dark:text-gray-400">{item.service_category_name}</span>
+                    <span className="text-xs text-gray-500 dark:text-gray-400">
+                      {item.service_category_name} · использований: {item.usage_count}
+                    </span>
                   </div>
                 )}
 

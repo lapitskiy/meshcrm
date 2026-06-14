@@ -28,6 +28,14 @@ def init_db() -> None:
                   content_json JSONB NOT NULL,
                   content_html TEXT NOT NULL DEFAULT '',
                   category_id UUID,
+                  page_width_mm INTEGER NOT NULL DEFAULT 200,
+                  page_height_mm INTEGER NOT NULL DEFAULT 300,
+                  page_margin_mm INTEGER NOT NULL DEFAULT 0,
+                  page_auto_height BOOLEAN NOT NULL DEFAULT FALSE,
+                  page_offset_x_mm INTEGER,
+                  page_offset_y_mm INTEGER,
+                  page_rotation_deg INTEGER,
+                  qz_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                   created_by_uuid TEXT,
                   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -38,6 +46,19 @@ def init_db() -> None:
                 """
                 ALTER TABLE print_forms
                 ADD COLUMN IF NOT EXISTS category_id UUID;
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE print_forms
+                ADD COLUMN IF NOT EXISTS page_width_mm INTEGER NOT NULL DEFAULT 200,
+                ADD COLUMN IF NOT EXISTS page_height_mm INTEGER NOT NULL DEFAULT 300,
+                ADD COLUMN IF NOT EXISTS page_margin_mm INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS page_auto_height BOOLEAN NOT NULL DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS page_offset_x_mm INTEGER,
+                ADD COLUMN IF NOT EXISTS page_offset_y_mm INTEGER,
+                ADD COLUMN IF NOT EXISTS page_rotation_deg INTEGER,
+                ADD COLUMN IF NOT EXISTS qz_enabled BOOLEAN NOT NULL DEFAULT FALSE;
                 """
             )
             cur.execute(
@@ -97,6 +118,20 @@ def init_db() -> None:
                   ('finance', 'is_paid', 'Оплачен заказ (Да/Нет)'),
                   ('finance', 'lines_text', 'Строки оплаты (текст)'),
                   ('finance', 'total_amount', 'Итого сумма'),
+                  ('orders_report', 'report_number', 'Номер отчёта'),
+                  ('orders_report', 'report_date', 'Дата отчёта'),
+                  ('orders_report', 'warehouse_name', 'Склад'),
+                  ('orders_report', 'created_by_name', 'Кто сформировал отчёт'),
+                  ('orders_report', 'created_at', 'Дата и время создания отчёта'),
+                  ('orders_report', 'total_revenue', 'Выручка'),
+                  ('orders_report', 'total_master_salary', 'ЗП мастера'),
+                  ('orders_report', 'total_cash_remainder', 'Остаток в кассе'),
+                  ('orders_report', 'salary_cash_from_change', 'Из размена на ЗП'),
+                  ('orders_report', 'salary_cash_from_revenue', 'Из выручки на ЗП'),
+                  ('orders_report', 'issue_kind', 'Проблема отчёта'),
+                  ('orders_report', 'day_lines_text', 'Заказы за день (текст)'),
+                  ('orders_report', 'old_lines_text', 'Старые заказы (текст)'),
+                  ('orders_report', 'all_lines_text', 'Все строки отчёта (текст)'),
                   ('skupka', 'deal_id', 'UUID выкупа'),
                   ('skupka', 'deal_number', 'Номер выкупа'),
                   ('skupka', 'deal_type', 'Тип сделки'),

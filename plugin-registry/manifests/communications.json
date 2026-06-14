@@ -1,0 +1,16 @@
+{
+  "name": "communications",
+  "bounded_context": "communications",
+  "version": "1.0.0",
+  "events": { "subscribes": [], "publishes": [] },
+  "ui": {
+    "menu": {
+      "title": "Новости",
+      "items": [
+        { "id": "news", "title": "Лента" },
+        { "id": "chat", "title": "Чат" }
+      ]
+    }
+  },
+  "api": { "base_url": "http://communications:8000" }
+}

@@ -2,7 +2,7 @@ import SignInForm from "@/components/auth/SignInForm";
 import { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Страница входа | MeshCRM",
+  title: "Вход",
   description: "Страница входа в MeshCRM через Keycloak",
 };
 

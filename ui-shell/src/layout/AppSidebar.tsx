@@ -22,7 +22,7 @@ type SubItem = {
   path?: string;
   pro?: boolean;
   new?: boolean;
-  children?: { name: string; path: string; pro?: boolean; new?: boolean }[];
+  children?: SubItem[];
 };
 
 type NavItem = {
@@ -30,6 +30,7 @@ type NavItem = {
   icon: React.ReactNode;
   path?: string;
   subItems?: SubItem[];
+  badgeCount?: number;
 };
 
 type PluginMeta = {
@@ -81,6 +82,7 @@ const AppSidebar: React.FC = () => {
   const [enabledModuleOrder, setEnabledModuleOrder] = useState<string[]>([]);
   const [isAdmin, setIsAdmin] = useState(false);
   const [canManageUsers, setCanManageUsers] = useState(false);
+  const [socialNeedsReplyCount, setSocialNeedsReplyCount] = useState(0);
 
   const navItems = React.useMemo<NavItem[]>(() => {
     const dynamicItems: NavItem[] = [];
@@ -91,6 +93,23 @@ const AppSidebar: React.FC = () => {
         subItems: [
           { name: "Создать заказ", path: "/modules/orders/create" },
           { name: "Список заказов", path: "/modules/orders/list" },
+          { name: "Цены", path: "/modules/orders/prices" },
+          {
+            name: "Отчет",
+            children: [
+              { name: "Создать отчет", path: "/modules/orders/report/create" },
+              { name: "Список отчетов", path: "/modules/orders/report/list" },
+              { name: "Настройки", path: "/modules/orders/report/settings" },
+            ],
+          },
+          {
+            name: "Снабжение",
+            children: [
+              { name: "Создать заявку", path: "/modules/orders/supply/create" },
+              { name: "Список заявок", path: "/modules/orders/supply/list" },
+              { name: "Настройки", path: "/modules/orders/supply/settings" },
+            ],
+          },
           {
             name: "Настройки",
             children: [
@@ -139,6 +158,7 @@ const AppSidebar: React.FC = () => {
       social: {
         name: "Соцсети",
         icon: <BoxCubeIcon />,
+        badgeCount: socialNeedsReplyCount,
         subItems: [
           { name: "Вконтакте", path: "/modules/social/vk" },
           { name: "Настройки", path: "/modules/social/settings/vk" },
@@ -150,6 +170,39 @@ const AppSidebar: React.FC = () => {
         subItems: [
           { name: "Склады", path: "/modules/warehouses/list" },
           { name: "Настройки", path: "/modules/warehouses/settings" },
+        ],
+      },
+      staff: {
+        name: "Персонал",
+        icon: <GroupIcon />,
+        subItems: [
+          { name: "Посещаемость", path: "/modules/staff/attendance" },
+          { name: "Графики смен", path: "/modules/staff/schedules" },
+          { name: "Аналитика", path: "/modules/staff/analytics" },
+          { name: "КПК", path: "/modules/staff" },
+          { name: "Нарушения", path: "/modules/staff/violations" },
+          {
+            name: "Уведомления",
+            children: [
+              { name: "Создать уведомление", path: "/modules/staff/notifications/create" },
+              { name: "Список уведомлений", path: "/modules/staff/notifications/list" },
+            ],
+          },
+          {
+            name: "Настройки",
+            children: [
+              { name: "Общие", path: "/modules/staff/settings" },
+              { name: "КПК", path: "/modules/staff/settings/kpk" },
+            ],
+          },
+        ],
+      },
+      communications: {
+        name: "Новости",
+        icon: <BoxCubeIcon />,
+        subItems: [
+          { name: "Лента", path: "/modules/communications/news" },
+          { name: "Чат", path: "/modules/communications/news#chat" },
         ],
       },
       documents: {
@@ -166,37 +219,6 @@ const AppSidebar: React.FC = () => {
             ],
           },
         ],
-      },
-      marketplaces: {
-        name: "Маркетплейсы",
-        icon: <BoxCubeIcon />,
-        subItems: [
-          {
-            name: "Настройки",
-            children: [{ name: "Общие", path: "/modules/marketplaces/settings/common" }],
-          },
-          {
-            name: "Ozon",
-            children: [
-              { name: "Настройки", path: "/modules/marketplaces/ozon/settings" },
-              { name: "Финансы", path: "/modules/marketplaces/ozon/finances" },
-              { name: "Акции", path: "/modules/marketplaces/ozon/promotions" },
-            ],
-          },
-          {
-            name: "WB",
-            children: [{ name: "Настройки", path: "/modules/marketplaces/wb/settings" }],
-          },
-          {
-            name: "Yandex",
-            children: [{ name: "Настройки", path: "/modules/marketplaces/yandex/settings" }],
-          },
-        ],
-      },
-      moysklad: {
-        name: "МойСклад",
-        icon: <BoxCubeIcon />,
-        subItems: [{ name: "Настройки", path: "/modules/moysklad/settings" }],
       },
       "ai-memory": {
         name: "ИИ",
@@ -232,7 +254,7 @@ const AppSidebar: React.FC = () => {
     }
 
     return dynamicItems;
-  }, [enabledModuleOrder, isAdmin, canManageUsers]);
+  }, [enabledModuleOrder, isAdmin, canManageUsers, socialNeedsReplyCount]);
 
   useEffect(() => {
     let alive = true;
@@ -243,32 +265,49 @@ const AppSidebar: React.FC = () => {
         const token = getToken();
         setIsAdmin(hasAdminAccess(token));
         const headers = token ? { authorization: `Bearer ${token}` } : {};
-        const metaResp = await fetch(`${base}/plugins/_meta?enabled_only=true`, {
-          cache: "no-store",
-          headers,
-        });
-        if (!metaResp.ok) {
-          throw new Error(`plugins meta failed: ${metaResp.status}`);
-        }
-        const data = (await metaResp.json()) as PluginMeta[];
-        let usersManage = false;
-        if (token) {
-          const usersManageResp = await fetch(`${base}/plugins/access/check/users.manage`, {
-            cache: "no-store",
-            headers,
-          });
-          usersManage = usersManageResp.ok
-            ? (((await usersManageResp.json()) as AccessCheckResponse).allowed ?? false)
-            : false;
-        }
+
+        const [metaResp, socialSummaryResp, usersManageResp] = await Promise.all([
+          fetch(`${base}/plugins/_meta?enabled_only=true`, { cache: "no-store", headers }).catch((e) => {
+            console.error("meta fail", e);
+            return null;
+          }),
+          token
+            ? fetch(`${base}/social/vk/inbox-summary`, { cache: "no-store", headers }).catch((e) => null)
+            : Promise.resolve(null),
+          token
+            ? fetch(`${base}/plugins/access/check/users.manage`, { cache: "no-store", headers }).catch((e) => null)
+            : Promise.resolve(null),
+        ]);
+
         if (!alive) return;
-        setCanManageUsers(usersManage);
-        setEnabledModuleOrder((data || []).filter((item) => item.enabled).map((item) => item.name));
-      } catch {
-        if (alive) {
-          setEnabledModuleOrder([]);
+
+        if (metaResp && metaResp.ok) {
+          const data = (await metaResp.json()) as PluginMeta[];
+          if (!alive) return;
+          const nextEnabledModuleOrder = (data || []).filter((item) => item.enabled).map((item) => item.name);
+          setEnabledModuleOrder(nextEnabledModuleOrder);
+
+          if (socialSummaryResp && socialSummaryResp.ok && nextEnabledModuleOrder.includes("social")) {
+            const socialSummary = await socialSummaryResp.json();
+            if (alive) {
+              setSocialNeedsReplyCount(Number(socialSummary?.needs_reply_count || 0));
+            }
+          } else {
+            setSocialNeedsReplyCount(0);
+          }
+        }
+
+        if (usersManageResp && usersManageResp.ok) {
+          const respData = (await usersManageResp.json()) as AccessCheckResponse;
+          if (alive) {
+            setCanManageUsers(respData.allowed ?? false);
+          }
+        } else if (usersManageResp && !usersManageResp.ok) {
           setCanManageUsers(false);
         }
+
+      } catch (err) {
+        console.error("loadEnabledModules error:", err);
       }
     };
 
@@ -287,7 +326,7 @@ const AppSidebar: React.FC = () => {
     navItems: NavItem[],
     menuType: "main" | "others"
   ) => (
-    <ul className="flex flex-col gap-4">
+    <ul className="flex flex-col gap-2">
       {navItems.map((nav, index) => (
         <li key={nav.name}>
           {nav.subItems ? (
@@ -308,12 +347,22 @@ const AppSidebar: React.FC = () => {
                   openSubmenu?.type === menuType && openSubmenu?.index === index
                     ? "menu-item-icon-active"
                     : "menu-item-icon-inactive"
-                }`}
+                } ${nav.badgeCount ? "relative" : ""}`}
               >
                 {nav.icon}
+                {nav.badgeCount ? (
+                  <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border border-white bg-red-500 dark:border-gray-900" />
+                ) : null}
               </span>
               {(isExpanded || isHovered || isMobileOpen) && (
-                <span className={`menu-item-text`}>{nav.name}</span>
+                <>
+                  <span className={`menu-item-text`}>{nav.name}</span>
+                  {nav.badgeCount ? (
+                    <span className="ml-2 rounded-full bg-red-500 px-2 py-0.5 text-[11px] font-semibold text-white">
+                      {nav.badgeCount > 99 ? "99+" : nav.badgeCount}
+                    </span>
+                  ) : null}
+                </>
               )}
               {(isExpanded || isHovered || isMobileOpen) && (
                 <ChevronDownIcon
@@ -330,6 +379,7 @@ const AppSidebar: React.FC = () => {
             nav.path && (
               <Link
                 href={nav.path}
+                onClick={(event) => handleMenuLinkClick(event, nav.path)}
                 className={`menu-item group ${
                   isActive(nav.path) ? "menu-item-active" : "menu-item-inactive"
                 }`}
@@ -373,9 +423,10 @@ const AppSidebar: React.FC = () => {
                     {subItem.path ? (
                       <Link
                         href={subItem.path}
+                        onClick={(event) => handleMenuLinkClick(event, subItem.path)}
                         className={`menu-dropdown-item ${
                           isActive(subItem.path)
-                            ? "menu-dropdown-item-active"
+                            ? "menu-dropdown-item-selected"
                             : "menu-dropdown-item-inactive"
                         }`}
                       >
@@ -407,26 +458,35 @@ const AppSidebar: React.FC = () => {
                       </Link>
                     ) : (
                       subItem.children?.length ? (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const k = `${menuType}-${index}-${subItem.name}`;
-                            setOpenSubItemChildren((prev) => ({
-                              ...prev,
-                              [k]: !(prev[k] ?? true),
-                            }));
-                          }}
-                          className="menu-dropdown-item menu-dropdown-item-inactive w-full flex items-center"
-                        >
-                          {subItem.name}
-                          <ChevronDownIcon
-                            className={`ml-auto w-4 h-4 transition-transform duration-200 ${
-                              openSubItemChildren[`${menuType}-${index}-${subItem.name}`] ?? true
-                                ? "rotate-180 text-brand-500"
-                                : ""
-                            }`}
-                          />
-                        </button>
+                        (() => {
+                          const k = `${menuType}-${index}-${subItem.name}`;
+                          const isChildGroupOpen = openSubItemChildren[k] ?? true;
+                          return (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setOpenSubItemChildren((prev) => ({
+                                  ...prev,
+                                  [k]: !isChildGroupOpen,
+                                }));
+                              }}
+                              className={`menu-dropdown-item w-full flex items-center ${
+                                isChildGroupOpen
+                                  ? "menu-dropdown-item-active"
+                                  : "menu-dropdown-item-inactive"
+                              }`}
+                            >
+                              {subItem.name}
+                              <ChevronDownIcon
+                                className={`ml-auto w-4 h-4 transition-transform duration-200 ${
+                                  isChildGroupOpen
+                                    ? "rotate-180 text-brand-500"
+                                    : ""
+                                }`}
+                              />
+                            </button>
+                          );
+                        })()
                       ) : (
                         <div className="menu-dropdown-item menu-dropdown-item-inactive cursor-default">
                           {subItem.name}
@@ -438,16 +498,75 @@ const AppSidebar: React.FC = () => {
                         <ul className="mt-1 space-y-1 ml-4">
                           {subItem.children.map((child) => (
                             <li key={child.name}>
-                              <Link
-                                href={child.path}
-                                className={`menu-dropdown-item ${
-                                  isActive(child.path)
-                                    ? "menu-dropdown-item-active"
-                                    : "menu-dropdown-item-inactive"
-                                }`}
-                              >
-                                {child.name}
-                              </Link>
+                              {child.path ? (
+                                <Link
+                                  href={child.path}
+                                  onClick={(event) => handleMenuLinkClick(event, child.path!)}
+                                  className={`menu-dropdown-item ${
+                                    isActive(child.path)
+                                      ? "menu-dropdown-item-selected"
+                                      : "menu-dropdown-item-inactive"
+                                  }`}
+                                >
+                                  {child.name}
+                                </Link>
+                              ) : child.children?.length ? (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const childKey = `${menuType}-${index}-${subItem.name}-${child.name}`;
+                                      setOpenSubItemChildren((prev) => ({
+                                        ...prev,
+                                        [childKey]: !(prev[childKey] ?? true),
+                                      }));
+                                    }}
+                                    className={`menu-dropdown-item w-full flex items-center ${
+                                      (openSubItemChildren[`${menuType}-${index}-${subItem.name}-${child.name}`] ?? true)
+                                        ? "menu-dropdown-item-active"
+                                        : "menu-dropdown-item-inactive"
+                                    }`}
+                                  >
+                                    {child.name}
+                                    <ChevronDownIcon
+                                      className={`ml-auto w-4 h-4 transition-transform duration-200 ${
+                                        (openSubItemChildren[`${menuType}-${index}-${subItem.name}-${child.name}`] ?? true)
+                                          ? "rotate-180 text-brand-500"
+                                          : ""
+                                      }`}
+                                    />
+                                  </button>
+                                  {(openSubItemChildren[`${menuType}-${index}-${subItem.name}-${child.name}`] ?? true) ? (
+                                    <ul className="mt-1 space-y-1 ml-4">
+                                      {child.children.map((grandChild) => (
+                                        <li key={grandChild.name}>
+                                          {grandChild.path ? (
+                                            <Link
+                                              href={grandChild.path}
+                                              onClick={(event) => handleMenuLinkClick(event, grandChild.path!)}
+                                              className={`menu-dropdown-item ${
+                                                isActive(grandChild.path)
+                                                  ? "menu-dropdown-item-selected"
+                                                  : "menu-dropdown-item-inactive"
+                                              }`}
+                                            >
+                                              {grandChild.name}
+                                            </Link>
+                                          ) : (
+                                            <div className="menu-dropdown-item menu-dropdown-item-inactive cursor-default">
+                                              {grandChild.name}
+                                            </div>
+                                          )}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  ) : null}
+                                </>
+                              ) : (
+                                <div className="menu-dropdown-item menu-dropdown-item-inactive cursor-default">
+                                  {child.name}
+                                </div>
+                              )}
                             </li>
                           ))}
                         </ul>
@@ -472,9 +591,18 @@ const AppSidebar: React.FC = () => {
   );
   const subMenuRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const subMenuContentRefs = useRef<Record<string, HTMLUListElement | null>>({});
+  const prevPathnameRef = useRef(pathname);
 
   // const isActive = (path: string) => path === pathname;
    const isActive = useCallback((path: string) => path === pathname, [pathname]);
+  const handleMenuLinkClick = useCallback(
+    (event: React.MouseEvent<HTMLAnchorElement>, path: string) => {
+      if (!isActive(path)) return;
+      event.preventDefault();
+      window.location.reload();
+    },
+    [isActive]
+  );
 
   useEffect(() => {
     // Check if the current path matches any submenu item
@@ -503,10 +631,11 @@ const AppSidebar: React.FC = () => {
       });
     });
 
-    // If no submenu item matches, close the open submenu
-    if (!submenuMatched) {
+    // Keep manually opened menus during sidebar polling; only auto-close on real route change.
+    if (!submenuMatched && prevPathnameRef.current !== pathname) {
       setOpenSubmenu(null);
     }
+    prevPathnameRef.current = pathname;
   }, [pathname, isActive, navItems]);
 
   useEffect(() => {
@@ -537,7 +666,7 @@ const AppSidebar: React.FC = () => {
 
   return (
     <aside
-      className={`fixed mt-16 flex flex-col lg:mt-0 top-0 px-5 left-0 bg-white dark:bg-gray-900 dark:border-gray-800 text-gray-900 h-screen transition-all duration-300 ease-in-out z-50 border-r border-gray-200 
+      className={`fixed top-16 bottom-0 flex shrink-0 flex-col lg:sticky lg:top-0 lg:bottom-auto lg:h-screen px-5 left-0 bg-white dark:bg-gray-900 dark:border-gray-800 text-gray-900 transition-all duration-300 ease-in-out z-50 border-r border-gray-200 
         ${
           isExpanded || isMobileOpen
             ? "w-[290px]"
@@ -551,7 +680,7 @@ const AppSidebar: React.FC = () => {
       onMouseLeave={() => setIsHovered(false)}
     >
       <div
-        className={`py-8 flex  ${
+        className={`shrink-0 py-6 flex  ${
           !isExpanded && !isHovered ? "lg:justify-center" : "justify-start"
         }`}
       >
@@ -583,12 +712,12 @@ const AppSidebar: React.FC = () => {
           )}
         </Link>
       </div>
-      <div className="flex flex-col overflow-y-auto duration-300 ease-linear no-scrollbar">
-        <nav className="mb-6">
-          <div className="flex flex-col gap-4">
+      <div className="min-h-0 flex-1 overflow-y-auto duration-300 ease-linear no-scrollbar">
+        <nav className="mb-4">
+          <div className="flex flex-col gap-3">
             <div>
               <h2
-                className={`mb-4 text-xs uppercase flex leading-[20px] text-gray-400 ${
+                className={`mb-2 text-xs uppercase flex leading-[20px] text-gray-400 ${
                   !isExpanded && !isHovered
                     ? "lg:justify-center"
                     : "justify-start"
@@ -605,7 +734,7 @@ const AppSidebar: React.FC = () => {
               {othersItems.length ? (
                 <>
                   <h2
-                    className={`mb-4 text-xs uppercase flex leading-[20px] text-gray-400 ${
+                    className={`mb-2 text-xs uppercase flex leading-[20px] text-gray-400 ${
                       !isExpanded && !isHovered
                         ? "lg:justify-center"
                         : "justify-start"
@@ -625,7 +754,7 @@ const AppSidebar: React.FC = () => {
         </nav>
       </div>
       <div
-        className={`mt-auto pb-4 ${
+        className={`mt-auto shrink-0 pt-3 pb-4 ${
           isExpanded || isHovered || isMobileOpen ? "flex justify-center" : "hidden lg:flex lg:justify-center"
         }`}
       >

@@ -27,7 +27,6 @@ def env(name: str, default: str | None = None) -> str:
 
 
 DATABASE_URL = env("DATABASE_URL")
-MARKETPLACES_BASE_URL = env("MARKETPLACES_BASE_URL", "http://marketplaces:8000")
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 
@@ -269,29 +268,6 @@ def _gigachat_chat(settings: GigachatSettingsIn, prompt: str) -> str:
         raise HTTPException(status_code=502, detail="gigachat chat invalid json") from e
 
 
-def _get_finances_from_marketplaces(user_uuid_val: uuid.UUID, months_ago: int) -> dict[str, Any]:
-    req = urllib.request.Request(
-        f"{MARKETPLACES_BASE_URL}/ozon/finances?months_ago={months_ago}&mode=cache",
-        method="GET",
-        headers={"x-user-uuid": str(user_uuid_val), "accept": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        try:
-            raw = e.read().decode("utf-8")
-        except Exception:
-            raw = ""
-        raise HTTPException(status_code=502, detail=f"marketplaces finances error: {raw}") from e
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"marketplaces finances unavailable: {str(e)}") from e
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail="marketplaces finances invalid json") from e
-
-
 def _load_prompt_template(file_name: str) -> str:
     path = PROMPTS_DIR / file_name
     try:
@@ -351,20 +327,10 @@ def analyze_ozon_finances(
     x_user_uuid: str | None = Header(default=None),
     months_ago: int = Query(default=1, ge=1, le=24),
 ) -> FinanceInsightOut:
-    user_uuid_val = _user_uuid(x_user_uuid)
-    settings = _get_gigachat_settings(user_uuid_val)
-    finances = _get_finances_from_marketplaces(user_uuid_val, months_ago)
-    data_json = json.dumps(finances, ensure_ascii=False)
-    step1_template = _load_prompt_template("ozon_finances_step1.txt")
-    step2_template = _load_prompt_template("ozon_finances_step2.txt")
-    step1_prompt = step1_template.format(data_json=data_json, months_ago=months_ago)
-    step1_result = _gigachat_chat(settings, step1_prompt).strip()
-    if not step1_result:
-        raise HTTPException(status_code=502, detail="empty ai response on step1")
-    step2_prompt = step2_template.format(data_json=data_json, step1_result=step1_result, months_ago=months_ago)
-    step2_result = _gigachat_chat(settings, step2_prompt).strip()
-    if not step2_result:
-        raise HTTPException(status_code=502, detail="empty ai response on step2")
-    return FinanceInsightOut(result=step2_result, source="gigachat", months_ago=months_ago)
+    _user_uuid(x_user_uuid)
+    raise HTTPException(
+        status_code=503,
+        detail="Ozon finances insight requires marketplaces service; it is disabled on this deployment",
+    )
 
 

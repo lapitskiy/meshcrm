@@ -34,6 +34,8 @@ type FinanceLine = {
   id: string;
   work_type_uuid: string;
   amount: number;
+  prepayment?: number | null;
+  cost_price?: number | null;
   currency: string;
   payment_method: "card" | "cash" | null;
   is_paid: boolean;
@@ -45,6 +47,10 @@ type FinanceHistoryItem = {
   work_type_uuid: string;
   old_amount: number | null;
   new_amount: number | null;
+  old_prepayment: number | null;
+  new_prepayment: number | null;
+  old_cost_price: number | null;
+  new_cost_price: number | null;
   old_is_paid: boolean | null;
   new_is_paid: boolean | null;
   old_payment_method: string | null;
@@ -77,6 +83,11 @@ function toYmdLocal(d: Date): string {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+function getReceivedAmount(line: FinanceLine): number {
+  if (line.is_paid) return Number(line.amount || 0);
+  return Number(line.prepayment || 0);
+}
+
 export default function FinanceMoneyPage() {
   const base = useMemo(() => getGatewayBaseUrl(), []);
   const searchParams = useSearchParams();
@@ -96,7 +107,9 @@ export default function FinanceMoneyPage() {
   const [historyByOrder, setHistoryByOrder] = useState<Record<string, FinanceHistoryItem[]>>({});
   const [historyLoadingByOrder, setHistoryLoadingByOrder] = useState<Record<string, boolean>>({});
   const [historyErrorByOrder, setHistoryErrorByOrder] = useState<Record<string, string>>({});
-  const [lineDraftById, setLineDraftById] = useState<Record<string, { amount: string; is_paid: "yes" | "no" }>>({});
+  const [lineDraftById, setLineDraftById] = useState<
+    Record<string, { amount: string; prepayment: string; cost_price: string; is_paid: "yes" | "no" }>
+  >({});
   const [lineSavingById, setLineSavingById] = useState<Record<string, boolean>>({});
   const [workTypeNameById, setWorkTypeNameById] = useState<Record<string, string>>({});
   const [warehouseOptions, setWarehouseOptions] = useState<WarehouseOption[]>([]);
@@ -147,11 +160,13 @@ export default function FinanceMoneyPage() {
   };
 
   const hydrateLineDrafts = (nextFinanceByOrder: Record<string, FinanceLine[]>) => {
-    const nextDrafts: Record<string, { amount: string; is_paid: "yes" | "no" }> = {};
+    const nextDrafts: Record<string, { amount: string; prepayment: string; cost_price: string; is_paid: "yes" | "no" }> = {};
     for (const lines of Object.values(nextFinanceByOrder)) {
       for (const line of lines) {
         nextDrafts[line.id] = {
           amount: String(line.amount),
+          prepayment: line.prepayment == null ? "" : String(line.prepayment),
+          cost_price: line.cost_price == null ? "" : String(line.cost_price),
           is_paid: line.is_paid ? "yes" : "no",
         };
       }
@@ -211,7 +226,7 @@ export default function FinanceMoneyPage() {
       const nextTotals: Record<string, number> = {};
       for (const [orderId, lines] of financePairs) {
         nextFinanceByOrder[orderId] = lines;
-        nextTotals[orderId] = lines.reduce((acc, line) => acc + Number(line.amount || 0), 0);
+        nextTotals[orderId] = lines.reduce((acc, line) => acc + getReceivedAmount(line), 0);
       }
       setFinanceByOrder(nextFinanceByOrder);
       setFinanceTotalByOrder(nextTotals);
@@ -287,8 +302,8 @@ export default function FinanceMoneyPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const loadHistoryForOrder = async (orderId: string) => {
-    if (historyByOrder[orderId]) return;
+  const loadHistoryForOrder = async (orderId: string, force = false) => {
+    if (!force && historyByOrder[orderId]) return;
     setHistoryLoadingByOrder((prev) => ({ ...prev, [orderId]: true }));
     setHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
     try {
@@ -312,8 +327,20 @@ export default function FinanceMoneyPage() {
     const draft = lineDraftById[line.id];
     if (!draft) return;
     const amount = Number(String(draft.amount || "").replace(",", "."));
+    const prepaymentRaw = String(draft.prepayment || "").replace(",", ".").trim();
+    const prepayment = prepaymentRaw ? Number(prepaymentRaw) : null;
+    const costPriceRaw = String(draft.cost_price || "").replace(",", ".").trim();
+    const costPrice = costPriceRaw ? Number(costPriceRaw) : null;
     if (!Number.isFinite(amount)) {
       setError("Сумма должна быть числом");
+      return;
+    }
+    if (prepaymentRaw && !Number.isFinite(prepayment)) {
+      setError("Предоплата должна быть числом");
+      return;
+    }
+    if (costPriceRaw && !Number.isFinite(costPrice)) {
+      setError("Себестоимость должна быть числом");
       return;
     }
     setLineSavingById((prev) => ({ ...prev, [line.id]: true }));
@@ -326,6 +353,8 @@ export default function FinanceMoneyPage() {
           order_uuid: orderId,
           work_type_uuid: line.work_type_uuid,
           amount,
+          prepayment,
+          cost_price: costPrice,
           currency: line.currency,
           payment_method: line.payment_method,
           is_paid: draft.is_paid === "yes",
@@ -343,18 +372,23 @@ export default function FinanceMoneyPage() {
       });
       setFinanceTotalByOrder((prev) => {
         const list = (financeByOrder[orderId] || []).map((x) => (x.id === line.id ? updated : x));
-        return { ...prev, [orderId]: list.reduce((acc, x) => acc + Number(x.amount || 0), 0) };
+        return { ...prev, [orderId]: list.reduce((acc, x) => acc + getReceivedAmount(x), 0) };
       });
       setLineDraftById((prev) => ({
         ...prev,
-        [line.id]: { amount: String(updated.amount), is_paid: updated.is_paid ? "yes" : "no" },
+        [line.id]: {
+          amount: String(updated.amount),
+          prepayment: updated.prepayment == null ? "" : String(updated.prepayment),
+          cost_price: updated.cost_price == null ? "" : String(updated.cost_price),
+          is_paid: updated.is_paid ? "yes" : "no",
+        },
       }));
       setHistoryByOrder((prev) => {
         const next = { ...prev };
         delete next[orderId];
         return next;
       });
-      void loadHistoryForOrder(orderId);
+      void loadHistoryForOrder(orderId, true);
     } catch (e: any) {
       setError(e?.message || "failed to save line");
     } finally {
@@ -533,10 +567,46 @@ export default function FinanceMoneyPage() {
                                             ...prev,
                                             [line.id]: {
                                               amount: e.target.value,
+                                              prepayment: prev[line.id]?.prepayment ?? (line.prepayment == null ? "" : String(line.prepayment)),
+                                              cost_price: prev[line.id]?.cost_price ?? (line.cost_price == null ? "" : String(line.cost_price)),
                                               is_paid: prev[line.id]?.is_paid ?? (line.is_paid ? "yes" : "no"),
                                             },
                                           }))
                                         }
+                                      />
+                                      <input
+                                        className="h-9 w-28 rounded-lg border border-gray-300 px-2 text-sm dark:border-gray-700 dark:bg-gray-900"
+                                        value={lineDraftById[line.id]?.prepayment ?? (line.prepayment == null ? "" : String(line.prepayment))}
+                                        onClick={(e) => e.stopPropagation()}
+                                        onChange={(e) =>
+                                          setLineDraftById((prev) => ({
+                                            ...prev,
+                                            [line.id]: {
+                                              amount: prev[line.id]?.amount ?? String(line.amount),
+                                              prepayment: e.target.value,
+                                              cost_price: prev[line.id]?.cost_price ?? (line.cost_price == null ? "" : String(line.cost_price)),
+                                              is_paid: prev[line.id]?.is_paid ?? (line.is_paid ? "yes" : "no"),
+                                            },
+                                          }))
+                                        }
+                                        placeholder="Предоплата"
+                                      />
+                                      <input
+                                        className="h-9 w-28 rounded-lg border border-gray-300 px-2 text-sm dark:border-gray-700 dark:bg-gray-900"
+                                        value={lineDraftById[line.id]?.cost_price ?? (line.cost_price == null ? "" : String(line.cost_price))}
+                                        onClick={(e) => e.stopPropagation()}
+                                        onChange={(e) =>
+                                          setLineDraftById((prev) => ({
+                                            ...prev,
+                                            [line.id]: {
+                                              amount: prev[line.id]?.amount ?? String(line.amount),
+                                              prepayment: prev[line.id]?.prepayment ?? (line.prepayment == null ? "" : String(line.prepayment)),
+                                              cost_price: e.target.value,
+                                              is_paid: prev[line.id]?.is_paid ?? (line.is_paid ? "yes" : "no"),
+                                            },
+                                          }))
+                                        }
+                                        placeholder="Себестоимость"
                                       />
                                       <span>{line.currency}</span>
                                       <span>
@@ -557,6 +627,8 @@ export default function FinanceMoneyPage() {
                                             ...prev,
                                             [line.id]: {
                                               amount: prev[line.id]?.amount ?? String(line.amount),
+                                              prepayment: prev[line.id]?.prepayment ?? (line.prepayment == null ? "" : String(line.prepayment)),
+                                              cost_price: prev[line.id]?.cost_price ?? (line.cost_price == null ? "" : String(line.cost_price)),
                                               is_paid: e.target.value === "yes" ? "yes" : "no",
                                             },
                                           }))
@@ -597,7 +669,9 @@ export default function FinanceMoneyPage() {
                                     <div key={h.id} className="text-sm">
                                       {new Date(h.changed_at).toLocaleString()} |{" "}
                                       {workTypeNameById[h.work_type_uuid] || "Вид работы не найден"} | сумма:{" "}
-                                      {h.old_amount ?? "-"} -&gt; {h.new_amount ?? "-"} | оплата:{" "}
+                                      {h.old_amount ?? "-"} -&gt; {h.new_amount ?? "-"} | предоплата: {h.old_prepayment ?? "-"} -&gt;{" "}
+                                      {h.new_prepayment ?? "-"} | себестоимость: {h.old_cost_price ?? "-"} -&gt; {h.new_cost_price ?? "-"} |
+                                      оплата:{" "}
                                       {h.old_is_paid === null ? "-" : h.old_is_paid ? "Оплачен" : "Не оплачен"} -&gt;{" "}
                                       {h.new_is_paid === null ? "-" : h.new_is_paid ? "Оплачен" : "Не оплачен"} |{" "}
                                       {h.changed_by_name || "Неизвестно"}

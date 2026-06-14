@@ -15,7 +15,7 @@ class PsycopgWorkTypeRepository:
                     """
                     INSERT INTO work_types (id, service_category_id, name)
                     VALUES (%s, %s, %s)
-                    RETURNING id, service_category_id, name, created_at
+                    RETURNING id, service_category_id, name, usage_count, created_at
                     """,
                     (new_id, service_category_id, name),
                 )
@@ -35,7 +35,8 @@ class PsycopgWorkTypeRepository:
             id=row[0],
             service_category_id=row[1],
             name=row[2],
-            created_at=row[3],
+            usage_count=row[3],
+            created_at=row[4],
             service_category_name=category_row[0] if category_row else "",
         )
 
@@ -47,7 +48,7 @@ class PsycopgWorkTypeRepository:
         limit: int = 100,
     ) -> list[WorkType]:
         sql = """
-            SELECT wt.id, wt.service_category_id, sc.name, wt.name, wt.created_at
+            SELECT wt.id, wt.service_category_id, sc.name, wt.name, wt.usage_count, wt.created_at
             FROM work_types wt
             JOIN service_categories sc ON sc.id = wt.service_category_id
         """
@@ -66,7 +67,7 @@ class PsycopgWorkTypeRepository:
             params_list.append(f"%{name_query}%")
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY wt.created_at DESC LIMIT %s"
+        sql += " ORDER BY wt.usage_count DESC, wt.created_at DESC LIMIT %s"
         params_list.append(limit)
         params = tuple(params_list)
 
@@ -79,7 +80,8 @@ class PsycopgWorkTypeRepository:
                 service_category_id=row[1],
                 service_category_name=row[2],
                 name=row[3],
-                created_at=row[4],
+                usage_count=row[4],
+                created_at=row[5],
             )
             for row in rows
         ]
@@ -92,7 +94,7 @@ class PsycopgWorkTypeRepository:
                     UPDATE work_types
                     SET service_category_id = %s, name = %s
                     WHERE id = %s
-                    RETURNING id, service_category_id, name, created_at
+                    RETURNING id, service_category_id, name, usage_count, created_at
                     """,
                     (service_category_id, name, work_type_id),
                 )
@@ -115,7 +117,8 @@ class PsycopgWorkTypeRepository:
             id=row[0],
             service_category_id=row[1],
             name=row[2],
-            created_at=row[3],
+            usage_count=row[3],
+            created_at=row[4],
             service_category_name=category_row[0] if category_row else "",
         )
 

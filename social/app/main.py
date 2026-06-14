@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 from urllib.parse import urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
@@ -20,6 +21,9 @@ def env(name: str, default: str | None = None) -> str:
 
 DATABASE_URL = env("DATABASE_URL")
 ADMIN_ROLES = {"superadmin", "admin"}
+SOCIAL_VK_BACKGROUND_SYNC_ENABLED = str(os.getenv("SOCIAL_VK_BACKGROUND_SYNC_ENABLED", "true")).lower() == "true"
+SOCIAL_VK_BACKGROUND_SYNC_INTERVAL_SECONDS = max(int(os.getenv("SOCIAL_VK_BACKGROUND_SYNC_INTERVAL_SECONDS", "60") or 60), 30)
+SOCIAL_VK_BACKGROUND_SYNC_RUN_ON_START = str(os.getenv("SOCIAL_VK_BACKGROUND_SYNC_RUN_ON_START", "true")).lower() == "true"
 
 MANIFEST = {
     "name": "social",
@@ -108,6 +112,7 @@ class VkConversationOut(BaseModel):
     last_from_name: str = ""
     last_message_ts: int = 0
     messages_count: int = 0
+    needs_reply: bool = False
 
 
 class VkReplyIn(BaseModel):
@@ -118,6 +123,14 @@ class VkReplyOut(BaseModel):
     ok: bool
     vk_message_id: int | None = None
     message: str = ""
+
+
+class VkReplyStatsOut(BaseModel):
+    social_replies_count: int = 0
+
+
+class VkInboxSummaryOut(BaseModel):
+    needs_reply_count: int = 0
 
 
 def db():
@@ -166,6 +179,7 @@ def init_db() -> None:
               last_message_text TEXT NOT NULL DEFAULT '',
               last_from_id TEXT NOT NULL DEFAULT '',
               last_message_ts BIGINT NOT NULL DEFAULT 0,
+              reply_closed_ts BIGINT NOT NULL DEFAULT 0,
               messages_count INTEGER NOT NULL DEFAULT 0,
               updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
@@ -229,6 +243,12 @@ def init_db() -> None:
         )
         cur.execute(
             """
+            ALTER TABLE social_vk_conversations
+            ADD COLUMN IF NOT EXISTS reply_closed_ts BIGINT NOT NULL DEFAULT 0;
+            """
+        )
+        cur.execute(
+            """
             DROP INDEX IF EXISTS uq_social_vk_messages_group_event;
             """
         )
@@ -254,6 +274,34 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_social_vk_messages_peer_ts
             ON social_vk_messages(peer_id, message_ts DESC, id DESC);
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS social_vk_reply_events (
+              id BIGSERIAL PRIMARY KEY,
+              user_uuid TEXT NOT NULL,
+              vk_group_id TEXT NOT NULL DEFAULT '',
+              peer_id TEXT NOT NULL DEFAULT '',
+              outgoing_event_id TEXT NOT NULL,
+              outgoing_vk_message_id BIGINT NOT NULL DEFAULT 0,
+              reply_text TEXT NOT NULL DEFAULT '',
+              replied_at_ts BIGINT NOT NULL DEFAULT 0,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              UNIQUE (vk_group_id, outgoing_event_id)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_social_vk_reply_events_user_uuid
+            ON social_vk_reply_events(user_uuid);
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_social_vk_reply_events_group_peer
+            ON social_vk_reply_events(vk_group_id, peer_id, replied_at_ts DESC);
             """
         )
         cur.execute(
@@ -353,6 +401,7 @@ def _startup() -> None:
     for _ in range(60):
         try:
             init_db()
+            _start_vk_background_sync()
             return
         except Exception:
             time.sleep(1)
@@ -685,46 +734,78 @@ def _bootstrap_longpoll_for_row(settings_row: tuple) -> tuple[str, str, str]:
     return server, key, ts
 
 
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return default
+
+
+def _extract_vk_message_obj(item: dict) -> dict:
+    obj = item.get("object") if isinstance(item, dict) else {}
+    if not isinstance(obj, dict):
+        return {}
+    msg_obj = obj.get("message")
+    if isinstance(msg_obj, dict):
+        return msg_obj
+    if any(key in obj for key in ("peer_id", "from_id", "date", "text", "attachments", "conversation_message_id", "id")):
+        return obj
+    return {}
+
+
+def _make_vk_message_text(msg_obj: dict) -> str:
+    text = str(msg_obj.get("text") or "").strip()
+    if text:
+        return text
+    attachments = msg_obj.get("attachments") if isinstance(msg_obj, dict) else []
+    if isinstance(attachments, list) and attachments:
+        types = []
+        for att in attachments[:3]:
+            att_type = str((att or {}).get("type") or "").strip()
+            if att_type:
+                types.append(att_type)
+        return f"[Вложения: {', '.join(types)}]" if types else "[Вложение]"
+    return ""
+
+
+def _build_vk_message_event_id(msg_obj: dict, provided_event_id: str = "") -> str:
+    if provided_event_id:
+        return provided_event_id
+    peer_id = str(msg_obj.get("peer_id") or "").strip()
+    created_at = _safe_int(msg_obj.get("date") or 0)
+    message_id = str(msg_obj.get("id") or "").strip()
+    conv_msg_id = str(msg_obj.get("conversation_message_id") or "").strip()
+    if peer_id and message_id:
+        return f"vk:{peer_id}:{message_id}"
+    if peer_id and conv_msg_id:
+        return f"{peer_id}:{created_at}:{conv_msg_id}"
+    return f"{peer_id}:{created_at}:0"
+
+
+def _normalize_vk_message_obj(msg_obj: dict, event_type: str, event_id: str = "") -> VkMessageOut | None:
+    if not isinstance(msg_obj, dict):
+        return None
+    peer_id = str(msg_obj.get("peer_id") or "").strip()
+    if not peer_id:
+        return None
+    return VkMessageOut(
+        event_type=event_type,
+        event_id=_build_vk_message_event_id(msg_obj, provided_event_id=event_id),
+        text=_make_vk_message_text(msg_obj),
+        from_id=str(msg_obj.get("from_id") or "").strip(),
+        peer_id=peer_id,
+        created_at=_safe_int(msg_obj.get("date") or 0),
+    )
+
+
 def _normalize_vk_message_event(item: dict) -> VkMessageOut | None:
     if not isinstance(item, dict):
         return None
     event_type = str(item.get("type") or "").strip()
-    if event_type != "message_new":
+    if event_type not in {"message_new", "message_reply"}:
         return None
     event_id = str(item.get("event_id") or "").strip()
-    obj = item.get("object") or {}
-    msg_obj = obj.get("message") if isinstance(obj, dict) else {}
-    if not isinstance(msg_obj, dict):
-        msg_obj = {}
-    text = str(msg_obj.get("text") or "").strip()
-    if not text:
-        attachments = msg_obj.get("attachments") if isinstance(msg_obj, dict) else []
-        if isinstance(attachments, list) and attachments:
-            types = []
-            for a in attachments[:3]:
-                t = str((a or {}).get("type") or "").strip()
-                if t:
-                    types.append(t)
-            text = f"[Вложения: {', '.join(types)}]" if types else "[Вложение]"
-    from_id = str(msg_obj.get("from_id") or "").strip()
-    peer_id = str(msg_obj.get("peer_id") or "").strip()
-    try:
-        created_at = int(msg_obj.get("date") or 0)
-    except Exception:
-        created_at = 0
-    if not peer_id:
-        return None
-    if not event_id:
-        conv_msg_id = str(msg_obj.get("conversation_message_id") or "").strip()
-        event_id = f"{peer_id}:{created_at}:{conv_msg_id}"
-    return VkMessageOut(
-        event_type=event_type,
-        event_id=event_id,
-        text=text,
-        from_id=from_id,
-        peer_id=peer_id,
-        created_at=created_at,
-    )
+    return _normalize_vk_message_obj(_extract_vk_message_obj(item), event_type=event_type, event_id=event_id)
 
 
 def _encode_conv_peer(group_id: str, peer_id: str) -> str:
@@ -738,6 +819,44 @@ def _decode_conv_peer(encoded_peer: str) -> str:
     return value.split(":", 1)[1]
 
 
+def _wrap_vk_message_event(message_obj: dict, event_type: str = "message_new") -> dict:
+    return {
+        "type": event_type,
+        "event_id": _build_vk_message_event_id(message_obj),
+        "object": {"message": message_obj},
+    }
+
+
+def _upsert_vk_conversation(cur, group_id: str, message: VkMessageOut) -> None:
+    cur.execute(
+        """
+        INSERT INTO social_vk_conversations (peer_id, last_message_text, last_from_id, last_message_ts, messages_count, updated_at)
+        VALUES (%s, %s, %s, %s, 1, NOW())
+        ON CONFLICT (peer_id) DO UPDATE
+        SET
+          last_message_text = CASE
+            WHEN EXCLUDED.last_message_ts >= social_vk_conversations.last_message_ts
+            THEN EXCLUDED.last_message_text
+            ELSE social_vk_conversations.last_message_text
+          END,
+          last_from_id = CASE
+            WHEN EXCLUDED.last_message_ts >= social_vk_conversations.last_message_ts
+            THEN EXCLUDED.last_from_id
+            ELSE social_vk_conversations.last_from_id
+          END,
+          last_message_ts = GREATEST(social_vk_conversations.last_message_ts, EXCLUDED.last_message_ts),
+          messages_count = social_vk_conversations.messages_count + 1,
+          updated_at = NOW()
+        """,
+        (
+            _encode_conv_peer(group_id, message.peer_id),
+            message.text,
+            message.from_id,
+            int(message.created_at or 0),
+        ),
+    )
+
+
 def _persist_vk_messages(updates: list[dict], group_id: str) -> list[VkMessageOut]:
     stored: list[VkMessageOut] = []
     gid = str(group_id or "").strip()
@@ -746,7 +865,28 @@ def _persist_vk_messages(updates: list[dict], group_id: str) -> list[VkMessageOu
             normalized = _normalize_vk_message_event(item)
             if normalized is None:
                 continue
-            conv_peer_id = _encode_conv_peer(gid, normalized.peer_id)
+            cur.execute(
+                """
+                SELECT 1
+                FROM social_vk_messages
+                WHERE vk_group_id=%s
+                  AND (
+                    event_id=%s
+                    OR (peer_id=%s AND from_id=%s AND message_ts=%s AND text=%s)
+                  )
+                LIMIT 1
+                """,
+                (
+                    gid,
+                    normalized.event_id,
+                    normalized.peer_id,
+                    normalized.from_id,
+                    int(normalized.created_at or 0),
+                    normalized.text,
+                ),
+            )
+            if cur.fetchone():
+                continue
             cur.execute(
                 """
                 INSERT INTO social_vk_messages (vk_group_id, event_id, peer_id, from_id, text, message_ts, raw_json)
@@ -763,35 +903,7 @@ def _persist_vk_messages(updates: list[dict], group_id: str) -> list[VkMessageOu
                     json.dumps(item, ensure_ascii=False),
                 ),
             )
-            if cur.rowcount == 0:
-                continue
-            cur.execute(
-                """
-                INSERT INTO social_vk_conversations (peer_id, last_message_text, last_from_id, last_message_ts, messages_count, updated_at)
-                VALUES (%s, %s, %s, %s, 1, NOW())
-                ON CONFLICT (peer_id) DO UPDATE
-                SET
-                  last_message_text = CASE
-                    WHEN EXCLUDED.last_message_ts >= social_vk_conversations.last_message_ts
-                    THEN EXCLUDED.last_message_text
-                    ELSE social_vk_conversations.last_message_text
-                  END,
-                  last_from_id = CASE
-                    WHEN EXCLUDED.last_message_ts >= social_vk_conversations.last_message_ts
-                    THEN EXCLUDED.last_from_id
-                    ELSE social_vk_conversations.last_from_id
-                  END,
-                  last_message_ts = GREATEST(social_vk_conversations.last_message_ts, EXCLUDED.last_message_ts),
-                  messages_count = social_vk_conversations.messages_count + 1,
-                  updated_at = NOW()
-                """,
-                (
-                    conv_peer_id,
-                    normalized.text,
-                    normalized.from_id,
-                    int(normalized.created_at or 0),
-                ),
-            )
+            _upsert_vk_conversation(cur, gid, normalized)
             stored.append(normalized)
     return stored
 
@@ -972,6 +1084,156 @@ def _resolve_vk_group_title(token: str, version: str, group_id: str) -> str:
     return ""
 
 
+def _fetch_vk_conversations_from_api(token: str, version: str, group_id: str, filter_name: str, limit: int) -> list[dict]:
+    if not (token and str(group_id or "").isdigit()):
+        return []
+    response = _vk_api_call(
+        method="messages.getConversations",
+        token=token,
+        version=version,
+        params={
+            "group_id": int(group_id),
+            "count": max(1, min(int(limit), 200)),
+            "filter": filter_name,
+        },
+    )
+    items = response.get("items") if isinstance(response, dict) else []
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _fetch_vk_history_from_api(token: str, version: str, group_id: str, peer_id: str, limit: int) -> list[dict]:
+    if not (token and str(group_id or "").isdigit() and str(peer_id or "").isdigit()):
+        return []
+    response = _vk_api_call(
+        method="messages.getHistory",
+        token=token,
+        version=version,
+        params={
+            "group_id": int(group_id),
+            "peer_id": int(peer_id),
+            "count": max(1, min(int(limit), 200)),
+            "rev": 0,
+        },
+    )
+    items = response.get("items") if isinstance(response, dict) else []
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _load_vk_conversation_state_map(group_id: str) -> dict[str, dict[str, int]]:
+    gid = str(group_id or "").strip()
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT peer_id, last_message_ts, messages_count
+            FROM social_vk_conversations
+            WHERE peer_id LIKE %s
+            """,
+            (f"{gid}:%",),
+        )
+        rows = cur.fetchall()
+    return {
+        str(row[0] or ""): {
+            "last_message_ts": _safe_int(row[1] or 0),
+            "messages_count": _safe_int(row[2] or 0),
+        }
+        for row in rows
+    }
+
+
+def _sync_vk_history_for_peer(
+    token: str,
+    version: str,
+    group_id: str,
+    peer_id: str,
+    history_limit: int,
+) -> int:
+    history_items = _fetch_vk_history_from_api(token, version, group_id, peer_id, history_limit)
+    if not history_items:
+        return 0
+    payloads = [_wrap_vk_message_event(message_obj=item) for item in history_items]
+    return len(_persist_vk_messages(payloads, group_id=group_id))
+
+
+def _sync_vk_conversations_from_api(settings_id: int | None = None, limit: int = 100) -> int:
+    settings_row = _load_vk_lp_row(settings_id=settings_id)
+    _, api_token, api_version, _, group_id, _, _, _ = settings_row
+    token = str(api_token or "").strip()
+    version = str(api_version or "5.199")
+    gid = str(group_id or "").strip()
+    if not token or not gid.isdigit():
+        return 0
+
+    local_map = _load_vk_conversation_state_map(gid)
+    merged: dict[str, dict] = {}
+    for filter_name in ("unread", "all"):
+        try:
+            items = _fetch_vk_conversations_from_api(token, version, gid, filter_name, limit)
+        except Exception:
+            continue
+        for item in items:
+            conversation = item.get("conversation") if isinstance(item, dict) else {}
+            peer = conversation.get("peer") if isinstance(conversation, dict) else {}
+            peer_id = str((peer or {}).get("id") or "").strip()
+            if peer_id:
+                merged[peer_id] = item
+
+    stored_total = 0
+    for peer_id, item in merged.items():
+        conversation = item.get("conversation") if isinstance(item, dict) else {}
+        last_message = item.get("last_message") if isinstance(item, dict) else {}
+        unread_count = _safe_int((conversation or {}).get("unread_count") or 0)
+        encoded_peer = _encode_conv_peer(gid, peer_id)
+        local_state = local_map.get(encoded_peer) or {"last_message_ts": 0, "messages_count": 0}
+        remote_ts = _safe_int((last_message or {}).get("date") or 0)
+        should_sync = unread_count > 0 or remote_ts > int(local_state.get("last_message_ts") or 0)
+        if not should_sync:
+            continue
+        history_limit = max(20, min(200, unread_count + 20))
+        stored_total += _sync_vk_history_for_peer(token, version, gid, peer_id, history_limit)
+    return stored_total
+
+
+def _list_enabled_vk_group_ids() -> list[int]:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id
+            FROM social_vk_group_settings
+            WHERE enabled = TRUE
+            ORDER BY is_default DESC, updated_at DESC, id ASC
+            """
+        )
+        rows = cur.fetchall()
+    return [int(row[0]) for row in rows if row and row[0] is not None]
+
+
+def _run_vk_background_sync_once() -> None:
+    for settings_id in _list_enabled_vk_group_ids():
+        try:
+            _sync_vk_conversations_from_api(settings_id=settings_id, limit=100)
+        except Exception as exc:
+            print(f"[social] vk background sync failed for settings_id={settings_id}: {exc}", flush=True)
+
+
+def _vk_background_sync_loop() -> None:
+    print(
+        f"[social] vk background sync started, interval={SOCIAL_VK_BACKGROUND_SYNC_INTERVAL_SECONDS}s",
+        flush=True,
+    )
+    if SOCIAL_VK_BACKGROUND_SYNC_RUN_ON_START:
+        _run_vk_background_sync_once()
+    while True:
+        time.sleep(SOCIAL_VK_BACKGROUND_SYNC_INTERVAL_SECONDS)
+        _run_vk_background_sync_once()
+
+
+def _start_vk_background_sync() -> None:
+    if not SOCIAL_VK_BACKGROUND_SYNC_ENABLED:
+        return
+    thread = threading.Thread(target=_vk_background_sync_loop, name="social-vk-sync", daemon=True)
+    thread.start()
+
+
 @app.post("/settings/vk/longpoll/bootstrap", response_model=VkLongPollSessionOut)
 def bootstrap_vk_longpoll(request: Request, settings_id: int | None = None) -> VkLongPollSessionOut:
     require_admin(request)
@@ -1027,6 +1289,7 @@ def get_vk_longpoll_messages(
     if not connected:
         return VkMessagesOut(connected=False, message=message, ts=new_ts)
     _persist_vk_messages(updates, group_id=gid)
+    _sync_vk_conversations_from_api(settings_id=settings_id, limit=safe_limit)
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -1076,10 +1339,11 @@ def list_vk_conversations(request: Request, limit: int = 50, settings_id: int | 
     settings_row = _load_vk_lp_row(settings_id=settings_id)
     _, api_token, api_version, _, group_id, _, _, _ = settings_row
     gid = str(group_id or "").strip()
+    _sync_vk_conversations_from_api(settings_id=settings_id, limit=safe_limit)
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT peer_id, last_message_text, last_from_id, last_message_ts, messages_count
+            SELECT peer_id, last_message_text, last_from_id, last_message_ts, reply_closed_ts, messages_count
             FROM social_vk_conversations
             WHERE peer_id LIKE %s
             ORDER BY last_message_ts DESC, updated_at DESC
@@ -1094,7 +1358,12 @@ def list_vk_conversations(request: Request, limit: int = 50, settings_id: int | 
             last_message_text=str(row[1] or ""),
             last_from_id=str(row[2] or ""),
             last_message_ts=int(row[3] or 0),
-            messages_count=int(row[4] or 0),
+            messages_count=int(row[5] or 0),
+            needs_reply=bool(
+                str(row[2] or "").strip()
+                and str(row[2] or "").strip() != f"-{gid}"
+                and int(row[3] or 0) > int(row[4] or 0)
+            ),
         )
         for row in rows
     ]
@@ -1119,6 +1388,10 @@ def list_vk_conversation_messages(
     settings_row = _load_vk_lp_row(settings_id=settings_id)
     _, api_token, api_version, _, group_id, _, _, _ = settings_row
     gid = str(group_id or "").strip()
+    token = str(api_token or "").strip()
+    version = str(api_version or "5.199")
+    if safe_offset == 0:
+        _sync_vk_history_for_peer(token, version, gid, str(peer_id).strip(), max(safe_limit, 100))
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -1156,11 +1429,31 @@ def list_vk_conversation_messages(
     return items
 
 
+@app.post("/vk/conversations/{peer_id}/dismiss-reply")
+def dismiss_vk_conversation_reply(request: Request, peer_id: str, settings_id: int | None = None) -> dict[str, bool]:
+    require_user_uuid(request)
+    settings_row = _load_vk_lp_row(settings_id=settings_id)
+    _, _, _, _, group_id, _, _, _ = settings_row
+    encoded_peer = _encode_conv_peer(str(group_id or "").strip(), str(peer_id or "").strip())
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE social_vk_conversations
+            SET reply_closed_ts = GREATEST(reply_closed_ts, last_message_ts), updated_at = NOW()
+            WHERE peer_id = %s
+            """,
+            (encoded_peer,),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="conversation not found")
+    return {"ok": True}
+
+
 @app.post("/vk/conversations/{peer_id}/reply", response_model=VkReplyOut)
 def send_vk_conversation_reply(
     request: Request, peer_id: str, body: VkReplyIn, settings_id: int | None = None
 ) -> VkReplyOut:
-    require_user_uuid(request)
+    user_uuid = require_user_uuid(request)
     settings_row = _load_vk_lp_row(settings_id=settings_id)
     _, api_token, api_version, _, group_id, _, _, _ = settings_row
     token = str(api_token or "").strip()
@@ -1190,8 +1483,14 @@ def send_vk_conversation_reply(
     )
     vk_message_id = int(response or 0)
     now_ts = int(time.time())
-    event_id = f"out:{target_peer_id}:{vk_message_id}:{now_ts}"
-    conv_peer_id = _encode_conv_peer(gid, target_peer_id)
+    normalized = VkMessageOut(
+        event_type="message_out",
+        event_id=f"out:{target_peer_id}:{vk_message_id}:{now_ts}",
+        text=text,
+        from_id=f"-{gid}",
+        peer_id=target_peer_id,
+        created_at=now_ts,
+    )
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -1201,29 +1500,70 @@ def send_vk_conversation_reply(
             """,
             (
                 gid,
-                event_id,
-                target_peer_id,
-                f"-{gid}",
-                text,
-                now_ts,
+                normalized.event_id,
+                normalized.peer_id,
+                normalized.from_id,
+                normalized.text,
+                normalized.created_at,
                 json.dumps({"type": "message_out", "vk_message_id": vk_message_id}, ensure_ascii=False),
             ),
         )
         cur.execute(
             """
-            INSERT INTO social_vk_conversations (peer_id, last_message_text, last_from_id, last_message_ts, messages_count, updated_at)
-            VALUES (%s, %s, %s, %s, 1, NOW())
-            ON CONFLICT (peer_id) DO UPDATE
-            SET
-              last_message_text = EXCLUDED.last_message_text,
-              last_from_id = EXCLUDED.last_from_id,
-              last_message_ts = GREATEST(social_vk_conversations.last_message_ts, EXCLUDED.last_message_ts),
-              messages_count = social_vk_conversations.messages_count + 1,
-              updated_at = NOW()
+            INSERT INTO social_vk_reply_events (
+              user_uuid, vk_group_id, peer_id, outgoing_event_id,
+              outgoing_vk_message_id, reply_text, replied_at_ts
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (vk_group_id, outgoing_event_id) DO NOTHING
             """,
-            (conv_peer_id, text, f"-{gid}", now_ts),
+            (
+                user_uuid,
+                gid,
+                normalized.peer_id,
+                normalized.event_id,
+                int(vk_message_id or 0),
+                normalized.text,
+                normalized.created_at,
+            ),
         )
+        _upsert_vk_conversation(cur, gid, normalized)
     return VkReplyOut(ok=True, vk_message_id=vk_message_id, message="sent")
+
+
+@app.get("/vk/reply-stats/me", response_model=VkReplyStatsOut)
+def get_vk_reply_stats_me(request: Request) -> VkReplyStatsOut:
+    user_uuid = require_user_uuid(request)
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM social_vk_reply_events
+            WHERE user_uuid = %s
+            """,
+            (user_uuid,),
+        )
+        row = cur.fetchone()
+    return VkReplyStatsOut(social_replies_count=int((row or [0])[0] or 0))
+
+
+@app.get("/vk/inbox-summary", response_model=VkInboxSummaryOut)
+def get_vk_inbox_summary(request: Request) -> VkInboxSummaryOut:
+    require_user_uuid(request)
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM social_vk_conversations c
+            JOIN social_vk_group_settings g
+              ON g.group_id = split_part(c.peer_id, ':', 1)
+            WHERE g.enabled = TRUE
+              AND c.last_from_id <> ('-' || split_part(c.peer_id, ':', 1))
+              AND c.last_message_ts > c.reply_closed_ts
+            """
+        )
+        row = cur.fetchone()
+    return VkInboxSummaryOut(needs_reply_count=int((row or [0])[0] or 0))
 
 
 @app.post("/vk/callback")
@@ -1259,4 +1599,6 @@ def vk_callback(payload: dict) -> Response:
         incoming_secret = str(payload.get("secret") or "").strip()
         if incoming_secret != str(callback_secret).strip():
             return Response(content="invalid secret", media_type="text/plain", status_code=403)
+    if event_type in {"message_new", "message_reply"}:
+        _persist_vk_messages([payload], group_id=str(group_id or "").strip())
     return Response(content="ok", media_type="text/plain")

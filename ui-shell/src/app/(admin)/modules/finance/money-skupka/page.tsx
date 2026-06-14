@@ -145,8 +145,8 @@ export default function FinanceMoneySkupkaPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const loadHistoryForDeal = async (dealId: string) => {
-    if (historyByDealId[dealId]) return;
+  const loadHistoryForDeal = async (dealId: string, force = false) => {
+    if (!force && historyByDealId[dealId]) return;
     setHistoryLoadingByDealId((prev) => ({ ...prev, [dealId]: true }));
     setHistoryErrorByDealId((prev) => ({ ...prev, [dealId]: "" }));
     try {
@@ -205,7 +205,7 @@ export default function FinanceMoneySkupkaPage() {
         delete next[dealId];
         return next;
       });
-      await loadHistoryForDeal(dealId);
+      await loadHistoryForDeal(dealId, true);
     } catch (e: any) {
       setError(e?.message || "failed to save line");
     } finally {

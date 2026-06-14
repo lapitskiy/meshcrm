@@ -242,6 +242,22 @@ def init_db() -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS buyback_category_access (
+              buyback_category_id UUID NOT NULL REFERENCES buyback_categories(id) ON DELETE CASCADE,
+              user_uuid TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (buyback_category_id, user_uuid)
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_buyback_category_access_user_uuid
+            ON buyback_category_access(user_uuid);
+            """
+        )
+        cur.execute(
+            """
             ALTER TABLE buyback_device_conditions
             ADD COLUMN IF NOT EXISTS category_id UUID;
             """
@@ -320,6 +336,25 @@ def require_admin(request: Request) -> None:
     roles = {part.strip() for part in raw_roles.split(",") if part.strip()}
     if not roles.intersection(ADMIN_ROLES):
         raise HTTPException(status_code=403, detail="forbidden: admin role required")
+
+
+def require_admin_or_category_access(request: Request, category_id: uuid.UUID) -> None:
+    raw_roles = str(request.headers.get("x-user-roles", "")).strip()
+    roles = {part.strip() for part in raw_roles.split(",") if part.strip()}
+    if roles.intersection(ADMIN_ROLES):
+        return
+    user_uuid = require_user_uuid(request)
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM buyback_category_access
+            WHERE buyback_category_id = %s AND user_uuid = %s
+            """,
+            (category_id, user_uuid)
+        )
+        if cur.fetchone():
+            return
+    raise HTTPException(status_code=403, detail="forbidden: admin role or category access required")
 
 
 def _keycloak_admin_token() -> str:
@@ -414,6 +449,22 @@ class BuybackCategoryOut(BaseModel):
     id: uuid.UUID
     name: str
     created_at: datetime
+
+
+class CategoryAccessReplaceIn(BaseModel):
+    category_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class CategoryAccessOut(BaseModel):
+    user_uuid: str
+    category_ids: list[uuid.UUID]
+
+
+class UserLiteOut(BaseModel):
+    user_uuid: str
+    username: str
+    email: str
+    full_name: str
 
 
 class BuybackPurchaseObjectIn(BaseModel):
@@ -851,6 +902,86 @@ def delete_buyback_category(category_id: uuid.UUID, request: Request) -> None:
         cur.execute("DELETE FROM buyback_categories WHERE id=%s", (category_id,))
 
 
+@app.get("/settings/categories/access/users/search", response_model=list[UserLiteOut])
+@app.get("/skupka/settings/categories/access/users/search", response_model=list[UserLiteOut])
+def search_users(q: str, request: Request) -> list[UserLiteOut]:
+    require_admin(request)
+    term = q.strip()
+    if len(term) < 2:
+        return []
+    token = _keycloak_admin_token()
+    req = UrlRequest(
+        f"{KEYCLOAK_INTERNAL_URL}/admin/realms/{KEYCLOAK_REALM}/users?search={term}&max=20",
+        headers={"authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    with urlopen(req, timeout=10) as resp:
+        payload = resp.read().decode("utf-8")
+    rows = json.loads(payload) or []
+    out: list[UserLiteOut] = []
+    for row in rows:
+        user_uuid = str((row or {}).get("id") or "").strip()
+        if not user_uuid:
+            continue
+        first = str((row or {}).get("firstName") or "").strip()
+        last = str((row or {}).get("lastName") or "").strip()
+        full_name = f"{first} {last}".strip() or str((row or {}).get("username") or "").strip() or user_uuid
+        out.append(
+            UserLiteOut(
+                user_uuid=user_uuid,
+                username=str((row or {}).get("username") or "").strip(),
+                email=str((row or {}).get("email") or "").strip(),
+                full_name=full_name,
+            )
+        )
+    return out
+
+
+@app.get("/settings/categories/access/users/{user_uuid}", response_model=CategoryAccessOut)
+@app.get("/skupka/settings/categories/access/users/{user_uuid}", response_model=CategoryAccessOut)
+def get_user_category_access(user_uuid: str, request: Request) -> CategoryAccessOut:
+    require_admin(request)
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT buyback_category_id
+            FROM buyback_category_access
+            WHERE user_uuid = %s
+            ORDER BY created_at ASC
+            """,
+            (user_uuid,),
+        )
+        rows = cur.fetchall()
+    return CategoryAccessOut(user_uuid=user_uuid, category_ids=[row[0] for row in rows])
+
+
+@app.put("/settings/categories/access/users/{user_uuid}", response_model=CategoryAccessOut)
+@app.put("/skupka/settings/categories/access/users/{user_uuid}", response_model=CategoryAccessOut)
+def replace_user_category_access(user_uuid: str, payload: CategoryAccessReplaceIn, request: Request) -> CategoryAccessOut:
+    require_admin(request)
+    category_ids = list(dict.fromkeys(payload.category_ids))
+    with db() as conn, conn.cursor() as cur:
+        if category_ids:
+            cur.execute(
+                "SELECT id FROM buyback_categories WHERE id = ANY(%s)",
+                (category_ids,),
+            )
+            existing_ids = {row[0] for row in cur.fetchall()}
+            if len(existing_ids) != len(category_ids):
+                raise HTTPException(status_code=400, detail="some category_ids do not exist")
+        cur.execute("DELETE FROM buyback_category_access WHERE user_uuid = %s", (user_uuid,))
+        for category_id in category_ids:
+            cur.execute(
+                """
+                INSERT INTO buyback_category_access (buyback_category_id, user_uuid)
+                VALUES (%s, %s)
+                ON CONFLICT (buyback_category_id, user_uuid) DO NOTHING
+                """,
+                (category_id, user_uuid),
+            )
+    return CategoryAccessOut(user_uuid=user_uuid, category_ids=category_ids)
+
+
 @app.get("/settings/purchase-objects", response_model=list[BuybackPurchaseObjectOut])
 @app.get("/skupka/settings/purchase-objects", response_model=list[BuybackPurchaseObjectOut])
 def list_buyback_purchase_objects(request: Request, category_id: uuid.UUID | None = None) -> list[BuybackPurchaseObjectOut]:
@@ -892,7 +1023,7 @@ def list_buyback_purchase_objects(request: Request, category_id: uuid.UUID | Non
 @app.post("/settings/purchase-objects", response_model=BuybackPurchaseObjectOut, status_code=201)
 @app.post("/skupka/settings/purchase-objects", response_model=BuybackPurchaseObjectOut, status_code=201)
 def create_buyback_purchase_object(body: BuybackPurchaseObjectIn, request: Request) -> BuybackPurchaseObjectOut:
-    require_admin(request)
+    require_admin_or_category_access(request, body.category_id)
     with db() as conn, conn.cursor() as cur:
         cur.execute("SELECT name FROM buyback_categories WHERE id=%s", (body.category_id,))
         category_row = cur.fetchone()
@@ -921,7 +1052,7 @@ def create_buyback_purchase_object(body: BuybackPurchaseObjectIn, request: Reque
 def update_buyback_purchase_object(
     object_id: uuid.UUID, body: BuybackPurchaseObjectIn, request: Request
 ) -> BuybackPurchaseObjectOut:
-    require_admin(request)
+    require_admin_or_category_access(request, body.category_id)
     with db() as conn, conn.cursor() as cur:
         cur.execute("SELECT name FROM buyback_categories WHERE id=%s", (body.category_id,))
         category_row = cur.fetchone()
@@ -951,8 +1082,30 @@ def update_buyback_purchase_object(
 @app.delete("/settings/purchase-objects/{object_id}", status_code=204)
 @app.delete("/skupka/settings/purchase-objects/{object_id}", status_code=204)
 def delete_buyback_purchase_object(object_id: uuid.UUID, request: Request) -> None:
-    require_admin(request)
+    # Check access based on the object's category
+    raw_roles = str(request.headers.get("x-user-roles", "")).strip()
+    roles = {part.strip() for part in raw_roles.split(",") if part.strip()}
+    is_admin = bool(roles.intersection(ADMIN_ROLES))
+    
     with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT category_id FROM buyback_purchase_objects WHERE id=%s", (object_id,))
+        obj_row = cur.fetchone()
+        if not obj_row:
+            raise HTTPException(status_code=404, detail="purchase object not found")
+        category_id = obj_row[0]
+        
+        if not is_admin:
+            user_uuid = require_user_uuid(request)
+            cur.execute(
+                """
+                SELECT 1 FROM buyback_category_access
+                WHERE buyback_category_id = %s AND user_uuid = %s
+                """,
+                (category_id, user_uuid)
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=403, detail="forbidden: admin role or category access required")
+
         cur.execute("DELETE FROM buyback_purchase_objects WHERE id=%s", (object_id,))
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="purchase object not found")

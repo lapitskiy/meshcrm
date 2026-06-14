@@ -5,12 +5,17 @@ from app.domain.service_objects.entity import ServiceObject
 from app.domain.service_objects.repository import ServiceObjectRepository
 
 
+def _capitalize_first_letter(value: str) -> str:
+    value = value.strip()
+    return value[:1].upper() + value[1:] if value else ""
+
+
 class ServiceObjectUseCases:
     def __init__(self, repo: ServiceObjectRepository) -> None:
         self._repo = repo
 
     def create(self, payload: CreateServiceObjectIn) -> ServiceObject:
-        name = payload.name.strip()
+        name = _capitalize_first_letter(payload.name)
         if not name:
             raise ValueError("Service object name must not be empty")
         return self._repo.create(service_category_id=payload.service_category_id, name=name)
@@ -30,7 +35,7 @@ class ServiceObjectUseCases:
         )
 
     def update(self, object_id: UUID, payload: UpdateServiceObjectIn) -> ServiceObject:
-        name = payload.name.strip()
+        name = _capitalize_first_letter(payload.name)
         if not name:
             raise ValueError("Service object name must not be empty")
         return self._repo.update(

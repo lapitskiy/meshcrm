@@ -5,6 +5,7 @@ from typing import Any
 import time
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
@@ -87,6 +88,80 @@ def init_db() -> None:
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_module_access_user_uuid ON module_access(user_uuid)")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tenants (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              created_by_uuid TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tenant_members (
+              tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+              user_uuid TEXT NOT NULL,
+              role TEXT NOT NULL DEFAULT 'member',
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (tenant_id, user_uuid)
+            );
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tenant_members_user_uuid ON tenant_members(user_uuid)")
+        cur.execute("ALTER TABLE module_access ADD COLUMN IF NOT EXISTS tenant_id TEXT")
+        cur.execute("SELECT DISTINCT user_uuid FROM module_access WHERE NULLIF(tenant_id, '') IS NULL")
+        for (user_uuid,) in cur.fetchall():
+            cur.execute(
+                """
+                SELECT tenant_id
+                FROM tenant_members
+                WHERE user_uuid = %s
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (user_uuid,),
+            )
+            row = cur.fetchone()
+            tenant_id = str(row[0]) if row else str(uuid4())
+            if row is None:
+                cur.execute(
+                    """
+                    INSERT INTO tenants (id, name, created_by_uuid)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (tenant_id, "Личный аккаунт", user_uuid),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO tenant_members (tenant_id, user_uuid, role)
+                    VALUES (%s, %s, 'owner')
+                    ON CONFLICT (tenant_id, user_uuid) DO NOTHING
+                    """,
+                    (tenant_id, user_uuid),
+                )
+            cur.execute(
+                """
+                UPDATE module_access
+                SET tenant_id = %s
+                WHERE user_uuid = %s AND NULLIF(tenant_id, '') IS NULL
+                """,
+                (tenant_id, user_uuid),
+            )
+        cur.execute("ALTER TABLE module_access ALTER COLUMN tenant_id SET NOT NULL")
+        cur.execute("ALTER TABLE module_access DROP CONSTRAINT IF EXISTS module_access_pkey")
+        cur.execute(
+            """
+            ALTER TABLE module_access
+            ADD CONSTRAINT module_access_pkey
+            PRIMARY KEY (tenant_id, module_name, user_uuid)
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_module_access_tenant_user_uuid ON module_access(tenant_id, user_uuid)"
+        )
 
 
 def seed_from_files() -> None:
@@ -139,6 +214,18 @@ class UserModuleAccessReplaceIn(BaseModel):
     role: str = Field(default="viewer", min_length=1, max_length=50)
 
 
+class TenantOut(BaseModel):
+    tenant_id: str
+    name: str
+    role: str
+
+
+class TenantContextOut(BaseModel):
+    tenant_id: str
+    role: str
+    tenants: list[TenantOut]
+
+
 class PluginOrderReplaceIn(BaseModel):
     names: list[str] = Field(default_factory=list)
 
@@ -169,6 +256,54 @@ def require_access_admin(request: FastAPIRequest) -> str:
     if is_access_admin(request):
         return user_uuid
     raise HTTPException(status_code=403, detail="forbidden: admin role required")
+
+
+def requested_tenant_id(request: FastAPIRequest) -> str:
+    return str(
+        request.headers.get("x-tenant-id")
+        or request.headers.get("x-active-tenant-id")
+        or ""
+    ).strip()
+
+
+def tenant_context(cur: psycopg.Cursor, user_uuid: str, requested_id: str = "") -> TenantContextOut:
+    cur.execute(
+        """
+        SELECT t.id, t.name, tm.role
+        FROM tenant_members tm
+        JOIN tenants t ON t.id = tm.tenant_id
+        WHERE tm.user_uuid = %s
+        ORDER BY tm.created_at ASC
+        """,
+        (user_uuid,),
+    )
+    rows = cur.fetchall()
+
+    if not rows:
+        tenant_id = str(uuid4())
+        cur.execute(
+            """
+            INSERT INTO tenants (id, name, created_by_uuid)
+            VALUES (%s, %s, %s)
+            """,
+            (tenant_id, "Личный аккаунт", user_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO tenant_members (tenant_id, user_uuid, role)
+            VALUES (%s, %s, 'owner')
+            """,
+            (tenant_id, user_uuid),
+        )
+        rows = [(tenant_id, "Личный аккаунт", "owner")]
+
+    tenants = [TenantOut(tenant_id=row[0], name=row[1], role=row[2]) for row in rows]
+    selected = tenants[0]
+    if requested_id:
+        selected = next((item for item in tenants if item.tenant_id == requested_id), None)
+        if selected is None:
+            raise HTTPException(status_code=403, detail="forbidden: tenant access denied")
+    return TenantContextOut(tenant_id=selected.tenant_id, role=selected.role, tenants=tenants)
 
 
 def keycloak_admin_token() -> str:
@@ -217,12 +352,20 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/plugins/tenants/current", response_model=TenantContextOut)
+def current_tenant(request: FastAPIRequest) -> TenantContextOut:
+    user_uuid = require_user_uuid(request)
+    with db() as conn, conn.cursor() as cur:
+        return tenant_context(cur, user_uuid, requested_tenant_id(request))
+
+
 @app.get("/plugins")
 def list_plugins(request: FastAPIRequest, enabled_only: bool = True) -> list[dict[str, Any]]:
     with db() as conn, conn.cursor() as cur:
         user_uuid = str(request.headers.get("x-user-uuid", "")).strip()
         is_admin = is_access_admin(request)
         if user_uuid and not is_admin:
+            tenant_id = tenant_context(cur, user_uuid, requested_tenant_id(request)).tenant_id
             if enabled_only:
                 cur.execute(
                     """
@@ -231,11 +374,11 @@ def list_plugins(request: FastAPIRequest, enabled_only: bool = True) -> list[dic
                     WHERE p.enabled=TRUE
                       AND EXISTS (
                         SELECT 1 FROM module_access ma
-                        WHERE ma.module_name = p.name AND ma.user_uuid = %s
+                        WHERE ma.tenant_id = %s AND ma.module_name = p.name AND ma.user_uuid = %s
                       )
                     ORDER BY p.sort_order ASC, p.name ASC
                     """,
-                    (user_uuid,),
+                    (tenant_id, user_uuid),
                 )
             else:
                 cur.execute(
@@ -244,11 +387,11 @@ def list_plugins(request: FastAPIRequest, enabled_only: bool = True) -> list[dic
                     FROM plugins p
                     WHERE EXISTS (
                       SELECT 1 FROM module_access ma
-                      WHERE ma.module_name = p.name AND ma.user_uuid = %s
+                      WHERE ma.tenant_id = %s AND ma.module_name = p.name AND ma.user_uuid = %s
                     )
                     ORDER BY p.sort_order ASC, p.name ASC
                     """,
-                    (user_uuid,),
+                    (tenant_id, user_uuid),
                 )
         elif enabled_only:
             cur.execute("SELECT manifest FROM plugins WHERE enabled=TRUE ORDER BY sort_order ASC, name ASC")
@@ -263,6 +406,7 @@ def list_plugins_meta(request: FastAPIRequest, enabled_only: bool = True) -> lis
         user_uuid = str(request.headers.get("x-user-uuid", "")).strip()
         is_admin = is_access_admin(request)
         if user_uuid and not is_admin:
+            tenant_id = tenant_context(cur, user_uuid, requested_tenant_id(request)).tenant_id
             if enabled_only:
                 cur.execute(
                     """
@@ -271,11 +415,11 @@ def list_plugins_meta(request: FastAPIRequest, enabled_only: bool = True) -> lis
                     WHERE p.enabled=TRUE
                       AND EXISTS (
                         SELECT 1 FROM module_access ma
-                        WHERE ma.module_name = p.name AND ma.user_uuid = %s
+                        WHERE ma.tenant_id = %s AND ma.module_name = p.name AND ma.user_uuid = %s
                       )
                     ORDER BY p.sort_order ASC, p.name ASC
                     """,
-                    (user_uuid,),
+                    (tenant_id, user_uuid),
                 )
             else:
                 cur.execute(
@@ -284,11 +428,11 @@ def list_plugins_meta(request: FastAPIRequest, enabled_only: bool = True) -> lis
                     FROM plugins p
                     WHERE EXISTS (
                       SELECT 1 FROM module_access ma
-                      WHERE ma.module_name = p.name AND ma.user_uuid = %s
+                      WHERE ma.tenant_id = %s AND ma.module_name = p.name AND ma.user_uuid = %s
                     )
                     ORDER BY p.sort_order ASC, p.name ASC
                     """,
-                    (user_uuid,),
+                    (tenant_id, user_uuid),
                 )
         elif enabled_only:
             cur.execute(
@@ -465,11 +609,17 @@ def search_users(q: str, request: FastAPIRequest) -> list[UserLiteOut]:
 
 @app.get("/plugins/access/users/{user_uuid}", response_model=UserModuleAccessOut)
 def get_user_access(user_uuid: str, request: FastAPIRequest) -> UserModuleAccessOut:
-    require_access_admin(request)
+    current_user_uuid = require_access_admin(request)
     with db() as conn, conn.cursor() as cur:
+        tenant_id = tenant_context(cur, current_user_uuid, requested_tenant_id(request)).tenant_id
         cur.execute(
-            "SELECT module_name FROM module_access WHERE user_uuid=%s ORDER BY created_at ASC, module_name ASC",
-            (user_uuid,),
+            """
+            SELECT module_name
+            FROM module_access
+            WHERE tenant_id=%s AND user_uuid=%s
+            ORDER BY created_at ASC, module_name ASC
+            """,
+            (tenant_id, user_uuid),
         )
         rows = cur.fetchall()
     return UserModuleAccessOut(user_uuid=user_uuid, module_names=[row[0] for row in rows])
@@ -481,9 +631,10 @@ def check_access(access_name: str, request: FastAPIRequest) -> dict[str, Any]:
     if is_access_admin(request):
         return {"access_name": access_name, "allowed": True}
     with db() as conn, conn.cursor() as cur:
+        tenant_id = tenant_context(cur, user_uuid, requested_tenant_id(request)).tenant_id
         cur.execute(
-            "SELECT 1 FROM module_access WHERE module_name=%s AND user_uuid=%s",
-            (access_name, user_uuid),
+            "SELECT 1 FROM module_access WHERE tenant_id=%s AND module_name=%s AND user_uuid=%s",
+            (tenant_id, access_name, user_uuid),
         )
         allowed = cur.fetchone() is not None
     return {"access_name": access_name, "allowed": allowed}
@@ -491,26 +642,27 @@ def check_access(access_name: str, request: FastAPIRequest) -> dict[str, Any]:
 
 @app.put("/plugins/access/users/{user_uuid}", response_model=UserModuleAccessOut)
 def replace_user_access(user_uuid: str, body: UserModuleAccessReplaceIn, request: FastAPIRequest) -> UserModuleAccessOut:
-    require_access_admin(request)
+    current_user_uuid = require_access_admin(request)
     role = body.role.strip().lower()
     if not role:
         raise HTTPException(status_code=400, detail="role must not be empty")
     module_names = [str(name).strip() for name in body.module_names if str(name).strip()]
     module_names = list(dict.fromkeys(module_names))
     with db() as conn, conn.cursor() as cur:
+        tenant_id = tenant_context(cur, current_user_uuid, requested_tenant_id(request)).tenant_id
         if module_names:
             existing_names = allowed_access_names(cur)
             if not set(module_names).issubset(existing_names):
                 raise HTTPException(status_code=400, detail="some module_names do not exist")
-        cur.execute("DELETE FROM module_access WHERE user_uuid=%s", (user_uuid,))
+        cur.execute("DELETE FROM module_access WHERE tenant_id=%s AND user_uuid=%s", (tenant_id, user_uuid))
         for module_name in module_names:
             cur.execute(
                 """
-                INSERT INTO module_access (module_name, user_uuid, role)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (module_name, user_uuid) DO UPDATE SET role=EXCLUDED.role
+                INSERT INTO module_access (tenant_id, module_name, user_uuid, role)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (tenant_id, module_name, user_uuid) DO UPDATE SET role=EXCLUDED.role
                 """,
-                (module_name, user_uuid, role),
+                (tenant_id, module_name, user_uuid, role),
             )
     return UserModuleAccessOut(user_uuid=user_uuid, module_names=module_names)
 

@@ -11,6 +11,14 @@ type PrintFormListItem = {
   title: string;
   category_id?: string | null;
   category_name?: string;
+  page_width_mm: number;
+  page_height_mm: number;
+  page_margin_mm: number;
+  page_auto_height: boolean;
+  page_offset_x_mm?: number | null;
+  page_offset_y_mm?: number | null;
+  page_rotation_deg?: number | null;
+  qz_enabled: boolean;
   updated_at: string;
 };
 
@@ -21,11 +29,44 @@ type PrintFormDetails = {
   content_json: any;
   category_id?: string | null;
   category_name?: string;
+  page_width_mm: number;
+  page_height_mm: number;
+  page_margin_mm: number;
+  page_auto_height: boolean;
+  page_offset_x_mm?: number | null;
+  page_offset_y_mm?: number | null;
+  page_rotation_deg?: number | null;
+  qz_enabled: boolean;
   updated_at: string;
 };
 
 function getToken(): string {
   return (window as any).__hubcrmAccessToken || "";
+}
+
+function pageSizeMm(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.min(2000, Math.round(parsed)));
+}
+
+function optionalPrintNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.round(parsed);
+}
+
+function printTransformCss(form: PrintFormDetails): string {
+  const x = optionalPrintNumber(form.page_offset_x_mm);
+  const y = optionalPrintNumber(form.page_offset_y_mm);
+  const rotation = optionalPrintNumber(form.page_rotation_deg);
+  const parts: string[] = [];
+  if (x !== null || y !== null) parts.push(`translate(${x ?? 0}mm, ${y ?? 0}mm)`);
+  if (rotation === 90) parts.push("rotate(90deg) translateY(-100%)");
+  if (rotation === 180) parts.push("rotate(180deg) translate(-100%, -100%)");
+  if (rotation === 270) parts.push("rotate(270deg) translateX(-100%)");
+  return parts.length ? `transform:${parts.join(" ")};transform-origin:top left;` : "";
 }
 
 export default function PrintFormsListPage() {
@@ -61,8 +102,8 @@ export default function PrintFormsListPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const ensureDetails = async (id: string) => {
-    if (details[id]) return;
+  const ensureDetails = async (id: string): Promise<PrintFormDetails> => {
+    if (details[id]) return details[id];
     const resp = await fetch(`${base}/documents/print/forms/${encodeURIComponent(id)}`, {
       cache: "no-store",
       headers: authHeaders(),
@@ -73,6 +114,7 @@ export default function PrintFormsListPage() {
     }
     const data = (await resp.json()) as PrintFormDetails;
     setDetails((prev) => ({ ...prev, [id]: data }));
+    return data;
   };
 
   const onToggleOpen = async (id: string) => {
@@ -120,17 +162,29 @@ export default function PrintFormsListPage() {
     setBusyId(id);
     setError(null);
     try {
-      await ensureDetails(id);
-      const html = (details[id] || {})?.content_html || "";
-      const w = window.open("", "_blank", "noopener,noreferrer");
+      const form = await ensureDetails(id);
+      const html = form.content_html || "";
+      const widthMm = pageSizeMm(form.page_width_mm, 200);
+      const heightMm = pageSizeMm(form.page_height_mm, 300);
+      const marginMm = pageSizeMm(form.page_margin_mm, 0);
+      const autoHeight = Boolean(form.page_auto_height);
+      const pageHeight = autoHeight ? "auto" : `${heightMm}mm`;
+      const transformCss = printTransformCss(form);
+      const popupWidth = Math.round(widthMm * 3.8);
+      const popupHeight = autoHeight ? 900 : Math.round(heightMm * 3.8);
+      const w = window.open("", "_blank", `width=${popupWidth},height=${popupHeight}`);
       if (!w) throw new Error("popup blocked");
       w.document.open();
       w.document.write(`<!doctype html><html><head><meta charset="utf-8"/><title>Print</title>
         <style>
-          body{font-family:Arial, sans-serif; padding:24px;}
+          @page{size:${widthMm}mm ${pageHeight};margin:${marginMm}mm;}
+          html,body{width:${widthMm}mm;margin:0;padding:0;}
+          body{font-family:Arial, sans-serif;}
+          .print-page{width:${widthMm}mm;${autoHeight ? "" : `min-height:${heightMm}mm;`}box-sizing:border-box;${transformCss}}
           img{max-width:100%;}
+          table{max-width:100%;}
         </style>
-      </head><body>${html}</body></html>`);
+      </head><body><div class="print-page">${html}</div></body></html>`);
       w.document.close();
       w.focus();
       setTimeout(() => w.print(), 300);
@@ -181,6 +235,11 @@ export default function PrintFormsListPage() {
                     {!!(f.category_name || "").trim() && (
                       <span className="rounded-full border border-gray-200 px-2 py-0.5 text-xs text-gray-600 dark:border-gray-800 dark:text-white/70">
                         {String(f.category_name)}
+                      </span>
+                    )}
+                    {f.qz_enabled && (
+                      <span className="rounded-full border border-brand-200 bg-brand-50 px-2 py-0.5 text-xs text-brand-700 dark:border-brand-900/40 dark:bg-brand-900/20 dark:text-brand-300">
+                        QZ
                       </span>
                     )}
                     <span className="ml-auto text-xs text-gray-500 dark:text-gray-400">

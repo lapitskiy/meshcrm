@@ -51,6 +51,8 @@ def init_db() -> None:
               order_uuid UUID NOT NULL,
               work_type_uuid UUID NOT NULL,
               amount NUMERIC NOT NULL,
+              prepayment NUMERIC,
+              cost_price NUMERIC,
               currency TEXT NOT NULL DEFAULT 'RUB',
               payment_method TEXT NOT NULL DEFAULT 'cash',
               source TEXT NOT NULL DEFAULT 'manual',
@@ -79,12 +81,28 @@ def init_db() -> None:
         )
         cur.execute(
             """
+            ALTER TABLE order_finance_lines
+            ADD COLUMN IF NOT EXISTS prepayment NUMERIC;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE order_finance_lines
+            ADD COLUMN IF NOT EXISTS cost_price NUMERIC;
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS order_finance_line_history (
               id UUID PRIMARY KEY,
               order_uuid UUID NOT NULL,
               work_type_uuid UUID NOT NULL,
               old_amount NUMERIC,
               new_amount NUMERIC,
+              old_prepayment NUMERIC,
+              new_prepayment NUMERIC,
+              old_cost_price NUMERIC,
+              new_cost_price NUMERIC,
               old_is_paid BOOLEAN,
               new_is_paid BOOLEAN,
               old_payment_method TEXT,
@@ -99,6 +117,30 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_finance_line_history_order_changed_at
             ON order_finance_line_history(order_uuid, changed_at DESC);
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE order_finance_line_history
+            ADD COLUMN IF NOT EXISTS old_prepayment NUMERIC;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE order_finance_line_history
+            ADD COLUMN IF NOT EXISTS new_prepayment NUMERIC;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE order_finance_line_history
+            ADD COLUMN IF NOT EXISTS old_cost_price NUMERIC;
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE order_finance_line_history
+            ADD COLUMN IF NOT EXISTS new_cost_price NUMERIC;
             """
         )
         cur.execute(
@@ -161,6 +203,8 @@ class OrderFinanceLineIn(BaseModel):
     order_uuid: uuid.UUID
     work_type_uuid: uuid.UUID
     amount: float | None = None
+    prepayment: float | None = None
+    cost_price: float | None = None
     currency: str | None = None
     payment_method: Literal["card", "cash"] | None = None
     is_paid: bool | None = None
@@ -171,6 +215,8 @@ class OrderFinanceLineOut(BaseModel):
     order_uuid: uuid.UUID
     work_type_uuid: uuid.UUID
     amount: float
+    prepayment: float | None = None
+    cost_price: float | None = None
     currency: str
     payment_method: Literal["card", "cash"] | None
     is_paid: bool
@@ -184,12 +230,21 @@ class FinanceLineHistoryOut(BaseModel):
     work_type_uuid: uuid.UUID
     old_amount: float | None = None
     new_amount: float | None = None
+    old_prepayment: float | None = None
+    new_prepayment: float | None = None
+    old_cost_price: float | None = None
+    new_cost_price: float | None = None
     old_is_paid: bool | None = None
     new_is_paid: bool | None = None
     old_payment_method: str | None = None
     new_payment_method: str | None = None
     changed_by_uuid: str | None = None
     changed_by_name: str = ""
+    changed_at: datetime
+
+
+class FinanceChangedOrderOut(BaseModel):
+    order_uuid: uuid.UUID
     changed_at: datetime
 
 
@@ -342,6 +397,8 @@ def get_price_rule(work_type_uuid: uuid.UUID) -> PriceRuleOut:
 @app.put("/finance/order-lines", response_model=OrderFinanceLineOut)
 def upsert_order_line(body: OrderFinanceLineIn, request: Request) -> OrderFinanceLineOut:
     amount = body.amount
+    prepayment = body.prepayment
+    cost_price = body.cost_price
     currency = body.currency.strip() if body.currency else None
     payment_method = body.payment_method
     is_paid = bool(body.is_paid) if body.is_paid is not None else False
@@ -351,7 +408,7 @@ def upsert_order_line(body: OrderFinanceLineIn, request: Request) -> OrderFinanc
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT amount, is_paid, payment_method
+            SELECT amount, prepayment, cost_price, is_paid, payment_method
             FROM order_finance_lines
             WHERE order_uuid=%s AND work_type_uuid=%s
             """,
@@ -378,24 +435,30 @@ def upsert_order_line(body: OrderFinanceLineIn, request: Request) -> OrderFinanc
 
         cur.execute(
             """
-            INSERT INTO order_finance_lines (id, order_uuid, work_type_uuid, amount, currency, payment_method, is_paid, source, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            INSERT INTO order_finance_lines (id, order_uuid, work_type_uuid, amount, prepayment, cost_price, currency, payment_method, is_paid, source, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (order_uuid, work_type_uuid)
-            DO UPDATE SET amount=EXCLUDED.amount, currency=EXCLUDED.currency, payment_method=EXCLUDED.payment_method, is_paid=EXCLUDED.is_paid, source=EXCLUDED.source, updated_at=NOW()
-            RETURNING id, order_uuid, work_type_uuid, amount, currency, payment_method, is_paid, source, updated_at
+            DO UPDATE SET amount=EXCLUDED.amount, prepayment=EXCLUDED.prepayment, cost_price=EXCLUDED.cost_price, currency=EXCLUDED.currency, payment_method=EXCLUDED.payment_method, is_paid=EXCLUDED.is_paid, source=EXCLUDED.source, updated_at=NOW()
+            RETURNING id, order_uuid, work_type_uuid, amount, prepayment, cost_price, currency, payment_method, is_paid, source, updated_at
             """,
-            (uuid.uuid4(), body.order_uuid, body.work_type_uuid, amount, currency, payment_method, is_paid, source),
+            (uuid.uuid4(), body.order_uuid, body.work_type_uuid, amount, prepayment, cost_price, currency, payment_method, is_paid, source),
         )
         row = cur.fetchone()
         old_amount = float(previous[0]) if previous and previous[0] is not None else None
-        old_is_paid = bool(previous[1]) if previous and previous[1] is not None else None
-        old_payment_method = str(previous[2]) if previous and previous[2] is not None else None
+        old_prepayment = float(previous[1]) if previous and previous[1] is not None else None
+        old_cost_price = float(previous[2]) if previous and previous[2] is not None else None
+        old_is_paid = bool(previous[3]) if previous and previous[3] is not None else None
+        old_payment_method = str(previous[4]) if previous and previous[4] is not None else None
         new_amount = float(row[3])
-        new_is_paid = bool(row[6])
-        new_payment_method = str(row[5])
+        new_prepayment = float(row[4]) if row[4] is not None else None
+        new_cost_price = float(row[5]) if row[5] is not None else None
+        new_is_paid = bool(row[8])
+        new_payment_method = str(row[7]) if row[7] is not None else None
         changed = (
             previous is None
             or old_amount != new_amount
+            or old_prepayment != new_prepayment
+            or old_cost_price != new_cost_price
             or old_is_paid != new_is_paid
             or old_payment_method != new_payment_method
         )
@@ -405,11 +468,13 @@ def upsert_order_line(body: OrderFinanceLineIn, request: Request) -> OrderFinanc
                 INSERT INTO order_finance_line_history (
                   id, order_uuid, work_type_uuid,
                   old_amount, new_amount,
+                  old_prepayment, new_prepayment,
+                  old_cost_price, new_cost_price,
                   old_is_paid, new_is_paid,
                   old_payment_method, new_payment_method,
                   changed_by_uuid, changed_by_name, changed_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 """,
                 (
                     uuid.uuid4(),
@@ -417,6 +482,10 @@ def upsert_order_line(body: OrderFinanceLineIn, request: Request) -> OrderFinanc
                     body.work_type_uuid,
                     old_amount,
                     new_amount,
+                    old_prepayment,
+                    new_prepayment,
+                    old_cost_price,
+                    new_cost_price,
                     old_is_paid,
                     new_is_paid,
                     old_payment_method,
@@ -430,11 +499,13 @@ def upsert_order_line(body: OrderFinanceLineIn, request: Request) -> OrderFinanc
         order_uuid=row[1],
         work_type_uuid=row[2],
         amount=float(row[3]),
-        currency=row[4],
-        payment_method=row[5],
-        is_paid=bool(row[6]),
-        source=row[7],
-        updated_at=row[8],
+        prepayment=float(row[4]) if row[4] is not None else None,
+        cost_price=float(row[5]) if row[5] is not None else None,
+        currency=row[6],
+        payment_method=row[7],
+        is_paid=bool(row[8]),
+        source=row[9],
+        updated_at=row[10],
     )
 
 
@@ -447,6 +518,8 @@ def list_order_history(order_uuid: uuid.UUID, limit: int = 100) -> list[FinanceL
             SELECT
               id, order_uuid, work_type_uuid,
               old_amount, new_amount,
+              old_prepayment, new_prepayment,
+              old_cost_price, new_cost_price,
               old_is_paid, new_is_paid,
               old_payment_method, new_payment_method,
               changed_by_uuid, changed_by_name, changed_at
@@ -465,16 +538,44 @@ def list_order_history(order_uuid: uuid.UUID, limit: int = 100) -> list[FinanceL
             work_type_uuid=row[2],
             old_amount=float(row[3]) if row[3] is not None else None,
             new_amount=float(row[4]) if row[4] is not None else None,
-            old_is_paid=bool(row[5]) if row[5] is not None else None,
-            new_is_paid=bool(row[6]) if row[6] is not None else None,
-            old_payment_method=row[7],
-            new_payment_method=row[8],
-            changed_by_uuid=row[9],
-            changed_by_name=row[10] or "",
-            changed_at=row[11],
+            old_prepayment=float(row[5]) if row[5] is not None else None,
+            new_prepayment=float(row[6]) if row[6] is not None else None,
+            old_cost_price=float(row[7]) if row[7] is not None else None,
+            new_cost_price=float(row[8]) if row[8] is not None else None,
+            old_is_paid=bool(row[9]) if row[9] is not None else None,
+            new_is_paid=bool(row[10]) if row[10] is not None else None,
+            old_payment_method=row[11],
+            new_payment_method=row[12],
+            changed_by_uuid=row[13],
+            changed_by_name=row[14] or "",
+            changed_at=row[15],
         )
         for row in rows
     ]
+
+
+@app.get("/finance/orders/changed-by-date", response_model=list[FinanceChangedOrderOut])
+def list_orders_changed_by_date(changed_from: str, changed_to: str) -> list[FinanceChangedOrderOut]:
+    with db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT h.order_uuid, MAX(h.changed_at) AS changed_at
+            FROM order_finance_line_history h
+            JOIN order_finance_lines l
+              ON l.order_uuid = h.order_uuid
+             AND l.work_type_uuid = h.work_type_uuid
+            WHERE h.changed_at >= (%s::date)
+              AND h.changed_at < ((%s::date) + INTERVAL '1 day')
+              AND COALESCE(h.new_amount, h.old_amount) IS NOT NULL
+              AND h.new_is_paid = TRUE
+              AND l.is_paid = TRUE
+            GROUP BY h.order_uuid
+            ORDER BY MAX(h.changed_at) DESC
+            """,
+            (changed_from, changed_to),
+        )
+        rows = cur.fetchall()
+    return [FinanceChangedOrderOut(order_uuid=row[0], changed_at=row[1]) for row in rows]
 
 
 @app.get("/finance/orders/{order_uuid}/lines", response_model=list[OrderFinanceLineOut])
@@ -482,7 +583,7 @@ def list_order_lines(order_uuid: uuid.UUID) -> list[OrderFinanceLineOut]:
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, order_uuid, work_type_uuid, amount, currency, payment_method, is_paid, source, updated_at
+            SELECT id, order_uuid, work_type_uuid, amount, prepayment, cost_price, currency, payment_method, is_paid, source, updated_at
             FROM order_finance_lines
             WHERE order_uuid=%s
             ORDER BY updated_at DESC
@@ -496,11 +597,13 @@ def list_order_lines(order_uuid: uuid.UUID) -> list[OrderFinanceLineOut]:
             order_uuid=row[1],
             work_type_uuid=row[2],
             amount=float(row[3]),
-            currency=row[4],
-            payment_method=row[5],
-            is_paid=bool(row[6]),
-            source=row[7],
-            updated_at=row[8],
+            prepayment=float(row[4]) if row[4] is not None else None,
+            cost_price=float(row[5]) if row[5] is not None else None,
+            currency=row[6],
+            payment_method=row[7],
+            is_paid=bool(row[8]),
+            source=row[9],
+            updated_at=row[10],
         )
         for row in rows
     ]

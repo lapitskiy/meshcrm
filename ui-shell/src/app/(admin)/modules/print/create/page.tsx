@@ -6,6 +6,7 @@ import Label from "@/components/form/Label";
 import { getGatewayBaseUrl } from "@/lib/gateway";
 import { useSearchParams } from "next/navigation";
 import { EditorContent, useEditor } from "@tiptap/react";
+import { Mark, mergeAttributes } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import Link from "@tiptap/extension-link";
 import Image from "@tiptap/extension-image";
@@ -26,6 +27,33 @@ type PrintCategory = {
   id: string;
   name: string;
 };
+
+const DEFAULT_PAGE_WIDTH_MM = 200;
+const DEFAULT_PAGE_HEIGHT_MM = 300;
+const DEFAULT_PAGE_MARGIN_MM = 0;
+const FONT_SIZE_OPTIONS = ["10", "12", "14", "16", "18", "20", "24", "28", "32"];
+
+const FontSize = Mark.create({
+  name: "fontSize",
+  addAttributes() {
+    return {
+      size: {
+        default: null,
+        parseHTML: (element) => element.style.fontSize.replace("px", "") || null,
+        renderHTML: (attributes) => {
+          if (!attributes.size) return {};
+          return { style: `font-size: ${attributes.size}px` };
+        },
+      },
+    };
+  },
+  parseHTML() {
+    return [{ tag: "span[style*=font-size]" }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["span", mergeAttributes(HTMLAttributes), 0];
+  },
+});
 
 const ResizableImage = Image.extend({
   addAttributes() {
@@ -48,6 +76,20 @@ function parseWidthPercent(raw: string): number {
   const value = Number.parseInt(String(raw || "").replace("%", "").trim(), 10);
   if (!Number.isFinite(value)) return 100;
   return Math.max(10, Math.min(100, value));
+}
+
+function parsePageSizeMm(raw: string, fallback: number, min: number, max: number): number {
+  const value = Number.parseInt(String(raw || "").trim(), 10);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, value));
+}
+
+function parseOptionalMm(raw: string, min: number, max: number): number | null {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return null;
+  const value = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(value)) return null;
+  return Math.max(min, Math.min(max, value));
 }
 
 function makeHtmlReadable(html: string): { readableHtml: string; srcMap: Record<string, string> } {
@@ -116,6 +158,14 @@ export default function PrintCreateFormPage() {
   const editingId = String(search.get("id") || "").trim() || null;
   const [title, setTitle] = useState("");
   const [categoryId, setCategoryId] = useState("");
+  const [pageWidthMm, setPageWidthMm] = useState(String(DEFAULT_PAGE_WIDTH_MM));
+  const [pageHeightMm, setPageHeightMm] = useState(String(DEFAULT_PAGE_HEIGHT_MM));
+  const [pageMarginMm, setPageMarginMm] = useState(String(DEFAULT_PAGE_MARGIN_MM));
+  const [pageAutoHeight, setPageAutoHeight] = useState(false);
+  const [pageOffsetXMm, setPageOffsetXMm] = useState("");
+  const [pageOffsetYMm, setPageOffsetYMm] = useState("");
+  const [pageRotationDeg, setPageRotationDeg] = useState("");
+  const [qzEnabled, setQzEnabled] = useState(false);
   const [categories, setCategories] = useState<PrintCategory[]>([]);
   const [vars, setVars] = useState<PrintVariable[]>([]);
   const [busy, setBusy] = useState(false);
@@ -134,6 +184,7 @@ export default function PrintCreateFormPage() {
   const editor = useEditor({
     extensions: [
       StarterKit,
+      FontSize,
       Link.configure({ openOnClick: false }),
       Table.configure({
         resizable: false,
@@ -180,6 +231,14 @@ export default function PrintCreateFormPage() {
           const form = await formResp.json();
           setTitle(String(form?.title || ""));
           setCategoryId(String(form?.category_id || ""));
+          setPageWidthMm(String(form?.page_width_mm || DEFAULT_PAGE_WIDTH_MM));
+          setPageHeightMm(String(form?.page_height_mm || DEFAULT_PAGE_HEIGHT_MM));
+          setPageMarginMm(String(form?.page_margin_mm ?? DEFAULT_PAGE_MARGIN_MM));
+          setPageAutoHeight(Boolean(form?.page_auto_height));
+          setPageOffsetXMm(form?.page_offset_x_mm == null ? "" : String(form.page_offset_x_mm));
+          setPageOffsetYMm(form?.page_offset_y_mm == null ? "" : String(form.page_offset_y_mm));
+          setPageRotationDeg(form?.page_rotation_deg == null ? "" : String(form.page_rotation_deg));
+          setQzEnabled(Boolean(form?.qz_enabled));
           if (editor) {
             editor.commands.setContent(form?.content_json || "<p></p>");
           }
@@ -213,6 +272,12 @@ export default function PrintCreateFormPage() {
       editor.off("update", syncHtml);
     };
   }, [editor, htmlMode]);
+
+  useEffect(() => {
+    if (!editor) return;
+    const width = parsePageSizeMm(pageWidthMm, DEFAULT_PAGE_WIDTH_MM, 20, 2000);
+    editor.view.dom.style.maxWidth = `${width}mm`;
+  }, [editor, pageWidthMm]);
 
   const insertVariable = (v: PrintVariable) => {
     if (!editor) return;
@@ -281,11 +346,23 @@ export default function PrintCreateFormPage() {
       if (!cleanTitle) throw new Error("Название формы обязательно");
       const cleanCategoryId = categoryId.trim();
       if (!cleanCategoryId) throw new Error("Категория обязательна");
+      const cleanPageWidthMm = parsePageSizeMm(pageWidthMm, DEFAULT_PAGE_WIDTH_MM, 20, 2000);
+      const cleanPageHeightMm = parsePageSizeMm(pageHeightMm, DEFAULT_PAGE_HEIGHT_MM, 20, 2000);
+      const cleanPageMarginMm = parsePageSizeMm(pageMarginMm, DEFAULT_PAGE_MARGIN_MM, 0, 200);
+      const cleanRotationDeg = pageRotationDeg ? Number(pageRotationDeg) : null;
       const payload = {
         title: cleanTitle,
         category_id: cleanCategoryId,
         content_json: editor.getJSON(),
         content_html: normalizedHtml,
+        page_width_mm: cleanPageWidthMm,
+        page_height_mm: cleanPageHeightMm,
+        page_margin_mm: cleanPageMarginMm,
+        page_auto_height: pageAutoHeight,
+        page_offset_x_mm: parseOptionalMm(pageOffsetXMm, -2000, 2000),
+        page_offset_y_mm: parseOptionalMm(pageOffsetYMm, -2000, 2000),
+        page_rotation_deg: cleanRotationDeg,
+        qz_enabled: qzEnabled,
       };
       const url = editingId ? `${base}/documents/print/forms/${encodeURIComponent(editingId)}` : `${base}/documents/print/forms`;
       const method = editingId ? "PUT" : "POST";
@@ -321,6 +398,19 @@ export default function PrintCreateFormPage() {
     const current = parseWidthPercent(String(attrs?.width || "100%"));
     const next = Math.max(10, Math.min(100, current + delta));
     editor.chain().focus().updateAttributes("image", { width: `${next}%` }).run();
+  };
+
+  const applyFontSize = (size: string) => {
+    if (!editor) return;
+    if (htmlMode) {
+      setError("Размер шрифта доступен только в Visual mode");
+      return;
+    }
+    if (!size) {
+      editor.chain().focus().unsetMark("fontSize").run();
+      return;
+    }
+    editor.chain().focus().setMark("fontSize", { size }).run();
   };
 
   const insertImageGrid = (cols: number) => {
@@ -397,6 +487,100 @@ export default function PrintCreateFormPage() {
             )}
           </div>
 
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+            <div>
+              <Label>Ширина листа, мм</Label>
+              <Input
+                type="number"
+                min="20"
+                max="2000"
+                value={pageWidthMm}
+                onChange={(e) => setPageWidthMm(e.target.value)}
+                placeholder="200"
+              />
+            </div>
+            <div>
+              <Label>Высота листа, мм</Label>
+              <Input
+                type="number"
+                min="20"
+                max="2000"
+                value={pageHeightMm}
+                onChange={(e) => setPageHeightMm(e.target.value)}
+                placeholder="300"
+                disabled={pageAutoHeight}
+              />
+            </div>
+            <div>
+              <Label>Поля, мм</Label>
+              <Input
+                type="number"
+                min="0"
+                max="200"
+                value={pageMarginMm}
+                onChange={(e) => setPageMarginMm(e.target.value)}
+                placeholder="0"
+              />
+            </div>
+          </div>
+          <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+            <input
+              type="checkbox"
+              checked={pageAutoHeight}
+              onChange={(e) => setPageAutoHeight(e.target.checked)}
+              className="h-4 w-4 rounded border-gray-300"
+            />
+            Авто высота: ширина фиксированная, высота зависит от данных
+          </label>
+          <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+            <input
+              type="checkbox"
+              checked={qzEnabled}
+              onChange={(e) => setQzEnabled(e.target.checked)}
+              className="h-4 w-4 rounded border-gray-300"
+            />
+            QZ Tray: печатать как label через локальный QZ-принтер
+          </label>
+
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+            <div>
+              <Label>Смещение X, мм</Label>
+              <Input
+                type="number"
+                min="-2000"
+                max="2000"
+                value={pageOffsetXMm}
+                onChange={(e) => setPageOffsetXMm(e.target.value)}
+                placeholder="Не используется"
+              />
+            </div>
+            <div>
+              <Label>Смещение Y, мм</Label>
+              <Input
+                type="number"
+                min="-2000"
+                max="2000"
+                value={pageOffsetYMm}
+                onChange={(e) => setPageOffsetYMm(e.target.value)}
+                placeholder="Не используется"
+              />
+            </div>
+            <div>
+              <Label>Поворот</Label>
+              <select
+                className="h-11 w-full rounded-lg border border-gray-200 bg-transparent px-4 py-2.5 text-sm text-gray-800 dark:border-gray-800 dark:text-white/90"
+                value={pageRotationDeg}
+                onChange={(e) => setPageRotationDeg(e.target.value)}
+              >
+                <option value="">Не используется</option>
+                <option value="0">0°</option>
+                <option value="90">90°</option>
+                <option value="180">180°</option>
+                <option value="270">270°</option>
+              </select>
+            </div>
+          </div>
+
           <div className="flex flex-wrap gap-2">
             <button
               className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
@@ -426,6 +610,19 @@ export default function PrintCreateFormPage() {
             >
               1. list
             </button>
+            <select
+              className="h-8 rounded-lg border border-gray-200 bg-transparent px-3 py-1 text-sm text-gray-700 dark:border-gray-800 dark:text-gray-200"
+              value={String(editor?.getAttributes("fontSize")?.size || "")}
+              onChange={(e) => applyFontSize(e.target.value)}
+              disabled={!editor || htmlMode}
+            >
+              <option value="">Размер</option>
+              {FONT_SIZE_OPTIONS.map((size) => (
+                <option key={size} value={size}>
+                  {size}px
+                </option>
+              ))}
+            </select>
             <button
               className="rounded-lg border border-gray-200 px-3 py-1 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
               onClick={onInsertImageUrl}
@@ -505,7 +702,7 @@ export default function PrintCreateFormPage() {
           <div className="text-xs text-gray-500 dark:text-gray-400">
             {htmlMode
               ? "Режим HTML: base64 src у изображений скрыт токенами (__IMG_DATA_N__), при применении восстанавливается."
-              : "Режим предпросмотра: ширина листа A4 (210mm), таблицы сохраняются с fixed-layout для стабильной печати."}
+              : `Режим предпросмотра: ширина ${parsePageSizeMm(pageWidthMm, DEFAULT_PAGE_WIDTH_MM, 20, 2000)}mm, высота ${pageAutoHeight ? "auto" : `${parsePageSizeMm(pageHeightMm, DEFAULT_PAGE_HEIGHT_MM, 20, 2000)}mm`}, смещение применяется только при печати.`}
           </div>
 
           <Button size="sm" disabled={busy || !editor} onClick={onSave}>

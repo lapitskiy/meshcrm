@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from typing import Literal
 from uuid import UUID, uuid4
 from urllib.request import urlopen
 
@@ -12,6 +13,10 @@ from app.infrastructure.db.connection import get_connection
 router = APIRouter(prefix="/print", tags=["print"])
 
 REGISTRY_BASE_URL = "http://plugin-registry:8000"
+DEFAULT_PAGE_WIDTH_MM = 200
+DEFAULT_PAGE_HEIGHT_MM = 300
+DEFAULT_PAGE_MARGIN_MM = 0
+DEFAULT_PAGE_AUTO_HEIGHT = False
 
 
 class PrintFormCreateIn(BaseModel):
@@ -19,6 +24,14 @@ class PrintFormCreateIn(BaseModel):
     content_json: dict = Field(default_factory=dict)
     content_html: str = ""
     category_id: UUID | None = None
+    page_width_mm: int = Field(default=DEFAULT_PAGE_WIDTH_MM, ge=20, le=2000)
+    page_height_mm: int = Field(default=DEFAULT_PAGE_HEIGHT_MM, ge=20, le=2000)
+    page_margin_mm: int = Field(default=DEFAULT_PAGE_MARGIN_MM, ge=0, le=200)
+    page_auto_height: bool = DEFAULT_PAGE_AUTO_HEIGHT
+    page_offset_x_mm: int | None = Field(default=None, ge=-2000, le=2000)
+    page_offset_y_mm: int | None = Field(default=None, ge=-2000, le=2000)
+    page_rotation_deg: Literal[0, 90, 180, 270] | None = None
+    qz_enabled: bool = False
 
 
 class PrintFormOut(BaseModel):
@@ -28,6 +41,14 @@ class PrintFormOut(BaseModel):
     content_html: str
     category_id: UUID | None = None
     category_name: str = ""
+    page_width_mm: int = DEFAULT_PAGE_WIDTH_MM
+    page_height_mm: int = DEFAULT_PAGE_HEIGHT_MM
+    page_margin_mm: int = DEFAULT_PAGE_MARGIN_MM
+    page_auto_height: bool = DEFAULT_PAGE_AUTO_HEIGHT
+    page_offset_x_mm: int | None = None
+    page_offset_y_mm: int | None = None
+    page_rotation_deg: Literal[0, 90, 180, 270] | None = None
+    qz_enabled: bool = False
     created_by_uuid: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -38,6 +59,14 @@ class PrintFormUpdateIn(BaseModel):
     content_json: dict = Field(default_factory=dict)
     content_html: str = ""
     category_id: UUID | None = None
+    page_width_mm: int = Field(default=DEFAULT_PAGE_WIDTH_MM, ge=20, le=2000)
+    page_height_mm: int = Field(default=DEFAULT_PAGE_HEIGHT_MM, ge=20, le=2000)
+    page_margin_mm: int = Field(default=DEFAULT_PAGE_MARGIN_MM, ge=0, le=200)
+    page_auto_height: bool = DEFAULT_PAGE_AUTO_HEIGHT
+    page_offset_x_mm: int | None = Field(default=None, ge=-2000, le=2000)
+    page_offset_y_mm: int | None = Field(default=None, ge=-2000, le=2000)
+    page_rotation_deg: Literal[0, 90, 180, 270] | None = None
+    qz_enabled: bool = False
 
 
 class PrintFormListItemOut(BaseModel):
@@ -45,6 +74,14 @@ class PrintFormListItemOut(BaseModel):
     title: str
     category_id: UUID | None = None
     category_name: str = ""
+    page_width_mm: int = DEFAULT_PAGE_WIDTH_MM
+    page_height_mm: int = DEFAULT_PAGE_HEIGHT_MM
+    page_margin_mm: int = DEFAULT_PAGE_MARGIN_MM
+    page_auto_height: bool = DEFAULT_PAGE_AUTO_HEIGHT
+    page_offset_x_mm: int | None = None
+    page_offset_y_mm: int | None = None
+    page_rotation_deg: Literal[0, 90, 180, 270] | None = None
+    qz_enabled: bool = False
     updated_at: datetime
 
 
@@ -238,9 +275,17 @@ def create_form(body: PrintFormCreateIn, request: Request) -> PrintFormOut:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO print_forms (id, title, content_json, content_html, category_id, created_by_uuid, created_at, updated_at)
-                VALUES (%s, %s, %s::jsonb, %s, %s, %s, NOW(), NOW())
-                RETURNING id, title, content_json, content_html, category_id, created_by_uuid, created_at, updated_at
+                INSERT INTO print_forms (
+                  id, title, content_json, content_html, category_id,
+                  page_width_mm, page_height_mm, page_margin_mm, page_auto_height,
+                  page_offset_x_mm, page_offset_y_mm, page_rotation_deg, qz_enabled,
+                  created_by_uuid, created_at, updated_at
+                )
+                VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                RETURNING id, title, content_json, content_html, category_id,
+                          page_width_mm, page_height_mm, page_margin_mm, page_auto_height,
+                          page_offset_x_mm, page_offset_y_mm, page_rotation_deg, qz_enabled,
+                          created_by_uuid, created_at, updated_at
                 """,
                 (
                     str(form_id),
@@ -248,6 +293,14 @@ def create_form(body: PrintFormCreateIn, request: Request) -> PrintFormOut:
                     json.dumps(body.content_json or {}),
                     str(body.content_html or ""),
                     str(body.category_id) if body.category_id else None,
+                    body.page_width_mm,
+                    body.page_height_mm,
+                    body.page_margin_mm,
+                    body.page_auto_height,
+                    body.page_offset_x_mm,
+                    body.page_offset_y_mm,
+                    body.page_rotation_deg,
+                    body.qz_enabled,
                     _user_uuid_from_headers(request),
                 ),
             )
@@ -264,9 +317,17 @@ def create_form(body: PrintFormCreateIn, request: Request) -> PrintFormOut:
             content_html=row[3] or "",
             category_id=UUID(str(row[4])) if row[4] else None,
             category_name=category_name,
-            created_by_uuid=row[5],
-            created_at=row[6],
-            updated_at=row[7],
+            page_width_mm=row[5] or DEFAULT_PAGE_WIDTH_MM,
+            page_height_mm=row[6] or DEFAULT_PAGE_HEIGHT_MM,
+            page_margin_mm=row[7] or DEFAULT_PAGE_MARGIN_MM,
+            page_auto_height=bool(row[8]),
+            page_offset_x_mm=row[9],
+            page_offset_y_mm=row[10],
+            page_rotation_deg=row[11],
+            qz_enabled=bool(row[12]),
+            created_by_uuid=row[13],
+            created_at=row[14],
+            updated_at=row[15],
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -284,7 +345,9 @@ def list_forms(limit: int = 200) -> list[PrintFormListItemOut]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT f.id, f.title, f.category_id, COALESCE(c.name, ''), f.updated_at
+                SELECT f.id, f.title, f.category_id, COALESCE(c.name, ''),
+                       f.page_width_mm, f.page_height_mm, f.page_margin_mm, f.page_auto_height,
+                       f.page_offset_x_mm, f.page_offset_y_mm, f.page_rotation_deg, f.qz_enabled, f.updated_at
                 FROM print_forms f
                 LEFT JOIN print_categories c ON c.id = f.category_id
                 ORDER BY updated_at DESC
@@ -299,7 +362,15 @@ def list_forms(limit: int = 200) -> list[PrintFormListItemOut]:
                 title=r[1],
                 category_id=UUID(str(r[2])) if r[2] else None,
                 category_name=r[3] or "",
-                updated_at=r[4],
+                page_width_mm=r[4] or DEFAULT_PAGE_WIDTH_MM,
+                page_height_mm=r[5] or DEFAULT_PAGE_HEIGHT_MM,
+                page_margin_mm=r[6] or DEFAULT_PAGE_MARGIN_MM,
+                page_auto_height=bool(r[7]),
+                page_offset_x_mm=r[8],
+                page_offset_y_mm=r[9],
+                page_rotation_deg=r[10],
+                qz_enabled=bool(r[11]),
+                updated_at=r[12],
             )
             for r in rows
         ]
@@ -319,6 +390,8 @@ def get_form(form_id: UUID) -> PrintFormOut:
             cur.execute(
                 """
                 SELECT f.id, f.title, f.content_json, f.content_html, f.category_id, COALESCE(c.name, ''),
+                       f.page_width_mm, f.page_height_mm, f.page_margin_mm, f.page_auto_height,
+                       f.page_offset_x_mm, f.page_offset_y_mm, f.page_rotation_deg, f.qz_enabled,
                        f.created_by_uuid, f.created_at, f.updated_at
                 FROM print_forms f
                 LEFT JOIN print_categories c ON c.id = f.category_id
@@ -336,9 +409,17 @@ def get_form(form_id: UUID) -> PrintFormOut:
             content_html=row[3] or "",
             category_id=UUID(str(row[4])) if row[4] else None,
             category_name=row[5] or "",
-            created_by_uuid=row[6],
-            created_at=row[7],
-            updated_at=row[8],
+            page_width_mm=row[6] or DEFAULT_PAGE_WIDTH_MM,
+            page_height_mm=row[7] or DEFAULT_PAGE_HEIGHT_MM,
+            page_margin_mm=row[8] or DEFAULT_PAGE_MARGIN_MM,
+            page_auto_height=bool(row[9]),
+            page_offset_x_mm=row[10],
+            page_offset_y_mm=row[11],
+            page_rotation_deg=row[12],
+            qz_enabled=bool(row[13]),
+            created_by_uuid=row[14],
+            created_at=row[15],
+            updated_at=row[16],
         )
     except HTTPException:
         raise
@@ -358,15 +439,28 @@ def update_form(form_id: UUID, body: PrintFormUpdateIn) -> PrintFormOut:
             cur.execute(
                 """
                 UPDATE print_forms
-                SET title=%s, content_json=%s::jsonb, content_html=%s, category_id=%s, updated_at=NOW()
+                SET title=%s, content_json=%s::jsonb, content_html=%s, category_id=%s,
+                    page_width_mm=%s, page_height_mm=%s, page_margin_mm=%s, page_auto_height=%s,
+                    page_offset_x_mm=%s, page_offset_y_mm=%s, page_rotation_deg=%s, qz_enabled=%s, updated_at=NOW()
                 WHERE id=%s
-                RETURNING id, title, content_json, content_html, category_id, created_by_uuid, created_at, updated_at
+                RETURNING id, title, content_json, content_html, category_id,
+                          page_width_mm, page_height_mm, page_margin_mm, page_auto_height,
+                          page_offset_x_mm, page_offset_y_mm, page_rotation_deg, qz_enabled,
+                          created_by_uuid, created_at, updated_at
                 """,
                 (
                     body.title.strip(),
                     json.dumps(body.content_json or {}),
                     str(body.content_html or ""),
                     str(body.category_id) if body.category_id else None,
+                    body.page_width_mm,
+                    body.page_height_mm,
+                    body.page_margin_mm,
+                    body.page_auto_height,
+                    body.page_offset_x_mm,
+                    body.page_offset_y_mm,
+                    body.page_rotation_deg,
+                    body.qz_enabled,
                     str(form_id),
                 ),
             )
@@ -385,9 +479,17 @@ def update_form(form_id: UUID, body: PrintFormUpdateIn) -> PrintFormOut:
             content_html=row[3] or "",
             category_id=UUID(str(row[4])) if row[4] else None,
             category_name=category_name,
-            created_by_uuid=row[5],
-            created_at=row[6],
-            updated_at=row[7],
+            page_width_mm=row[5] or DEFAULT_PAGE_WIDTH_MM,
+            page_height_mm=row[6] or DEFAULT_PAGE_HEIGHT_MM,
+            page_margin_mm=row[7] or DEFAULT_PAGE_MARGIN_MM,
+            page_auto_height=bool(row[8]),
+            page_offset_x_mm=row[9],
+            page_offset_y_mm=row[10],
+            page_rotation_deg=row[11],
+            qz_enabled=bool(row[12]),
+            created_by_uuid=row[13],
+            created_at=row[14],
+            updated_at=row[15],
         )
     except HTTPException:
         raise

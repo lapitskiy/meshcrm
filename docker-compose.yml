@@ -47,7 +47,7 @@ services:
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
       # Make issuer stable for local dev
-      KC_HOSTNAME_URL: ${KEYCLOAK_PUBLIC_URL:-https://crm.central-service.ru:3443/auth}
+      KC_HOSTNAME_URL: ${KEYCLOAK_PUBLIC_URL:-https://crm.central-service.ru:3443}
       KC_HOSTNAME_STRICT: "false"
       KC_PROXY_HEADERS: "xforwarded"
     depends_on:
@@ -57,6 +57,7 @@ services:
       - "8081:8080"
     volumes:
       - ./keycloak/realm-hubcrm.json:/opt/keycloak/data/import/realm-hubcrm.json:ro
+      - ./keycloak/themes:/opt/keycloak/themes:ro
 
   keycloak-https:
     image: nginx:1.27-alpine
@@ -181,22 +182,6 @@ services:
       timeout: 5s
       retries: 5
 
-  marketplaces-db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: marketplaces
-      POSTGRES_USER: marketplaces
-      POSTGRES_PASSWORD: ${MARKETPLACES_DB_PASSWORD:-marketplaces_pw}
-    ports:
-      - "5441:5432"
-    volumes:
-      - marketplaces-db-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U marketplaces"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   warehouses-db:
     image: postgres:16-alpine
     environment:
@@ -257,6 +242,38 @@ services:
       - finance-db-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U finance"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  staff-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: staff
+      POSTGRES_USER: staff
+      POSTGRES_PASSWORD: ${STAFF_DB_PASSWORD:-staff_pw}
+    ports:
+      - "5446:5432"
+    volumes:
+      - staff-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U staff"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  communications-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: communications
+      POSTGRES_USER: communications
+      POSTGRES_PASSWORD: ${COMMUNICATIONS_DB_PASSWORD:-communications_pw}
+    ports:
+      - "5447:5432"
+    volumes:
+      - communications-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U communications"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -399,7 +416,6 @@ services:
     build: ./ai-memory
     environment:
       DATABASE_URL: postgresql://ai_memory:${AI_MEMORY_DB_PASSWORD:-ai_memory_pw}@ai-memory-db:5432/ai_memory
-      MARKETPLACES_BASE_URL: http://marketplaces:8000
     depends_on:
       ai-memory-db:
         condition: service_healthy
@@ -413,43 +429,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-
-  marketplaces:
-    build: ./marketplaces
-    environment:
-      DATABASE_URL: postgresql://marketplaces:${MARKETPLACES_DB_PASSWORD:-marketplaces_pw}@marketplaces-db:5432/marketplaces
-      MARKETPLACES_SCHEDULER_TOKEN: ${MARKETPLACES_SCHEDULER_TOKEN:-marketplaces_scheduler_secret}
-    depends_on:
-      marketplaces-db:
-        condition: service_healthy
-    volumes:
-      - ./marketplaces/app:/app/app
-    ports:
-      - "8009:8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
-  marketplaces-scheduler:
-    image: python:3.12-slim
-    working_dir: /app
-    command: ["python", "-m", "app.scheduler"]
-    environment:
-      MARKETPLACES_INTERNAL_URL: http://marketplaces:8000
-      MARKETPLACES_SCHEDULER_TOKEN: ${MARKETPLACES_SCHEDULER_TOKEN:-marketplaces_scheduler_secret}
-      MARKETPLACES_SCHEDULER_DAY_OF_MONTH: ${MARKETPLACES_SCHEDULER_DAY_OF_MONTH:-10}
-      MARKETPLACES_SCHEDULER_RUN_HOUR_UTC: ${MARKETPLACES_SCHEDULER_RUN_HOUR_UTC:-3}
-      MARKETPLACES_SCHEDULER_RUN_MINUTE_UTC: ${MARKETPLACES_SCHEDULER_RUN_MINUTE_UTC:-0}
-      MARKETPLACES_SCHEDULER_RUN_ON_START: ${MARKETPLACES_SCHEDULER_RUN_ON_START:-false}
-    depends_on:
-      marketplaces:
-        condition: service_healthy
-    volumes:
-      - ./marketplaces/app:/app/app
-    restart: unless-stopped
 
   finance:
     build: ./finance
@@ -513,6 +492,9 @@ services:
     build: ./social
     environment:
       DATABASE_URL: postgresql://social:${SOCIAL_DB_PASSWORD:-social_pw}@social-db:5432/social
+      SOCIAL_VK_BACKGROUND_SYNC_ENABLED: ${SOCIAL_VK_BACKGROUND_SYNC_ENABLED:-true}
+      SOCIAL_VK_BACKGROUND_SYNC_INTERVAL_SECONDS: ${SOCIAL_VK_BACKGROUND_SYNC_INTERVAL_SECONDS:-60}
+      SOCIAL_VK_BACKGROUND_SYNC_RUN_ON_START: ${SOCIAL_VK_BACKGROUND_SYNC_RUN_ON_START:-true}
     depends_on:
       social-db:
         condition: service_healthy
@@ -520,6 +502,43 @@ services:
       - ./social/app:/app/app
     ports:
       - "8013:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  staff:
+    build: ./staff
+    environment:
+      DATABASE_URL: postgresql://staff:${STAFF_DB_PASSWORD:-staff_pw}@staff-db:5432/staff
+      WAREHOUSES_BASE_URL: http://warehouses:8000
+    depends_on:
+      staff-db:
+        condition: service_healthy
+    volumes:
+      - ./staff/app:/app/app
+    ports:
+      - "8014:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  communications:
+    build: ./communications
+    environment:
+      DATABASE_URL: postgresql://communications:${COMMUNICATIONS_DB_PASSWORD:-communications_pw}@communications-db:5432/communications
+    depends_on:
+      communications-db:
+        condition: service_healthy
+    volumes:
+      - ./communications/app:/app/app
+    ports:
+      - "8015:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -563,7 +582,7 @@ services:
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
       # used for issuer validation; should match token "iss"
       # Accept both internal and public issuer values to avoid browser flow mismatch.
-      OIDC_ISSUER: ${OIDC_ISSUER:-http://keycloak:8080/realms/${KEYCLOAK_REALM:-hubcrm},https://crm.central-service.ru:3443/auth/realms/${KEYCLOAK_REALM:-hubcrm}}
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://keycloak:8080/realms/${KEYCLOAK_REALM:-hubcrm},https://crm.central-service.ru:3443/realms/${KEYCLOAK_REALM:-hubcrm}}
       # if empty, audience is not verified (dev-friendly)
       OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
       CASES_BASE_URL: http://core-cases:8000
@@ -573,19 +592,18 @@ services:
       CONTACTS_BASE_URL: http://contacts:8000
       ORDERS_BASE_URL: http://orders:8000
       AI_MEMORY_BASE_URL: http://ai-memory:8000
-      MARKETPLACES_BASE_URL: http://marketplaces:8000
       FINANCE_BASE_URL: http://finance:8000
       WAREHOUSES_BASE_URL: http://warehouses:8000
       SKUPKA_BASE_URL: http://skupka:8000
       SOCIAL_BASE_URL: http://social:8000
+      STAFF_BASE_URL: http://staff:8000
+      COMMUNICATIONS_BASE_URL: http://communications:8000
     depends_on:
       keycloak:
         condition: service_started
       core-cases:
         condition: service_healthy
       plugin-registry:
-        condition: service_healthy
-      marketplaces:
         condition: service_healthy
       finance:
         condition: service_healthy
@@ -594,6 +612,10 @@ services:
       skupka:
         condition: service_healthy
       social:
+        condition: service_healthy
+      staff:
+        condition: service_healthy
+      communications:
         condition: service_healthy
     ports:
       - "8080:8000"
@@ -623,7 +645,7 @@ services:
       npm run dev -- --hostname 0.0.0.0 --port 3000"
     environment:
       NEXT_PUBLIC_GATEWAY_URL: ${GATEWAY_PUBLIC_URL:-https://crm.central-service.ru:3443/api}
-      NEXT_PUBLIC_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-https://crm.central-service.ru:3443/auth}
+      NEXT_PUBLIC_KEYCLOAK_URL: ${KEYCLOAK_PUBLIC_URL:-https://crm.central-service.ru:3443}
       NEXT_PUBLIC_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-hubcrm}
       NEXT_PUBLIC_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-hubcrm-ui}
       WATCHPACK_POLLING: "true"
@@ -657,9 +679,10 @@ volumes:
   contacts-db-data:
   orders-db-data:
   ai-memory-db-data:
-  marketplaces-db-data:
   finance-db-data:
   warehouses-db-data:
   skupka-db-data:
   social-db-data:
+  staff-db-data:
+  communications-db-data:
   ui-shell-node-modules:

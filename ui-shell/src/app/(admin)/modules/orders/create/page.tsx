@@ -24,11 +24,13 @@ type ServiceCategoryAccessSummary = {
 type WorkType = {
   id: string;
   name: string;
+  usage_count: number;
 };
 
 type ServiceObject = {
   id: string;
   name: string;
+  usage_count: number;
 };
 
 type ModuleLink = {
@@ -159,6 +161,7 @@ export default function OrdersCreatePage() {
   const [warehouseOptions, setWarehouseOptions] = useState<WarehouseOption[]>([]);
   const [createBusy, setCreateBusy] = useState(false);
   const [createSuccess, setCreateSuccess] = useState<string | null>(null);
+  const [receiptIssued, setReceiptIssued] = useState(false);
 
   const [error, setError] = useState<string | null>(null);
 
@@ -311,6 +314,7 @@ export default function OrdersCreatePage() {
     setRelatedModuleIndex(0);
     setModuleFieldValues({});
     setContactHasNoPhone(false);
+    setReceiptIssued(false);
     closeDropdown();
   };
 
@@ -569,6 +573,8 @@ export default function OrdersCreatePage() {
           initialValues[cfg.moduleName]["is_paid"] = "";
           for (const wt of selectedWorkTypes) {
             initialValues[cfg.moduleName][`amount:${wt.id}`] = "";
+            initialValues[cfg.moduleName][`prepayment:${wt.id}`] = "";
+            initialValues[cfg.moduleName][`cost_price:${wt.id}`] = "";
           }
         } else if (cfg.warehouseByAccess) {
           initialValues[cfg.moduleName]["warehouse_id"] = "";
@@ -653,7 +659,7 @@ export default function OrdersCreatePage() {
         } else {
           const name = String(contactValues.name || "").trim();
           const phone = String(contactValues.phone || "").trim();
-          if (name && phone && phone !== "+7" && contactsCfg.listEndpoint) {
+          if (phone && phone !== "+7" && contactsCfg.listEndpoint) {
             const createContactResp = await fetch(`${base}${contactsCfg.listEndpoint}`, {
               method: "POST",
               headers: { "content-type": "application/json", ...(await authHeaders()) },
@@ -706,6 +712,7 @@ export default function OrdersCreatePage() {
         warehouse_id: warehouseId || null,
         contact_uuid: contactUuid || null,
         related_modules: moduleFieldValues,
+        receipt_issued: receiptIssued,
       };
 
       const createOrderResp = await fetch(`${base}/orders/orders`, {
@@ -730,10 +737,20 @@ export default function OrdersCreatePage() {
         if (financeValues.is_paid === "yes" || financeValues.is_paid === "no") {
           for (const wt of selectedWorkTypes) {
             const amountRaw = String(financeValues[`amount:${wt.id}`] || "").replace(",", ".").trim();
+            const prepaymentRaw = String(financeValues[`prepayment:${wt.id}`] || "").replace(",", ".").trim();
+            const costPriceRaw = String(financeValues[`cost_price:${wt.id}`] || "").replace(",", ".").trim();
             if (!amountRaw) continue;
             const amountNum = Number(amountRaw);
             if (!Number.isFinite(amountNum)) {
               throw new Error(`finance amount invalid for work type: ${wt.label}`);
+            }
+            const prepaymentNum = prepaymentRaw ? Number(prepaymentRaw) : null;
+            if (prepaymentRaw && !Number.isFinite(prepaymentNum)) {
+              throw new Error(`finance prepayment invalid for work type: ${wt.label}`);
+            }
+            const costPriceNum = costPriceRaw ? Number(costPriceRaw) : null;
+            if (costPriceRaw && !Number.isFinite(costPriceNum)) {
+              throw new Error(`finance cost price invalid for work type: ${wt.label}`);
             }
             const financeResp = await fetch(`${base}/finance/finance/order-lines`, {
               method: "PUT",
@@ -742,6 +759,8 @@ export default function OrdersCreatePage() {
                 order_uuid: orderUuid,
                 work_type_uuid: wt.id,
                 amount: amountNum,
+                prepayment: prepaymentNum,
+                cost_price: costPriceNum,
                 payment_method: null,
                 is_paid: isPaid,
               }),
@@ -885,7 +904,12 @@ export default function OrdersCreatePage() {
       const filled = cfg.pricingByWorkTypes
         ? [
             `Оплачен заказ: ${paidOptions.find((p) => p.id === values.is_paid)?.label || "-"}`,
-            ...selectedWorkTypes.map((wt) => `${wt.label}: ${String(values[`amount:${wt.id}`] || "-")}`),
+            ...selectedWorkTypes.map(
+              (wt) =>
+                `${wt.label}: ${String(values[`amount:${wt.id}`] || "-")} | предоплата: ${String(
+                  values[`prepayment:${wt.id}`] || "-"
+                )} | себестоимость: ${String(values[`cost_price:${wt.id}`] || "-")}`
+            ),
           ].join(", ")
         : cfg.warehouseByAccess
         ? `Склад: ${
@@ -996,7 +1020,8 @@ export default function OrdersCreatePage() {
                               onClick={() => onSelectServiceObject(item)}
                               className="w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-white/10"
                             >
-                              {item.name}
+                              <span>{item.name}</span>
+                              <span className="ml-2 text-xs text-gray-400">x{item.usage_count}</span>
                             </button>
                           ))
                         )}
@@ -1093,7 +1118,8 @@ export default function OrdersCreatePage() {
                                 onClick={() => onSelectWorkType(row.key, item)}
                                 className="w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-white/10"
                               >
-                                {item.name}
+                                <span>{item.name}</span>
+                                <span className="ml-2 text-xs text-gray-400">x{item.usage_count}</span>
                               </button>
                             ))
                           )}
@@ -1138,7 +1164,9 @@ export default function OrdersCreatePage() {
                           <div key={wt.id} className="text-sm">
                             <span className="text-gray-500 dark:text-gray-400">{wt.label}: </span>
                             <span className="text-gray-800 dark:text-white/90">
-                              {String(values[`amount:${wt.id}`] || "-")}
+                              {String(values[`amount:${wt.id}`] || "-")} | предоплата:{" "}
+                              {String(values[`prepayment:${wt.id}`] || "-")} | себестоимость:{" "}
+                              {String(values[`cost_price:${wt.id}`] || "-")}
                             </span>
                           </div>
                         ))}
@@ -1208,6 +1236,18 @@ export default function OrdersCreatePage() {
                               value={currentModuleValues[`amount:${wt.id}`] || ""}
                               onChange={(e: any) => onChangeModuleField(`amount:${wt.id}`, e.target.value)}
                               placeholder="Сумма"
+                              className="w-[250px]"
+                            />
+                            <Input
+                              value={currentModuleValues[`prepayment:${wt.id}`] || ""}
+                              onChange={(e: any) => onChangeModuleField(`prepayment:${wt.id}`, e.target.value)}
+                              placeholder="Предоплата"
+                              className="w-[250px]"
+                            />
+                            <Input
+                              value={currentModuleValues[`cost_price:${wt.id}`] || ""}
+                              onChange={(e: any) => onChangeModuleField(`cost_price:${wt.id}`, e.target.value)}
+                              placeholder="Себестоимость"
                               className="w-[250px]"
                             />
                           </div>
@@ -1353,6 +1393,15 @@ export default function OrdersCreatePage() {
                 )}
                 {!hasNextRelatedModule && (
                   <div className="mt-4">
+                    <label className="mb-3 flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                      <input
+                        type="checkbox"
+                        checked={receiptIssued}
+                        onChange={(e) => setReceiptIssued(e.target.checked)}
+                        className="h-4 w-4 rounded border border-gray-300 text-brand-500 focus:ring-2 focus:ring-brand-300 dark:border-gray-700 dark:bg-gray-900"
+                      />
+                      Квитанция выдана
+                    </label>
                     <Button size="sm" disabled={createBusy || !canCreateOrder()} onClick={onCreateOrder}>
                       Создать
                     </Button>

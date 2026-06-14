@@ -1,15 +1,37 @@
 "use client";
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { ApexOptions } from "apexcharts";
 import flatpickr from "flatpickr";
 import ChartTab from "../common/ChartTab";
 import { CalenderIcon } from "../../icons";
+import { getGatewayBaseUrl } from "@/lib/gateway";
 
 const Chart = dynamic(() => import("react-apexcharts"), { ssr: false });
 
+type MonthlyOrdersByKindPoint = {
+  month: string;
+  label: string;
+  onsite_count: number;
+  repair_count: number;
+};
+
+type MonthlyOrdersChartPoint = MonthlyOrdersByKindPoint & {
+  total_count: number;
+};
+
+type MonthlyOrdersTotalPoint = {
+  month: string;
+  label: string;
+  orders_count: number;
+};
+
 export default function StatisticsChart() {
   const datePickerRef = useRef<HTMLInputElement>(null);
+  const base = useMemo(() => getGatewayBaseUrl(), []);
+  const [items, setItems] = useState<MonthlyOrdersChartPoint[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!datePickerRef.current) return;
@@ -38,123 +60,181 @@ export default function StatisticsChart() {
     };
   }, []);
 
-  const options: ApexOptions = {
-    legend: {
-      show: false, // Hide legend
-      position: "top",
-      horizontalAlign: "left",
-    },
-    colors: ["#465FFF", "#9CB9FF"], // Define line colors
-    chart: {
-      fontFamily: "Outfit, sans-serif",
-      height: 310,
-      type: "line", // Set the chart type to 'line'
-      toolbar: {
-        show: false, // Hide chart toolbar
-      },
-    },
-    stroke: {
-      curve: "straight", // Define the line style (straight, smooth, or step)
-      width: [2, 2], // Line width for each dataset
-    },
+  useEffect(() => {
+    let cancelled = false;
 
-    fill: {
-      type: "gradient",
-      gradient: {
-        opacityFrom: 0.55,
-        opacityTo: 0,
+    const load = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const token = (window as any).__hubcrmAccessToken || "";
+        const headers = token ? { authorization: `Bearer ${token}` } : {};
+        const [byKindResp, totalResp] = await Promise.all([
+          fetch(`${base}/orders/orders/stats/monthly-orders-by-kind`, {
+            cache: "no-store",
+            headers,
+          }),
+          fetch(`${base}/orders/orders/stats/monthly-orders`, {
+            cache: "no-store",
+            headers,
+          }),
+        ]);
+        if (!byKindResp.ok) {
+          const body = await byKindResp.text().catch(() => "");
+          throw new Error(`orders by kind load failed: ${byKindResp.status} ${body}`);
+        }
+        if (!totalResp.ok) {
+          const body = await totalResp.text().catch(() => "");
+          throw new Error(`orders total load failed: ${totalResp.status} ${body}`);
+        }
+        const data = (await byKindResp.json()) as { items?: MonthlyOrdersByKindPoint[] };
+        const totalData = (await totalResp.json()) as { items?: MonthlyOrdersTotalPoint[] };
+        if (!cancelled) {
+          const totalsByMonth = new Map(
+            (Array.isArray(totalData?.items) ? totalData.items : []).map((item) => [item.month, item.orders_count])
+          );
+          const nextItems = (Array.isArray(data?.items) ? data.items : []).map((item) => ({
+            ...item,
+            total_count: totalsByMonth.get(item.month) ?? item.onsite_count + item.repair_count,
+          }));
+          setItems(nextItems);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : "Не удалось загрузить статистику заказов");
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    };
+
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [base]);
+
+  const options: ApexOptions = useMemo(
+    () => ({
+      legend: {
+        show: true,
+        position: "top",
+        horizontalAlign: "left",
       },
-    },
-    markers: {
-      size: 0, // Size of the marker points
-      strokeColors: "#fff", // Marker border color
-      strokeWidth: 2,
-      hover: {
-        size: 6, // Marker size on hover
+      colors: ["#465FFF", "#9CB9FF", "#22C55E"],
+      chart: {
+        fontFamily: "Outfit, sans-serif",
+        height: 310,
+        type: "line",
+        toolbar: {
+          show: false,
+        },
       },
-    },
-    grid: {
+      stroke: {
+        curve: "straight",
+        width: [2, 2, 2],
+      },
+      fill: {
+        type: "gradient",
+        gradient: {
+          opacityFrom: 0.55,
+          opacityTo: 0,
+        },
+      },
+      markers: {
+        size: 0,
+        strokeColors: "#fff",
+        strokeWidth: 2,
+        hover: {
+          size: 6,
+        },
+      },
+      grid: {
+        xaxis: {
+          lines: {
+            show: false,
+          },
+        },
+        yaxis: {
+          lines: {
+            show: true,
+          },
+        },
+      },
+      dataLabels: {
+        enabled: false,
+      },
+      tooltip: {
+        enabled: true,
+        x: {
+          show: true,
+        },
+        y: {
+          formatter: (val: number) => `${val} заказов`,
+        },
+      },
       xaxis: {
-        lines: {
-          show: false, // Hide grid lines on x-axis
+        type: "category",
+        categories: items.map((item) => item.label),
+        axisBorder: {
+          show: false,
+        },
+        axisTicks: {
+          show: false,
+        },
+        tooltip: {
+          enabled: false,
         },
       },
       yaxis: {
-        lines: {
-          show: true, // Show grid lines on y-axis
+        min: 0,
+        forceNiceScale: true,
+        labels: {
+          style: {
+            fontSize: "12px",
+            colors: ["#6B7280"],
+          },
+        },
+        title: {
+          text: "",
+          style: {
+            fontSize: "0px",
+          },
         },
       },
-    },
-    dataLabels: {
-      enabled: false, // Disable data labels
-    },
-    tooltip: {
-      enabled: true, // Enable tooltip
-      x: {
-        format: "dd MMM yyyy", // Format for x-axis tooltip
-      },
-    },
-    xaxis: {
-      type: "category", // Category-based x-axis
-      categories: [
-        "Jan",
-        "Feb",
-        "Mar",
-        "Apr",
-        "May",
-        "Jun",
-        "Jul",
-        "Aug",
-        "Sep",
-        "Oct",
-        "Nov",
-        "Dec",
-      ],
-      axisBorder: {
-        show: false, // Hide x-axis border
-      },
-      axisTicks: {
-        show: false, // Hide x-axis ticks
-      },
-      tooltip: {
-        enabled: false, // Disable tooltip for x-axis points
-      },
-    },
-    yaxis: {
-      labels: {
-        style: {
-          fontSize: "12px", // Adjust font size for y-axis labels
-          colors: ["#6B7280"], // Color of the labels
-        },
-      },
-      title: {
-        text: "", // Remove y-axis title
-        style: {
-          fontSize: "0px",
-        },
-      },
-    },
-  };
+    }),
+    [items]
+  );
 
-  const series = [
-    {
-      name: "Sales",
-      data: [180, 190, 170, 160, 175, 165, 170, 205, 230, 210, 240, 235],
-    },
-    {
-      name: "Revenue",
-      data: [40, 30, 50, 40, 55, 40, 70, 100, 110, 120, 150, 140],
-    },
-  ];
+  const series = useMemo(
+    () => [
+      {
+        name: "Заказы Услуга на месте",
+        data: items.map((item) => item.onsite_count),
+      },
+      {
+        name: "Заказы в ремонт",
+        data: items.map((item) => item.repair_count),
+      },
+      {
+        name: "Все заказы",
+        data: items.map((item) => item.total_count),
+      },
+    ],
+    [items]
+  );
+
   return (
     <div className="rounded-2xl border border-gray-200 bg-white px-5 pb-5 pt-5 dark:border-gray-800 dark:bg-white/[0.03] sm:px-6 sm:pt-6">
       <div className="flex flex-col gap-5 mb-6 sm:flex-row sm:justify-between">
         <div className="w-full">
           <h3 className="text-lg font-semibold text-gray-800 dark:text-white/90">
-            Statistics
+            Заказы по типам
           </h3>
           <p className="mt-1 text-gray-500 text-theme-sm dark:text-gray-400">
-            Target you've set for each month
+            Услуга на месте, ремонт и все заказы по месяцам
           </p>
         </div>
         <div className="flex items-center gap-3 sm:justify-end">
@@ -172,7 +252,17 @@ export default function StatisticsChart() {
 
       <div className="max-w-full overflow-x-auto custom-scrollbar">
         <div className="min-w-[1000px] xl:min-w-full">
-          <Chart options={options} series={series} type="area" height={310} />
+          {loading ? (
+            <div className="flex h-[310px] items-center justify-center text-sm text-gray-500 dark:text-gray-400">
+              Загрузка...
+            </div>
+          ) : error ? (
+            <div className="flex h-[310px] items-center justify-center text-center text-sm text-red-500">
+              {error}
+            </div>
+          ) : (
+            <Chart options={options} series={series} type="area" height={310} />
+          )}
         </div>
       </div>
     </div>

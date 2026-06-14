@@ -1,13 +1,27 @@
 "use client";
 
 import { getGatewayBaseUrl } from "@/lib/gateway";
+import { connectQzTray, qzPrintRaw, qzPrintRawHex } from "@/lib/qzTray";
+import {
+  QZ_DEFAULT_PRINTER_NAME,
+  ensureTsplPrintFooter,
+  findUnknownPlaceholderKeys,
+  htmlTo30x20TsplHex,
+  htmlToPlainLinesForTspl,
+  looksLikeTspl,
+  normPrintPlaceholderKey,
+  normalizeTsplPayload,
+  tsplEscapeText,
+} from "@/lib/printQzTspl";
 import React, { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Button from "@/components/ui/button/Button";
 import DatePicker from "@/components/form/date-picker";
-import { ChevronDownIcon, PencilIcon } from "@/icons/index";
+import Radio from "@/components/form/input/Radio";
+import { ChevronDownIcon } from "@/icons/index";
 import { Dropdown } from "@/components/ui/dropdown/Dropdown";
 import { DropdownItem } from "@/components/ui/dropdown/DropdownItem";
+import { Modal } from "@/components/ui/modal";
 import {
   Table,
   TableBody,
@@ -32,6 +46,7 @@ type OrderItem = {
   contact_uuid: string | null;
   related_modules?: Record<string, Record<string, string>>;
   created_at: string;
+  active_callback_date?: string | null;
 };
 
 type OrdersPage = {
@@ -46,6 +61,8 @@ type FinanceLine = {
   id: string;
   work_type_uuid: string;
   amount: number;
+  prepayment?: number | null;
+  cost_price?: number | null;
   currency: string;
   payment_method: "card" | "cash" | null;
   is_paid: boolean;
@@ -87,6 +104,14 @@ type PrintFormListItem = {
   title: string;
   category_id?: string | null;
   category_name?: string;
+  page_width_mm: number;
+  page_height_mm: number;
+  page_margin_mm: number;
+  page_auto_height: boolean;
+  page_offset_x_mm?: number | null;
+  page_offset_y_mm?: number | null;
+  page_rotation_deg?: number | null;
+  qz_enabled: boolean;
   updated_at: string;
 };
 
@@ -105,9 +130,17 @@ type WarehouseOption = {
   name: string;
 };
 
+type ServiceObjectOption = {
+  id: string;
+  name: string;
+  service_category_id: string;
+};
+
 type ListFilters = {
+  order_ids: string;
   order_kind: string;
   service_category_id: string;
+  service_object_id: string;
   work_type_id: string;
   warehouse_id: string;
   created_by_uuid: string;
@@ -117,11 +150,35 @@ type ListFilters = {
 };
 
 type OrderIssueKind = "return" | "problem" | "issued";
+type OrderReturnType = "repair" | "money";
+type OrderReturnMoneySource = "today_cash" | "order_day_cash";
 
 type OrderIssueHistoryItem = {
   id: string;
   issue_kind: OrderIssueKind;
   reason: string;
+  created_by_uuid?: string | null;
+  created_by_name?: string;
+  created_at: string;
+};
+
+type OrderCommentHistoryItem = {
+  id: string;
+  comment: string;
+  created_by_uuid?: string | null;
+  created_by_name?: string;
+  created_at: string;
+};
+
+type OrderCallbackCompleteResponse = {
+  order: OrderItem;
+  comment_entry: OrderCommentHistoryItem;
+};
+
+type OrderPhotoHistoryItem = {
+  id: string;
+  mime_type: string;
+  data_url: string;
   created_by_uuid?: string | null;
   created_by_name?: string;
   created_at: string;
@@ -142,10 +199,59 @@ type OrderFeedItem =
       reason: string;
       created_at: string;
       created_by_name?: string;
+    }
+  | {
+      kind: "comment";
+      id: string;
+      title: string;
+      created_at: string;
+      created_by_name?: string;
+    }
+  | {
+      kind: "photo";
+      id: string;
+      title: string;
+      image_url: string;
+      created_at: string;
+      created_by_name?: string;
     };
+
+function EditButtonIcon() {
+  return (
+    <svg className="h-3.5 w-3.5 shrink-0" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M3.5 12.5h9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      <path d="M4 10.5l6.5-6.5 1.5 1.5-6.5 6.5H4v-1.5Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+    </svg>
+  );
+}
 
 function getToken(): string {
   return (window as any).__hubcrmAccessToken || "";
+}
+
+function pageSizeMm(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.min(2000, Math.round(parsed)));
+}
+
+function optionalPrintNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.round(parsed);
+}
+
+function printTransformCss(form: any): string {
+  const x = optionalPrintNumber(form?.page_offset_x_mm);
+  const y = optionalPrintNumber(form?.page_offset_y_mm);
+  const rotation = optionalPrintNumber(form?.page_rotation_deg);
+  const parts: string[] = [];
+  if (x !== null || y !== null) parts.push(`translate(${x ?? 0}mm, ${y ?? 0}mm)`);
+  if (rotation === 90) parts.push("rotate(90deg) translateY(-100%)");
+  if (rotation === 180) parts.push("rotate(180deg) translate(-100%, -100%)");
+  if (rotation === 270) parts.push("rotate(270deg) translateX(-100%)");
+  return parts.length ? `transform:${parts.join(" ")};transform-origin:top left;` : "";
 }
 
 function normalizeHexColor(value: string | undefined): string {
@@ -202,11 +308,21 @@ function toYmdLocal(d: Date): string {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+function getReturnRefundDate(createdAt: string, source: OrderReturnMoneySource | undefined): string {
+  if (!source) return "";
+  if (source === "today_cash") return toYmdLocal(new Date());
+  return toYmdLocal(new Date(createdAt));
+}
+
 export default function OrdersListPage() {
   const base = useMemo(() => getGatewayBaseUrl(), []);
+  const cameraVideoRef = React.useRef<HTMLVideoElement | null>(null);
+  const cameraStreamRef = React.useRef<MediaStream | null>(null);
+  const cameraToastTimerRef = React.useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const searchParams = useSearchParams();
   const initialSearch = String(searchParams.get("search") || "").trim();
   const initialOpenOrderId = String(searchParams.get("open_order_id") || "").trim();
+  const initialOrderIds = String(searchParams.get("order_ids") || "").trim();
   const [items, setItems] = useState<OrderItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [openOrderId, setOpenOrderId] = useState<string | null>(null);
@@ -221,10 +337,17 @@ export default function OrdersListPage() {
   const [warehouseNameById, setWarehouseNameById] = useState<Record<string, string>>({});
   const [warehouseById, setWarehouseById] = useState<Record<string, WarehouseInfo>>({});
   const [categoryNameById, setCategoryNameById] = useState<Record<string, string>>({});
+  const [serviceObjectOptions, setServiceObjectOptions] = useState<ServiceObjectOption[]>([]);
   const [serviceObjectNameById, setServiceObjectNameById] = useState<Record<string, string>>({});
   const [workTypeNameById, setWorkTypeNameById] = useState<Record<string, string>>({});
   const [statusOptions, setStatusOptions] = useState<StatusOption[]>([]);
   const [statusSavingByOrder, setStatusSavingByOrder] = useState<Record<string, boolean>>({});
+  const [serviceObjectEditOpenByOrder, setServiceObjectEditOpenByOrder] = useState<Record<string, boolean>>({});
+  const [serviceObjectQueryByOrder, setServiceObjectQueryByOrder] = useState<Record<string, string>>({});
+  const [serviceObjectSavingByOrder, setServiceObjectSavingByOrder] = useState<Record<string, boolean>>({});
+  const [warehouseEditOpenByOrder, setWarehouseEditOpenByOrder] = useState<Record<string, boolean>>({});
+  const [warehouseDraftByOrder, setWarehouseDraftByOrder] = useState<Record<string, string>>({});
+  const [warehouseSavingByOrder, setWarehouseSavingByOrder] = useState<Record<string, boolean>>({});
   const [statusHistoryByOrder, setStatusHistoryByOrder] = useState<Record<string, StatusHistoryItem[]>>({});
   const [statusHistoryLoadingByOrder, setStatusHistoryLoadingByOrder] = useState<Record<string, boolean>>({});
   const [statusHistoryErrorByOrder, setStatusHistoryErrorByOrder] = useState<Record<string, string>>({});
@@ -239,6 +362,7 @@ export default function OrdersListPage() {
   const [printFormsLoading, setPrintFormsLoading] = useState(false);
   const [printDropdownOrderId, setPrintDropdownOrderId] = useState<string | null>(null);
   const [isSuperadmin, setIsSuperadmin] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [creatorFilterQuery, setCreatorFilterQuery] = useState("");
   const [creatorFilterOptions, setCreatorFilterOptions] = useState<UserLite[]>([]);
   const [creatorFilterOpen, setCreatorFilterOpen] = useState(false);
@@ -247,11 +371,40 @@ export default function OrdersListPage() {
   const [issueHistoryErrorByOrder, setIssueHistoryErrorByOrder] = useState<Record<string, string>>({});
   const [issueDraftKindByOrder, setIssueDraftKindByOrder] = useState<Record<string, OrderIssueKind | undefined>>({});
   const [issueDraftReasonByOrder, setIssueDraftReasonByOrder] = useState<Record<string, string>>({});
+  const [issueReturnTypeByOrder, setIssueReturnTypeByOrder] = useState<Record<string, OrderReturnType | undefined>>({});
+  const [issueReturnMoneySourceByOrder, setIssueReturnMoneySourceByOrder] = useState<
+    Record<string, OrderReturnMoneySource | undefined>
+  >({});
+  const [issueReturnAmountByOrder, setIssueReturnAmountByOrder] = useState<Record<string, string>>({});
   const [issueSavingByOrder, setIssueSavingByOrder] = useState<Record<string, boolean>>({});
+  const [commentHistoryByOrder, setCommentHistoryByOrder] = useState<Record<string, OrderCommentHistoryItem[]>>({});
+  const [commentHistoryLoadingByOrder, setCommentHistoryLoadingByOrder] = useState<Record<string, boolean>>({});
+  const [commentHistoryErrorByOrder, setCommentHistoryErrorByOrder] = useState<Record<string, string>>({});
+  const [commentDraftOpenByOrder, setCommentDraftOpenByOrder] = useState<Record<string, boolean>>({});
+  const [commentDraftTextByOrder, setCommentDraftTextByOrder] = useState<Record<string, string>>({});
+  const [commentSavingByOrder, setCommentSavingByOrder] = useState<Record<string, boolean>>({});
+  const [callbackDraftOpenByOrder, setCallbackDraftOpenByOrder] = useState<Record<string, boolean>>({});
+  const [callbackDateByOrder, setCallbackDateByOrder] = useState<Record<string, string>>({});
+  const [callbackCommentByOrder, setCallbackCommentByOrder] = useState<Record<string, string>>({});
+  const [callbackNeedDateByOrder, setCallbackNeedDateByOrder] = useState<Record<string, boolean>>({});
+  const [callbackSavingByOrder, setCallbackSavingByOrder] = useState<Record<string, boolean>>({});
+  const [activeCallbackOrderId, setActiveCallbackOrderId] = useState<string | null>(null);
+  const [photoHistoryByOrder, setPhotoHistoryByOrder] = useState<Record<string, OrderPhotoHistoryItem[]>>({});
+  const [photoHistoryLoadingByOrder, setPhotoHistoryLoadingByOrder] = useState<Record<string, boolean>>({});
+  const [photoHistoryErrorByOrder, setPhotoHistoryErrorByOrder] = useState<Record<string, string>>({});
+  const [photoSavingByOrder, setPhotoSavingByOrder] = useState<Record<string, boolean>>({});
   const [confirmIssuedByOrder, setConfirmIssuedByOrder] = useState<Record<string, boolean>>({});
+  const [confirmClearProblemByOrder, setConfirmClearProblemByOrder] = useState<Record<string, boolean>>({});
+  const [cameraOrderId, setCameraOrderId] = useState<string | null>(null);
+  const [cameraError, setCameraError] = useState("");
+  const [cameraToast, setCameraToast] = useState("");
+  const [capturedPhotoDataUrl, setCapturedPhotoDataUrl] = useState("");
+  const [previewPhotoUrl, setPreviewPhotoUrl] = useState<string | null>(null);
   const [draftFilters, setDraftFilters] = useState<ListFilters>({
+    order_ids: initialOrderIds,
     order_kind: "",
     service_category_id: "",
+    service_object_id: "",
     work_type_id: "",
     warehouse_id: "",
     created_by_uuid: "",
@@ -260,8 +413,10 @@ export default function OrdersListPage() {
     created_to: "",
   });
   const [appliedFilters, setAppliedFilters] = useState<ListFilters>({
+    order_ids: initialOrderIds,
     order_kind: "",
     service_category_id: "",
+    service_object_id: "",
     work_type_id: "",
     warehouse_id: "",
     created_by_uuid: "",
@@ -270,6 +425,8 @@ export default function OrdersListPage() {
     created_to: "",
   });
   const [pendingOpenOrderId, setPendingOpenOrderId] = useState(initialOpenOrderId);
+  const [serviceObjectFilterQuery, setServiceObjectFilterQuery] = useState("");
+  const [serviceObjectFilterOpen, setServiceObjectFilterOpen] = useState(false);
   const [workTypeFilterQuery, setWorkTypeFilterQuery] = useState("");
   const [workTypeFilterOpen, setWorkTypeFilterOpen] = useState(false);
 
@@ -287,6 +444,14 @@ export default function OrdersListPage() {
     if (!term) return all.slice(0, 50);
     return all.filter((x) => x.name.toLowerCase().includes(term)).slice(0, 50);
   }, [workTypeNameById, workTypeFilterQuery]);
+
+  const serviceObjectFilterOptions = useMemo(() => {
+    const term = serviceObjectFilterQuery.trim().toLowerCase();
+    return serviceObjectOptions
+      .filter((item) => !draftFilters.service_category_id || item.service_category_id === draftFilters.service_category_id)
+      .filter((item) => !term || item.name.toLowerCase().includes(term))
+      .slice(0, 50);
+  }, [serviceObjectOptions, serviceObjectFilterQuery, draftFilters.service_category_id]);
 
   const authHeaders = () => {
     const token = getToken();
@@ -314,8 +479,10 @@ export default function OrdersListPage() {
       const qs = new URLSearchParams();
       qs.set("page", String(targetPage));
       qs.set("page_size", String(effectivePageSize));
+      if (f.order_ids.trim()) qs.set("order_ids", f.order_ids.trim());
       if (f.order_kind) qs.set("order_kind", f.order_kind);
       if (f.service_category_id) qs.set("service_category_id", f.service_category_id);
+      if (f.service_object_id) qs.set("service_object_id", f.service_object_id);
       if (f.work_type_id) qs.set("work_type_id", f.work_type_id);
       if (f.warehouse_id) qs.set("warehouse_id", f.warehouse_id);
       if (f.created_by_uuid) qs.set("created_by_uuid", f.created_by_uuid);
@@ -342,6 +509,7 @@ export default function OrdersListPage() {
         void loadFinanceLines(pendingOpenOrderId);
         void loadStatusHistory(pendingOpenOrderId);
         void loadIssueHistory(pendingOpenOrderId);
+        void loadPhotoHistory(pendingOpenOrderId);
         const autoOrder = (data.items || []).find((x) => x.id === pendingOpenOrderId);
         if (autoOrder?.contact_uuid) {
           void loadContactInfo(pendingOpenOrderId, autoOrder.contact_uuid);
@@ -362,6 +530,7 @@ export default function OrdersListPage() {
     const payload = parseJwtPayload(getToken());
     const roles = Array.isArray(payload?.realm_access?.roles) ? payload.realm_access.roles : [];
     setIsSuperadmin(roles.includes("superadmin"));
+    setIsAdmin(roles.includes("admin") || roles.includes("superadmin"));
   }, []);
 
   useEffect(() => {
@@ -453,7 +622,17 @@ export default function OrdersListPage() {
         throw new Error(`status update failed: ${resp.status} ${body}`);
       }
       const updatedOrder = (await resp.json()) as OrderItem;
-      setItems((prev) => prev.map((it) => (it.id === orderId ? { ...it, ...updatedOrder } : it)));
+      setItems((prev) =>
+        prev.map((it) =>
+          it.id === orderId
+            ? {
+                ...it,
+                ...updatedOrder,
+                issue_kind: it.issue_kind ?? updatedOrder.issue_kind,
+              }
+            : it
+        )
+      );
       if (nextStatus) {
         setStatusHistoryByOrder((prev) => {
           const existing = prev[orderId] || [];
@@ -467,6 +646,86 @@ export default function OrdersListPage() {
       setError(e?.message || "failed to update status");
     } finally {
       setStatusSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
+  };
+
+  const openWarehouseEditor = (order: OrderItem) => {
+    setWarehouseDraftByOrder((prev) => ({ ...prev, [order.id]: order.warehouse_id || "" }));
+    setWarehouseEditOpenByOrder((prev) => ({ ...prev, [order.id]: true }));
+  };
+
+  const serviceObjectOptionsForOrder = (order: OrderItem, query: string) => {
+    const term = query.trim().toLowerCase();
+    return serviceObjectOptions
+      .filter((item) => item.service_category_id === String(order.service_category_id || ""))
+      .filter((item) => !term || item.name.toLowerCase().includes(term))
+      .slice(0, 5);
+  };
+
+  const openServiceObjectEditor = (order: OrderItem) => {
+    const currentName = serviceObjectNameById[order.service_object_id || ""] || "";
+    setServiceObjectQueryByOrder((prev) => ({ ...prev, [order.id]: currentName }));
+    setServiceObjectEditOpenByOrder((prev) => ({ ...prev, [order.id]: true }));
+  };
+
+  const onChangeServiceObject = async (orderId: string, serviceObjectId: string) => {
+    const nextServiceObjectId = String(serviceObjectId || "").trim();
+    if (!nextServiceObjectId) return;
+    setServiceObjectSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setError(null);
+    try {
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/service-object`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders(),
+        },
+        body: JSON.stringify({ service_object_id: nextServiceObjectId }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`service object update failed: ${resp.status} ${body}`);
+      }
+      const updatedOrder = (await resp.json()) as OrderItem;
+      setItems((prev) => prev.map((it) => (it.id === orderId ? { ...it, ...updatedOrder } : it)));
+      setServiceObjectQueryByOrder((prev) => ({
+        ...prev,
+        [orderId]: serviceObjectNameById[nextServiceObjectId] || "",
+      }));
+      setServiceObjectEditOpenByOrder((prev) => ({ ...prev, [orderId]: false }));
+    } catch (e: any) {
+      setError(e?.message || "failed to update service object");
+    } finally {
+      setServiceObjectSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
+  };
+
+  const onChangeWarehouse = async (orderId: string, warehouseId: string) => {
+    const nextWarehouseId = String(warehouseId || "").trim();
+    if (!nextWarehouseId) return;
+    setWarehouseDraftByOrder((prev) => ({ ...prev, [orderId]: nextWarehouseId }));
+    setWarehouseSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setError(null);
+    try {
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/warehouse`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders(),
+        },
+        body: JSON.stringify({ warehouse_id: nextWarehouseId }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`warehouse update failed: ${resp.status} ${body}`);
+      }
+      const updatedOrder = (await resp.json()) as OrderItem;
+      setItems((prev) => prev.map((it) => (it.id === orderId ? { ...it, ...updatedOrder } : it)));
+      setWarehouseEditOpenByOrder((prev) => ({ ...prev, [orderId]: false }));
+    } catch (e: any) {
+      setError(e?.message || "failed to update warehouse");
+    } finally {
+      setWarehouseSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
     }
   };
 
@@ -514,6 +773,168 @@ export default function OrdersListPage() {
     }
   };
 
+  const loadCommentHistory = async (orderId: string) => {
+    if (commentHistoryByOrder[orderId]) return;
+    setCommentHistoryLoadingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setCommentHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    try {
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/comments?limit=100`, {
+        cache: "no-store",
+        headers: authHeaders(),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`order comments failed: ${resp.status} ${body}`);
+      }
+      const history = (await resp.json()) as OrderCommentHistoryItem[];
+      setCommentHistoryByOrder((prev) => ({ ...prev, [orderId]: history }));
+    } catch (e: any) {
+      setCommentHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to load comments" }));
+    } finally {
+      setCommentHistoryLoadingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
+  };
+
+  const loadPhotoHistory = async (orderId: string) => {
+    if (photoHistoryByOrder[orderId]) return;
+    setPhotoHistoryLoadingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setPhotoHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    try {
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/photos?limit=100`, {
+        cache: "no-store",
+        headers: authHeaders(),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`order photos failed: ${resp.status} ${body}`);
+      }
+      const history = (await resp.json()) as OrderPhotoHistoryItem[];
+      setPhotoHistoryByOrder((prev) => ({ ...prev, [orderId]: history }));
+    } catch (e: any) {
+      setPhotoHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to load photos" }));
+    } finally {
+      setPhotoHistoryLoadingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
+  };
+
+  const stopCameraStream = () => {
+    const stream = cameraStreamRef.current;
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      cameraStreamRef.current = null;
+    }
+    if (cameraVideoRef.current) {
+      cameraVideoRef.current.srcObject = null;
+    }
+  };
+
+  const closeCameraModal = () => {
+    stopCameraStream();
+    setCameraOrderId(null);
+    setCameraError("");
+    setCapturedPhotoDataUrl("");
+  };
+
+  const showCameraToast = (message: string) => {
+    setCameraToast(message);
+    if (cameraToastTimerRef.current) {
+      window.clearTimeout(cameraToastTimerRef.current);
+    }
+    cameraToastTimerRef.current = window.setTimeout(() => {
+      setCameraToast("");
+      cameraToastTimerRef.current = null;
+    }, 4000);
+  };
+
+  const onOpenCamera = async (orderId: string) => {
+    setPhotoHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    setCameraError("");
+    setCapturedPhotoDataUrl("");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      const message = "Браузер не поддерживает доступ к камере.";
+      setCameraError(message);
+      showCameraToast(message);
+      return;
+    }
+    try {
+      stopCameraStream();
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false,
+      });
+      cameraStreamRef.current = stream;
+      setCameraOrderId(orderId);
+      if (cameraVideoRef.current) {
+        cameraVideoRef.current.srcObject = stream;
+        void cameraVideoRef.current.play().catch(() => {
+          setCameraError("Не удалось запустить камеру.");
+        });
+      }
+    } catch (e: any) {
+      const message = e?.message ? `Не удалось открыть камеру: ${e.message}` : "Не удалось открыть камеру.";
+      setCameraError(message);
+      showCameraToast(message);
+    }
+  };
+
+  const onCapturePhoto = () => {
+    const video = cameraVideoRef.current;
+    if (!video) {
+      setCameraError("Камера не готова.");
+      return;
+    }
+    if (!video.videoWidth || !video.videoHeight) {
+      setCameraError("Подождите, пока камера начнет передавать изображение.");
+      return;
+    }
+    const maxWidth = 1600;
+    const scale = Math.min(1, maxWidth / video.videoWidth);
+    const width = Math.max(1, Math.round(video.videoWidth * scale));
+    const height = Math.max(1, Math.round(video.videoHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      setCameraError("Не удалось подготовить снимок.");
+      return;
+    }
+    ctx.drawImage(video, 0, 0, width, height);
+    setCapturedPhotoDataUrl(canvas.toDataURL("image/jpeg", 0.9));
+    setCameraError("");
+    stopCameraStream();
+  };
+
+  const onSavePhoto = async (orderId: string) => {
+    if (!capturedPhotoDataUrl) {
+      setCameraError("Сначала сделайте снимок.");
+      return;
+    }
+    setPhotoSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setPhotoHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    try {
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/photos`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders(),
+        },
+        body: JSON.stringify({ data_url: capturedPhotoDataUrl }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`order photo save failed: ${resp.status} ${body}`);
+      }
+      const entry = (await resp.json()) as OrderPhotoHistoryItem;
+      setPhotoHistoryByOrder((prev) => ({ ...prev, [orderId]: [entry, ...(prev[orderId] || [])] }));
+      closeCameraModal();
+    } catch (e: any) {
+      setPhotoHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to save photo" }));
+    } finally {
+      setPhotoSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
+  };
+
   const buildFeedItems = (orderId: string): OrderFeedItem[] => {
     const statusItems: OrderFeedItem[] = (statusHistoryByOrder[orderId] || []).map((entry, index) => ({
       kind: "status",
@@ -530,17 +951,35 @@ export default function OrdersListPage() {
       created_at: entry.created_at,
       created_by_name: entry.created_by_name,
     }));
-    return [...issueItems, ...statusItems].sort(
+    const commentItems: OrderFeedItem[] = (commentHistoryByOrder[orderId] || []).map((entry) => ({
+      kind: "comment",
+      id: entry.id,
+      title: entry.comment,
+      created_at: entry.created_at,
+      created_by_name: entry.created_by_name,
+    }));
+    const photoItems: OrderFeedItem[] = (photoHistoryByOrder[orderId] || []).map((entry) => ({
+      kind: "photo",
+      id: entry.id,
+      title: "Фото заказа",
+      image_url: entry.data_url,
+      created_at: entry.created_at,
+      created_by_name: entry.created_by_name,
+    }));
+    return [...issueItems, ...statusItems, ...commentItems, ...photoItems].sort(
       (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     );
   };
 
   const onToggleOpen = (id: string) => {
     setOpenOrderId((prev) => (prev === id ? null : id));
+    setActiveCallbackOrderId(null);
     if (openOrderId !== id) {
       void loadFinanceLines(id);
       void loadStatusHistory(id);
       void loadIssueHistory(id);
+      void loadCommentHistory(id);
+      void loadPhotoHistory(id);
       const order = items.find((x) => x.id === id);
       if (order?.contact_uuid) {
         void loadContactInfo(id, order.contact_uuid);
@@ -550,19 +989,190 @@ export default function OrdersListPage() {
   };
 
   const onStartIssue = (orderId: string, kind: OrderIssueKind) => {
+    onCancelCallback(orderId);
+    onCancelComment(orderId);
     setIssueDraftKindByOrder((prev) => ({ ...prev, [orderId]: kind }));
     setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    if (kind !== "return") {
+      setIssueReturnTypeByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+      setIssueReturnMoneySourceByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+      setIssueReturnAmountByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    }
   };
 
   const onCancelIssue = (orderId: string) => {
     setIssueDraftKindByOrder((prev) => ({ ...prev, [orderId]: undefined }));
     setIssueDraftReasonByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    setIssueReturnTypeByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+    setIssueReturnMoneySourceByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+    setIssueReturnAmountByOrder((prev) => ({ ...prev, [orderId]: "" }));
+  };
+
+  const onStartComment = (orderId: string) => {
+    onCancelCallback(orderId);
+    setCommentDraftOpenByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setCommentHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+  };
+
+  const onCancelComment = (orderId: string) => {
+    setCommentDraftOpenByOrder((prev) => ({ ...prev, [orderId]: false }));
+    setCommentDraftTextByOrder((prev) => ({ ...prev, [orderId]: "" }));
+  };
+
+  const onStartCallback = (orderId: string, hasActiveCallback: boolean) => {
+    onCancelComment(orderId);
+    setActiveCallbackOrderId(orderId);
+    setCallbackDraftOpenByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setCallbackNeedDateByOrder((prev) => ({ ...prev, [orderId]: !hasActiveCallback }));
+    setCallbackCommentByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] || "" }));
+    if (!hasActiveCallback) {
+      setCallbackDateByOrder((prev) => ({ ...prev, [orderId]: prev[orderId] || toYmdLocal(new Date()) }));
+    }
+    setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+  };
+
+  const onCancelCallback = (orderId: string) => {
+    setActiveCallbackOrderId((prev) => (prev === orderId ? null : prev));
+    setCallbackDraftOpenByOrder((prev) => ({ ...prev, [orderId]: false }));
+    setCallbackDateByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    setCallbackCommentByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    setCallbackNeedDateByOrder((prev) => ({ ...prev, [orderId]: false }));
+  };
+
+  const onSaveComment = async (orderId: string) => {
+    const comment = String(commentDraftTextByOrder[orderId] || "").trim();
+    if (!comment) {
+      setCommentHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "Укажите комментарий." }));
+      return;
+    }
+    setCommentSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setCommentHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    try {
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/comments`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders(),
+        },
+        body: JSON.stringify({ comment }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`order comment save failed: ${resp.status} ${body}`);
+      }
+      const entry = (await resp.json()) as OrderCommentHistoryItem;
+      setCommentHistoryByOrder((prev) => ({ ...prev, [orderId]: [entry, ...(prev[orderId] || [])] }));
+      setCommentDraftOpenByOrder((prev) => ({ ...prev, [orderId]: false }));
+      setCommentDraftTextByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    } catch (e: any) {
+      setCommentHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to save comment" }));
+    } finally {
+      setCommentSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
+  };
+
+  const onSaveCallback = async (orderId: string) => {
+    const callbackDate = String(callbackDateByOrder[orderId] || "").trim();
+    if (!callbackDate) {
+      setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "Выберите дату звонка." }));
+      return;
+    }
+    setCallbackSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    try {
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/callback-reminders`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ callback_date: callbackDate }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`callback reminder save failed: ${resp.status} ${body}`);
+      }
+      const reminder = await resp.json();
+      const reason = `Связаться: позвонить ${new Date(`${callbackDate}T00:00:00`).toLocaleDateString("ru-RU")}`;
+      setItems((prev) =>
+        prev.map((it) => (it.id === orderId ? { ...it, issue_kind: "problem", active_callback_date: reminder.callback_date } : it))
+      );
+      setIssueHistoryByOrder((prev) => ({
+        ...prev,
+        [orderId]: [{ id: reminder.id, issue_kind: "problem", reason, created_at: reminder.created_at }, ...(prev[orderId] || [])],
+      }));
+      const extraComment = String(callbackCommentByOrder[orderId] || "").trim();
+      if (extraComment) {
+        const commentResp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/comments`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...authHeaders(),
+          },
+          body: JSON.stringify({ comment: extraComment }),
+        });
+        if (!commentResp.ok) {
+          const body = await commentResp.text().catch(() => "");
+          throw new Error(`order comment save failed: ${commentResp.status} ${body}`);
+        }
+        const commentEntry = (await commentResp.json()) as OrderCommentHistoryItem;
+        setCommentHistoryByOrder((prev) => ({ ...prev, [orderId]: [commentEntry, ...(prev[orderId] || [])] }));
+      }
+      setCallbackDraftOpenByOrder((prev) => ({ ...prev, [orderId]: false }));
+      setCallbackDateByOrder((prev) => ({ ...prev, [orderId]: "" }));
+      setCallbackCommentByOrder((prev) => ({ ...prev, [orderId]: "" }));
+      setCallbackNeedDateByOrder((prev) => ({ ...prev, [orderId]: false }));
+      setActiveCallbackOrderId((prev) => (prev === orderId ? null : prev));
+    } catch (e: any) {
+      setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to save callback" }));
+    } finally {
+      setCallbackSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
+  };
+
+  const onCompleteCallback = async (orderId: string) => {
+    const comment = String(callbackCommentByOrder[orderId] || "").trim();
+    setCallbackSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    try {
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/callback-complete`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ comment }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`callback complete failed: ${resp.status} ${body}`);
+      }
+      const payload = (await resp.json()) as OrderCallbackCompleteResponse;
+      setItems((prev) => prev.map((it) => (it.id === orderId ? { ...it, ...payload.order, active_callback_date: null } : it)));
+      setCommentHistoryByOrder((prev) => ({
+        ...prev,
+        [orderId]: [payload.comment_entry, ...(prev[orderId] || [])],
+      }));
+      setCallbackDraftOpenByOrder((prev) => ({ ...prev, [orderId]: false }));
+      setCallbackCommentByOrder((prev) => ({ ...prev, [orderId]: "" }));
+      setCallbackDateByOrder((prev) => ({ ...prev, [orderId]: "" }));
+      setCallbackNeedDateByOrder((prev) => ({ ...prev, [orderId]: false }));
+      setActiveCallbackOrderId((prev) => (prev === orderId ? null : prev));
+    } catch (e: any) {
+      setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to complete callback" }));
+    } finally {
+      setCallbackSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
   };
 
   const onSaveIssue = async (orderId: string) => {
     const issueKind = issueDraftKindByOrder[orderId];
     const reason = String(issueDraftReasonByOrder[orderId] || "").trim();
+    const returnType = issueReturnTypeByOrder[orderId];
+    const returnMoneySource = issueReturnMoneySourceByOrder[orderId];
     if (!issueKind) return;
+    if (issueKind === "return" && !returnType) {
+      setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "Выберите тип возврата." }));
+      return;
+    }
+    if (issueKind === "return" && returnType === "money" && !returnMoneySource) {
+      setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "Выберите источник возврата." }));
+      return;
+    }
     if (!reason) {
       setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "Укажите причину." }));
       return;
@@ -609,6 +1219,9 @@ export default function OrdersListPage() {
       }
       setIssueDraftKindByOrder((prev) => ({ ...prev, [orderId]: undefined }));
       setIssueDraftReasonByOrder((prev) => ({ ...prev, [orderId]: "" }));
+      setIssueReturnTypeByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+      setIssueReturnMoneySourceByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+      setIssueReturnAmountByOrder((prev) => ({ ...prev, [orderId]: "" }));
     } catch (e: any) {
       setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to save issue" }));
     } finally {
@@ -620,53 +1233,20 @@ export default function OrdersListPage() {
     setIssueSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
     setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
     try {
-      const requests =
-        nextDisplayStatus === "Выдано"
-          ? await Promise.all([
-              fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/display-status`, {
-                method: "PUT",
-                headers: {
-                  "content-type": "application/json",
-                  ...authHeaders(),
-                },
-                body: JSON.stringify({ display_status: nextDisplayStatus }),
-              }),
-              fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/issue-kind`, {
-                method: "PUT",
-                headers: {
-                  "content-type": "application/json",
-                  ...authHeaders(),
-                },
-                body: JSON.stringify({ issue_kind: null }),
-              }),
-            ])
-          : [
-              await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/display-status`, {
-                method: "PUT",
-                headers: {
-                  "content-type": "application/json",
-                  ...authHeaders(),
-                },
-                body: JSON.stringify({ display_status: nextDisplayStatus }),
-              }),
-            ];
-      const resp = requests[0];
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/display-status`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders(),
+        },
+        body: JSON.stringify({ display_status: nextDisplayStatus }),
+      });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
         throw new Error(`order display status save failed: ${resp.status} ${body}`);
       }
-      if (requests[1] && !requests[1].ok) {
-        const body = await requests[1].text().catch(() => "");
-        throw new Error(`order issue kind reset failed: ${requests[1].status} ${body}`);
-      }
       const updatedOrder = (await resp.json()) as OrderItem;
-      setItems((prev) =>
-        prev.map((it) =>
-          it.id === orderId
-            ? { ...it, ...updatedOrder, ...(nextDisplayStatus === "Выдано" ? { issue_kind: null } : {}) }
-            : it
-        )
-      );
+      setItems((prev) => prev.map((it) => (it.id === orderId ? { ...it, ...updatedOrder } : it)));
       setStatusHistoryByOrder((prev) => ({
         ...prev,
         [orderId]: [{ status: nextDisplayStatus, changed_at: new Date().toISOString() }, ...(prev[orderId] || [])],
@@ -674,8 +1254,41 @@ export default function OrdersListPage() {
       setConfirmIssuedByOrder((prev) => ({ ...prev, [orderId]: false }));
       setIssueDraftKindByOrder((prev) => ({ ...prev, [orderId]: undefined }));
       setIssueDraftReasonByOrder((prev) => ({ ...prev, [orderId]: "" }));
+      setIssueReturnTypeByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+      setIssueReturnMoneySourceByOrder((prev) => ({ ...prev, [orderId]: undefined }));
+      setIssueReturnAmountByOrder((prev) => ({ ...prev, [orderId]: "" }));
     } catch (e: any) {
       setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to save display status" }));
+    } finally {
+      setIssueSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
+    }
+  };
+
+  const onClearProblem = async (orderId: string) => {
+    setIssueSavingByOrder((prev) => ({ ...prev, [orderId]: true }));
+    setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: "" }));
+    try {
+      const resp = await fetch(`${base}/orders/orders/${encodeURIComponent(orderId)}/issue-kind`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders(),
+        },
+        body: JSON.stringify({ issue_kind: null }),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`order problem clear failed: ${resp.status} ${body}`);
+      }
+      const updatedOrder = (await resp.json()) as OrderItem;
+      setItems((prev) => prev.map((it) => (it.id === orderId ? { ...it, ...updatedOrder } : it)));
+      setStatusHistoryByOrder((prev) => ({
+        ...prev,
+        [orderId]: [{ status: "Проблема снята", changed_at: new Date().toISOString() }, ...(prev[orderId] || [])],
+      }));
+      setConfirmClearProblemByOrder((prev) => ({ ...prev, [orderId]: false }));
+    } catch (e: any) {
+      setIssueHistoryErrorByOrder((prev) => ({ ...prev, [orderId]: e?.message || "failed to clear problem" }));
     } finally {
       setIssueSavingByOrder((prev) => ({ ...prev, [orderId]: false }));
     }
@@ -692,7 +1305,7 @@ export default function OrdersListPage() {
   };
 
   const onApplyFilters = async () => {
-    const next = { ...draftFilters, search: draftFilters.search.trim() };
+    const next = { ...draftFilters, order_ids: "", search: draftFilters.search.trim() };
     setAppliedFilters(next);
     await load(1, next);
   };
@@ -728,6 +1341,35 @@ export default function OrdersListPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items]);
 
+  useEffect(() => {
+    if (!cameraOrderId || !cameraVideoRef.current || !cameraStreamRef.current) return;
+    const video = cameraVideoRef.current;
+    video.srcObject = cameraStreamRef.current;
+    void video.play().catch(() => {
+      setCameraError("Не удалось запустить камеру.");
+    });
+    return () => {
+      if (video.srcObject === cameraStreamRef.current) {
+        video.srcObject = null;
+      }
+    };
+  }, [cameraOrderId]);
+
+  useEffect(() => {
+    return () => {
+      if (cameraToastTimerRef.current) {
+        window.clearTimeout(cameraToastTimerRef.current);
+        cameraToastTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopCameraStream();
+    };
+  }, []);
+
   const isOrderPaid = (orderId: string): boolean => {
     const lines = financeByOrder[orderId] || [];
     if (!lines.length) return false;
@@ -759,9 +1401,9 @@ export default function OrdersListPage() {
   const renderTemplate = (html: string, ctx: Record<string, string>) => {
     const source = String(html || "");
     const ctxLower: Record<string, string> = {};
-    for (const [k, v] of Object.entries(ctx)) ctxLower[k.toLowerCase()] = String(v ?? "");
+    for (const [k, v] of Object.entries(ctx)) ctxLower[normPrintPlaceholderKey(k)] = String(v ?? "");
     return source.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_m, keyRaw: string) => {
-      const key = String(keyRaw || "").trim().toLowerCase();
+      const key = normPrintPlaceholderKey(String(keyRaw || ""));
       if (Object.prototype.hasOwnProperty.call(ctxLower, key)) return ctxLower[key];
       const sizedQr = key.match(/^warehouse_qr_(site|yandex|vk|telegram)_svg_(\d{1,4})$/i);
       if (sizedQr) {
@@ -800,18 +1442,16 @@ export default function OrdersListPage() {
     }
   };
 
-  const onPrintWithForm = async (order: OrderItem, formId: string) => {
+  const onPrintWithForm = async (order: OrderItem, formBrief: PrintFormListItem) => {
     setError(null);
     setPrintDropdownOrderId(null);
-    const w = window.open("about:blank", "_blank");
+    let w: Window | null = null;
     try {
-      if (!w) throw new Error("popup blocked");
-      w.document.open();
-      w.document.write(`<!doctype html><html><head><meta charset="utf-8"/><title>Документ</title></head><body>Loading...</body></html>`);
-      w.document.close();
-
+      if (formBrief.qz_enabled) {
+        await connectQzTray();
+      }
       const [formResp, financeResp, contactResp, creatorResp] = await Promise.all([
-        fetchWithRetry(`${base}/documents/print/forms/${encodeURIComponent(formId)}`, { cache: "no-store", headers: authHeaders() }),
+        fetchWithRetry(`${base}/documents/print/forms/${encodeURIComponent(formBrief.id)}?_cb=${Date.now()}`, { cache: "no-store", headers: authHeaders() }),
         fetchWithRetry(`${base}/finance/finance/orders/${encodeURIComponent(order.id)}/lines`, { cache: "no-store", headers: authHeaders() }),
         order.contact_uuid
           ? fetchWithRetry(`${base}/contacts/contacts/${encodeURIComponent(order.contact_uuid)}`, {
@@ -847,6 +1487,12 @@ export default function OrdersListPage() {
       const contact = contactResp ? await contactResp.json() : null;
       const creator = (await creatorResp.json()) as CreatorInfo;
       const printTitle = String(form?.title || "Документ").trim() || "Документ";
+      const widthMm = pageSizeMm(form?.page_width_mm, 200);
+      const heightMm = pageSizeMm(form?.page_height_mm, 300);
+      const marginMm = pageSizeMm(form?.page_margin_mm, 0);
+      const autoHeight = Boolean(form?.page_auto_height);
+      const pageHeight = autoHeight ? "auto" : `${heightMm}mm`;
+      const transformCss = printTransformCss(form);
 
       const workTypesText =
         (order.work_type_ids || []).map((id) => workTypeNameById[id] || id).join(", ") || "-";
@@ -854,7 +1500,12 @@ export default function OrdersListPage() {
       const isPaid = financeLines?.some((x) => x.is_paid) ? "Да" : "Нет";
       const totalAmount = (financeLines || []).reduce((sum, x) => sum + Number(x.amount || 0), 0);
       const linesText = (financeLines || [])
-        .map((l) => `${workTypeNameById[l.work_type_uuid] || l.work_type_uuid}: ${l.amount} ${l.currency || "RUB"}`)
+        .map(
+          (l) =>
+            `${workTypeNameById[l.work_type_uuid] || l.work_type_uuid}: ${l.amount} ${l.currency || "RUB"} | предоплата: ${l.prepayment ?? "-"} ${
+              l.prepayment != null ? l.currency || "RUB" : ""
+            }`
+        )
         .join("\n");
       const linesTextHtml = linesText.replace(/\n/g, "<br/>");
 
@@ -890,12 +1541,29 @@ export default function OrdersListPage() {
         lines_text: linesTextHtml,
       };
 
+      if (Boolean(form?.qz_enabled ?? formBrief.qz_enabled)) {
+        const tpl = String(form?.content_html || "").trim();
+        if (!tpl) throw new Error("QZ: в форме пустое тело печати.");
+        const qzCtx = Object.fromEntries(Object.entries(ctx).map(([key, value]) => [key, tsplEscapeText(value, 200)]));
+        const unknownPh = findUnknownPlaceholderKeys(tpl, qzCtx);
+        if (unknownPh.length > 0) throw new Error(`QZ: в шаблоне неизвестные имена: ${unknownPh.join(", ")}`);
+        const renderedRaw = renderTemplate(tpl, qzCtx);
+        const rendered = htmlToPlainLinesForTspl(renderedRaw);
+        if (!rendered.trim()) throw new Error("QZ: после очистки HTML шаблон пуст.");
+        const commands = looksLikeTspl(rendered) ? [ensureTsplPrintFooter(normalizeTsplPayload(rendered))] : null;
+        if (commands) await qzPrintRaw(QZ_DEFAULT_PRINTER_NAME, commands);
+        else await qzPrintRawHex(QZ_DEFAULT_PRINTER_NAME, htmlTo30x20TsplHex(renderedRaw));
+        return;
+      }
+
       const html = renderTemplate(String(form?.content_html || ""), ctx);
+      w = window.open("about:blank", "_blank");
+      if (!w) throw new Error("popup blocked");
       w.document.open();
       w.document.write(`<!doctype html><html><head><meta charset="utf-8"/><title>${printTitle}</title>
         <style>
-          body{font-family:Arial, sans-serif; margin:0; padding:0; width:80mm;}
-          .print-root{width:80mm; margin:0; padding:0;}
+          body{font-family:Arial, sans-serif; margin:0; padding:0;}
+          .print-root{width:100%; margin:0; padding:0;${transformCss}}
           .print-root table{width:100% !important; table-layout:fixed !important; border-collapse:collapse !important;}
           .print-root td,.print-root th{overflow:hidden; vertical-align:top; word-break:break-word;}
           .print-root p{margin:0;}
@@ -910,11 +1578,12 @@ export default function OrdersListPage() {
             max-width:100% !important;
             height:auto !important;
           }
-          @page { size: 80mm auto; margin: 0; }
+          @page { size: ${widthMm}mm ${pageHeight}; margin: ${marginMm}mm; }
           @media print {
-            html, body { width: 80mm; margin: 0 !important; padding: 0 !important; }
-            .print-root { width: 80mm; margin: 0 !important; padding: 0 !important; }
+            html, body { margin: 0 !important; padding: 0 !important; }
+            .print-root { width: 100%; margin: 0 !important; padding: 0 !important; }
           }
+          @media screen { html, body, .print-root { width: ${widthMm}mm; ${autoHeight ? "" : `min-height: ${heightMm}mm;`} } }
         </style>
       </head><body><div class="print-root">${html}</div></body></html>`);
       w.document.close();
@@ -1034,10 +1703,15 @@ export default function OrdersListPage() {
           setCategoryNameById(next);
         }
         if (objResp.ok) {
-          const rows = (await objResp.json()) as Array<{ id: string; name: string }>;
+          const rows = (await objResp.json()) as Array<{ id: string; name: string; service_category_id: string }>;
           const next: Record<string, string> = {};
-          for (const row of rows || []) next[row.id] = row.name;
+          const nextOptions: ServiceObjectOption[] = [];
+          for (const row of rows || []) {
+            next[row.id] = row.name;
+            nextOptions.push({ id: row.id, name: row.name, service_category_id: row.service_category_id });
+          }
           setServiceObjectNameById(next);
+          setServiceObjectOptions(nextOptions);
         }
         if (wtResp.ok) {
           const rows = (await wtResp.json()) as Array<{ id: string; name: string }>;
@@ -1070,7 +1744,10 @@ export default function OrdersListPage() {
             <select
               className="h-10 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
               value={draftFilters.service_category_id}
-              onChange={(e) => setDraftFilters((prev) => ({ ...prev, service_category_id: e.target.value }))}
+              onChange={(e) => {
+                setDraftFilters((prev) => ({ ...prev, service_category_id: e.target.value, service_object_id: "" }));
+                setServiceObjectFilterQuery("");
+              }}
             >
               <option value="">Категория услуг</option>
               {Object.entries(categoryNameById).map(([id, name]) => (
@@ -1079,6 +1756,42 @@ export default function OrdersListPage() {
                 </option>
               ))}
             </select>
+            <div className="relative">
+              <input
+                className="h-10 w-full rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
+                value={serviceObjectFilterQuery}
+                onFocus={() => setServiceObjectFilterOpen(true)}
+                onBlur={() => setTimeout(() => setServiceObjectFilterOpen(false), 120)}
+                onChange={(e) => {
+                  setServiceObjectFilterQuery(e.target.value);
+                  setDraftFilters((prev) => ({ ...prev, service_object_id: "" }));
+                  setServiceObjectFilterOpen(true);
+                }}
+                placeholder="Объект ремонта"
+              />
+              {serviceObjectFilterOpen && (
+                <div className="absolute z-20 mt-1 w-full max-h-56 overflow-auto rounded-lg border border-gray-200 bg-white shadow-theme-lg dark:border-gray-800 dark:bg-gray-900">
+                  {!serviceObjectFilterOptions.length ? (
+                    <div className="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">Ничего не найдено</div>
+                  ) : (
+                    serviceObjectFilterOptions.map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className="w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-white/10"
+                        onClick={() => {
+                          setDraftFilters((prev) => ({ ...prev, service_object_id: item.id }));
+                          setServiceObjectFilterQuery(item.name);
+                          setServiceObjectFilterOpen(false);
+                        }}
+                      >
+                        {item.name}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
             <div className="relative">
               <input
                 className="h-10 w-full rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
@@ -1226,7 +1939,7 @@ export default function OrdersListPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody className="divide-y divide-gray-100 dark:divide-white/[0.05]">
-                  {items.map((order) => {
+                  {items.map((order, index) => {
                     const isOpen = openOrderId === order.id;
                     const issueKind = order.issue_kind || null;
                     const displayStatus = String(order.display_status || "").trim() || (issueKind === "issued" ? "Выдано" : "");
@@ -1234,16 +1947,30 @@ export default function OrdersListPage() {
                     const isIssued = displayStatus === "Выдано";
                     const shouldShowInternalStatus = !!order.status_selected_manually;
                     const confirmIssued = !!confirmIssuedByOrder[order.id];
+                    const confirmClearProblem = !!confirmClearProblemByOrder[order.id];
+                    const canClearProblem = isAdmin;
+                    const canClearIssue = issueKind === "return" || (issueKind === "problem" && canClearProblem);
+                    const hasActiveCallback = !!order.active_callback_date;
+                    const callbackNeedDate = !!callbackNeedDateByOrder[order.id];
+                    const showCallbackActions = hasActiveCallback && !callbackNeedDate;
+                    const showCallbackDate = !hasActiveCallback || callbackNeedDate;
                     const issueDraftKind = issueDraftKindByOrder[order.id];
+                    const issueReturnType = issueReturnTypeByOrder[order.id];
+                    const issueReturnMoneySource = issueReturnMoneySourceByOrder[order.id];
+                    const issueReturnRefundDate = getReturnRefundDate(order.created_at, issueReturnMoneySource);
+                    const availableServiceObjectOptions = serviceObjectOptionsForOrder(
+                      order,
+                      serviceObjectQueryByOrder[order.id] || ""
+                    );
+                    const orderToneClass =
+                      index % 2 === 0 ? "bg-white dark:bg-white/[0.03]" : "bg-gray-50 dark:bg-white/[0.06]";
                     return (
                     <React.Fragment key={order.id}>
                       <tr
-                        className={`cursor-pointer hover:bg-gray-50 dark:hover:bg-white/[0.02] ${
+                        className={`cursor-pointer ${
                           hasProblemMark
-                            ? "bg-red-50 dark:bg-red-500/10"
-                            : isOpen
-                            ? "bg-gray-50 dark:bg-white/[0.06]"
-                            : ""
+                            ? "bg-red-50 hover:bg-red-100 dark:bg-red-500/10 dark:hover:bg-red-500/15"
+                            : `${orderToneClass} hover:bg-gray-100/70 dark:hover:bg-white/[0.08]`
                         }`}
                         onClick={() => onToggleOpen(order.id)}
                       >
@@ -1302,7 +2029,11 @@ export default function OrdersListPage() {
                         </td>
                       </tr>
                       {isOpen && (
-                        <tr className={hasProblemMark ? "bg-red-50 dark:bg-red-500/10" : "bg-gray-50 dark:bg-white/[0.06]"}>
+                        <tr
+                          className={`border-b-4 border-gray-300 dark:border-gray-600 ${
+                            hasProblemMark ? "bg-red-50 dark:bg-red-500/10" : orderToneClass
+                          }`}
+                        >
                           <td
                             className="px-5 py-4 text-start text-theme-sm text-gray-700 dark:text-gray-300"
                             colSpan={4}
@@ -1333,10 +2064,61 @@ export default function OrdersListPage() {
                                 Категория услуги:{" "}
                                 {categoryNameById[order.service_category_id || ""] || "-"}
                               </div>
-                              <div>
-                                Объект ремонта:{" "}
-                                {serviceObjectNameById[order.service_object_id || ""] || "-"}
-                                {order.serial_model ? ` (${order.serial_model})` : ""}
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span>
+                                  Объект ремонта: {serviceObjectNameById[order.service_object_id || ""] || "-"}
+                                  {order.serial_model ? ` (${order.serial_model})` : ""}
+                                </span>
+                                {isAdmin ? (
+                                  serviceObjectEditOpenByOrder[order.id] ? (
+                                    <>
+                                      <div className="relative w-[260px] max-w-full">
+                                        <input
+                                          className="h-9 w-full rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
+                                          value={serviceObjectQueryByOrder[order.id] || ""}
+                                          disabled={!!serviceObjectSavingByOrder[order.id]}
+                                          onChange={(event) =>
+                                            setServiceObjectQueryByOrder((prev) => ({ ...prev, [order.id]: event.target.value }))
+                                          }
+                                          placeholder="Найти объект ремонта"
+                                        />
+                                        <div className="absolute z-20 mt-1 max-h-56 w-full overflow-auto rounded-lg border border-gray-200 bg-white shadow-theme-lg dark:border-gray-800 dark:bg-gray-900">
+                                          {!availableServiceObjectOptions.length ? (
+                                            <div className="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">Ничего не найдено</div>
+                                          ) : (
+                                            availableServiceObjectOptions.map((item) => (
+                                              <button
+                                                key={item.id}
+                                                type="button"
+                                                className="w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-white/10"
+                                                onClick={() => void onChangeServiceObject(order.id, item.id)}
+                                              >
+                                                {item.name}
+                                              </button>
+                                            ))
+                                          )}
+                                        </div>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        className="text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                                        onClick={() => setServiceObjectEditOpenByOrder((prev) => ({ ...prev, [order.id]: false }))}
+                                      >
+                                        Отмена
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      className="inline-flex h-8 items-center gap-1 rounded-lg border border-gray-200 px-2 text-xs text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800"
+                                      disabled={!availableServiceObjectOptions.length}
+                                      onClick={() => openServiceObjectEditor(order)}
+                                    >
+                                      <EditButtonIcon />
+                                      Изменить
+                                    </button>
+                                  )
+                                ) : null}
                               </div>
                               <div>
                                 Виды работ:{" "}
@@ -1344,8 +2126,41 @@ export default function OrdersListPage() {
                                   .map((id) => workTypeNameById[id] || id)
                                   .join(", ") || "-"}
                               </div>
-                              <div>
-                                Склад: {warehouseNameById[order.warehouse_id || ""] || order.warehouse_id || "-"}
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span>Склад: {warehouseNameById[order.warehouse_id || ""] || order.warehouse_id || "-"}</span>
+                                {warehouseEditOpenByOrder[order.id] ? (
+                                  <>
+                                    <select
+                                      className="h-9 rounded-lg border border-gray-300 px-3 text-sm dark:border-gray-700 dark:bg-gray-900"
+                                      value={warehouseDraftByOrder[order.id] ?? order.warehouse_id ?? ""}
+                                      disabled={!!warehouseSavingByOrder[order.id] || !warehouseOptions.length}
+                                      onChange={(event) => void onChangeWarehouse(order.id, event.target.value)}
+                                    >
+                                      {warehouseOptions.map((warehouse) => (
+                                        <option key={warehouse.id} value={warehouse.id}>
+                                          {warehouse.name}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    <button
+                                      type="button"
+                                      className="text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                                      onClick={() => setWarehouseEditOpenByOrder((prev) => ({ ...prev, [order.id]: false }))}
+                                    >
+                                      Отмена
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="inline-flex h-8 items-center gap-1 rounded-lg border border-gray-200 px-2 text-xs text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800"
+                                    disabled={!warehouseOptions.length}
+                                    onClick={() => openWarehouseEditor(order)}
+                                  >
+                                    <EditButtonIcon />
+                                    Изменить
+                                  </button>
+                                )}
                               </div>
                               <div>
                                 Контакт:{" "}
@@ -1383,10 +2198,11 @@ export default function OrdersListPage() {
                                     target="_blank"
                                     rel="noreferrer"
                                     onClick={(e) => e.stopPropagation()}
-                                    className="inline-flex h-6 w-6 items-center justify-center rounded-md text-brand-600 hover:bg-gray-100 dark:text-brand-400 dark:hover:bg-white/10"
+                                    className="inline-flex h-8 items-center gap-1 rounded-lg border border-gray-200 px-2 text-xs text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800"
                                     title="Редактировать в Бухгалтерии"
                                   >
-                                    <PencilIcon className="size-5 shrink-0" />
+                                    <EditButtonIcon />
+                                    Изменить
                                   </a>
                                 </span>
                               </div>
@@ -1400,7 +2216,9 @@ export default function OrdersListPage() {
                                 <div className="space-y-1">
                                   {(financeByOrder[order.id] || []).map((line) => (
                                     <div key={line.id}>
-                                      {workTypeNameById[line.work_type_uuid] || line.work_type_uuid} | {line.amount} {line.currency} |{" "}
+                                      {workTypeNameById[line.work_type_uuid] || line.work_type_uuid} | {line.amount} {line.currency} | предоплата:{" "}
+                                      {line.prepayment ?? "-"} {line.prepayment != null ? line.currency : ""} | себестоимость: {line.cost_price ?? "-"}{" "}
+                                      {line.cost_price != null ? line.currency : ""} |{" "}
                                       {line.payment_method
                                         ? line.payment_method === "card"
                                           ? "Оплата по карте"
@@ -1416,7 +2234,7 @@ export default function OrdersListPage() {
                                 <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-2">Печать</div>
                                 <div className="relative inline-block">
                                   <button
-                                    className="dropdown-toggle inline-flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                    className="dropdown-toggle inline-flex items-center gap-2 rounded-lg border border-brand-200 bg-white px-3 py-1.5 text-sm font-medium text-brand-700 shadow-sm hover:border-brand-300 hover:bg-brand-50/60 dark:border-brand-900/50 dark:bg-gray-900 dark:text-brand-300 dark:hover:bg-brand-500/10"
                                     onClick={() => setPrintDropdownOrderId((prev) => (prev === order.id ? null : order.id))}
                                   >
                                     Выбрать форму
@@ -1451,11 +2269,16 @@ export default function OrdersListPage() {
                                               {forms.map((f) => (
                                                 <DropdownItem
                                                   key={f.id}
-                                                  onClick={() => void onPrintWithForm(order, f.id)}
-                                                  className="flex w-full rounded-lg text-left font-normal text-gray-600 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-300 dark:hover:bg-white/5 dark:hover:text-gray-100"
+                                                  onClick={() => void onPrintWithForm(order, f)}
+                                                  className="flex w-full items-center justify-between gap-2 rounded-lg text-left font-normal text-gray-600 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-300 dark:hover:bg-white/5 dark:hover:text-gray-100"
                                                   onItemClick={() => setPrintDropdownOrderId(null)}
                                                 >
-                                                  {f.title}
+                                                  <span>{f.title}</span>
+                                                  {f.qz_enabled && (
+                                                    <span className="rounded-full border border-brand-200 bg-brand-50 px-2 py-0.5 text-xs text-brand-700 dark:border-brand-900/40 dark:bg-brand-900/20 dark:text-brand-300">
+                                                      QZ
+                                                    </span>
+                                                  )}
                                                 </DropdownItem>
                                               ))}
                                             </div>
@@ -1468,54 +2291,77 @@ export default function OrdersListPage() {
 
                               <div className="pt-2 border-t border-gray-200 dark:border-gray-800 space-y-3">
                                 <div className="flex justify-end gap-2">
-                                  {confirmIssued ? (
-                                    <>
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          void onSetDisplayStatus(order.id, "Выдано");
-                                        }}
-                                        className="rounded-lg border border-green-300 bg-green-100 px-3 py-1.5 text-sm text-green-700 dark:border-green-500/40 dark:bg-green-500/15 dark:text-green-300"
-                                      >
-                                        Подтвердить
-                                      </button>
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: false }));
-                                        }}
-                                        className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-white/[0.06]"
-                                      >
-                                        Нет
-                                      </button>
-                                    </>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: true }));
-                                      }}
-                                      className={`rounded-lg border px-3 py-1.5 text-sm ${
-                                        isIssued
-                                          ? "border-green-300 bg-green-100 text-green-700 dark:border-green-500/40 dark:bg-green-500/15 dark:text-green-300"
-                                          : "border-gray-300 text-gray-700 hover:bg-green-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-green-500/10"
-                                      }`}
-                                    >
-                                      Выдано
-                                    </button>
-                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      onCancelComment(order.id);
+                                      void onOpenCamera(order.id);
+                                    }}
+                                    className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                  >
+                                    Фото
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      onCancelComment(order.id);
+                                      setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: true }));
+                                      setConfirmClearProblemByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                    }}
+                                    className={`rounded-lg border px-3 py-1.5 text-sm ${
+                                      isIssued
+                                        ? "border-green-300 bg-green-100 text-green-700 dark:border-green-500/40 dark:bg-green-500/15 dark:text-green-300"
+                                        : "border-gray-300 text-gray-700 hover:bg-green-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-green-500/10"
+                                    }`}
+                                  >
+                                    Выдано
+                                  </button>
                                   <button
                                     type="button"
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                      onStartComment(order.id);
+                                    }}
+                                    className={`rounded-lg border px-3 py-1.5 text-sm ${
+                                      commentDraftOpenByOrder[order.id]
+                                        ? "border-gray-400 bg-gray-100 text-gray-800 dark:border-gray-500/40 dark:bg-white/10 dark:text-gray-100"
+                                        : "border-gray-300 text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                    }`}
+                                  >
+                                    Комментарий
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                      setConfirmClearProblemByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                      onStartCallback(order.id, hasActiveCallback);
+                                    }}
+                                    className={`rounded-lg border px-3 py-1.5 text-sm ${
+                                      callbackDraftOpenByOrder[order.id]
+                                        ? "border-blue-300 bg-blue-100 text-blue-700 dark:border-blue-500/40 dark:bg-blue-500/15 dark:text-blue-300"
+                                        : "border-gray-300 text-gray-700 hover:bg-blue-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-blue-500/10"
+                                    }`}
+                                  >
+                                    Связаться
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                      if (issueKind === "return") {
+                                        setConfirmClearProblemByOrder((prev) => ({ ...prev, [order.id]: true }));
+                                        return;
+                                      }
                                       onStartIssue(order.id, "return");
                                     }}
                                     className={`rounded-lg border px-3 py-1.5 text-sm ${
-                                      issueDraftKind === "return"
+                                      issueDraftKind === "return" || issueKind === "return"
                                         ? "border-red-300 bg-red-100 text-red-700 dark:border-red-500/40 dark:bg-red-500/15 dark:text-red-300"
                                         : "border-gray-300 text-gray-700 hover:bg-red-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-red-500/10"
                                     }`}
@@ -1527,6 +2373,10 @@ export default function OrdersListPage() {
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                      if (issueKind === "problem" && canClearProblem) {
+                                        setConfirmClearProblemByOrder((prev) => ({ ...prev, [order.id]: true }));
+                                        return;
+                                      }
                                       onStartIssue(order.id, "problem");
                                     }}
                                     className={`rounded-lg border px-3 py-1.5 text-sm ${
@@ -1539,12 +2389,250 @@ export default function OrdersListPage() {
                                   </button>
                                 </div>
 
+                                {photoHistoryErrorByOrder[order.id] ? (
+                                  <div className="flex justify-end">
+                                    <div className="text-sm text-red-600">Ошибка: {photoHistoryErrorByOrder[order.id]}</div>
+                                  </div>
+                                ) : null}
+
+                                {callbackDraftOpenByOrder[order.id] && activeCallbackOrderId === order.id ? (
+                                  <div className="flex justify-end">
+                                    <div className="w-full max-w-[380px] rounded-lg border border-blue-200 bg-white/80 p-3 dark:border-blue-500/20 dark:bg-white/[0.03]">
+                                      <div className="mb-2 text-sm font-medium text-gray-800 dark:text-white/90">
+                                        {showCallbackActions ? "Связаться с клиентом" : "Когда связаться"}
+                                      </div>
+                                      {showCallbackDate ? (
+                                        <DatePicker
+                                          id={`order-callback-date-${order.id}`}
+                                          mode="single"
+                                          defaultDate={callbackDateByOrder[order.id] || undefined}
+                                          placeholder="Выберите дату"
+                                          onChange={(dates) => {
+                                            const selected = dates?.[0];
+                                            setCallbackDateByOrder((prev) => ({
+                                              ...prev,
+                                              [order.id]: selected ? toYmdLocal(selected) : "",
+                                            }));
+                                          }}
+                                        />
+                                      ) : null}
+                                      <div className="mt-2 flex justify-end gap-2">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            if (showCallbackActions) {
+                                              setCallbackNeedDateByOrder((prev) => ({
+                                                ...prev,
+                                                [order.id]: true,
+                                              }));
+                                              setCallbackDateByOrder((prev) => ({
+                                                ...prev,
+                                                [order.id]: prev[order.id] || order.active_callback_date || toYmdLocal(new Date()),
+                                              }));
+                                              return;
+                                            }
+                                            onCancelCallback(order.id);
+                                          }}
+                                          className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                        >
+                                          {showCallbackActions ? "Нет" : "Отмена"}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          disabled={!!callbackSavingByOrder[order.id]}
+                                          onClick={() =>
+                                            void (showCallbackActions ? onCompleteCallback(order.id) : onSaveCallback(order.id))
+                                          }
+                                          className="rounded-lg border border-blue-300 bg-blue-100 px-3 py-1.5 text-sm text-blue-700 disabled:opacity-60 dark:border-blue-500/40 dark:bg-blue-500/15 dark:text-blue-300"
+                                        >
+                                          {showCallbackActions ? "Выполнено" : "Сохранить"}
+                                        </button>
+                                      </div>
+                                      {hasActiveCallback ? (
+                                        <textarea
+                                          value={callbackCommentByOrder[order.id] || ""}
+                                          onChange={(event) =>
+                                            setCallbackCommentByOrder((prev) => ({
+                                              ...prev,
+                                              [order.id]: event.target.value,
+                                            }))
+                                          }
+                                          rows={3}
+                                          placeholder="Комментарий (необязательно)"
+                                          className="mt-2 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-800 outline-none focus:border-brand-500 dark:border-gray-700 dark:bg-gray-900 dark:text-white/90"
+                                        />
+                                      ) : null}
+                                    </div>
+                                  </div>
+                                ) : null}
+
+                                {confirmIssued ? (
+                                  <div className="flex justify-end gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        void onSetDisplayStatus(order.id, "Выдано");
+                                      }}
+                                      className="rounded-lg border border-green-300 bg-green-100 px-3 py-1.5 text-sm text-green-700 dark:border-green-500/40 dark:bg-green-500/15 dark:text-green-300"
+                                    >
+                                      Подтвердить
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setConfirmIssuedByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                      }}
+                                      className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                    >
+                                      Нет
+                                    </button>
+                                  </div>
+                                ) : null}
+
+                                {canClearIssue && confirmClearProblem ? (
+                                  <div className="flex justify-end gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        void onClearProblem(order.id);
+                                      }}
+                                      className="rounded-lg border border-blue-300 bg-blue-100 px-3 py-1.5 text-sm text-blue-700 dark:border-blue-500/40 dark:bg-blue-500/15 dark:text-blue-300"
+                                    >
+                                      {issueKind === "return" ? "Снять возврат" : "Снять проблему"}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setConfirmClearProblemByOrder((prev) => ({ ...prev, [order.id]: false }));
+                                      }}
+                                      className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                    >
+                                      Нет
+                                    </button>
+                                  </div>
+                                ) : null}
+
                                 {issueDraftKind && (
                                   <div className="flex justify-end">
-                                    <div className="w-[250px] rounded-lg border border-red-200 bg-white/80 p-3 dark:border-red-500/20 dark:bg-white/[0.03]">
+                                    <div className="w-full max-w-[380px] rounded-lg border border-red-200 bg-white/80 p-3 dark:border-red-500/20 dark:bg-white/[0.03]">
                                       <div className="mb-2 text-sm font-medium text-gray-800 dark:text-white/90">
-                                        {issueDraftKind === "return" ? "Причина возврата" : "Описание проблемы"}
+                                        {issueDraftKind === "return" ? "Возврат" : "Описание проблемы"}
                                       </div>
+                                      {issueDraftKind === "return" ? (
+                                        <div className="mb-3 space-y-3">
+                                          <div>
+                                            <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                                              Вариант возврата
+                                            </div>
+                                            <div className="flex flex-wrap gap-x-4 gap-y-2">
+                                              <Radio
+                                                id={`return-type-repair-${order.id}`}
+                                                name={`return-type-${order.id}`}
+                                                value="repair"
+                                                checked={issueReturnType === "repair"}
+                                                label="Возврат в ремонт"
+                                                onChange={(_value) => {
+                                                  setIssueReturnTypeByOrder((prev) => ({ ...prev, [order.id]: "repair" }));
+                                                  setIssueReturnMoneySourceByOrder((prev) => ({ ...prev, [order.id]: undefined }));
+                                                  setIssueReturnAmountByOrder((prev) => ({ ...prev, [order.id]: "" }));
+                                                }}
+                                              />
+                                              <Radio
+                                                id={`return-type-money-${order.id}`}
+                                                name={`return-type-${order.id}`}
+                                                value="money"
+                                                checked={issueReturnType === "money"}
+                                                label="Возврат денег"
+                                                onChange={(_value) =>
+                                                  setIssueReturnTypeByOrder((prev) => ({ ...prev, [order.id]: "money" }))
+                                                }
+                                              />
+                                            </div>
+                                          </div>
+
+                                          {issueReturnType === "money" ? (
+                                            <div className="space-y-3 rounded-lg border border-gray-200 p-3 dark:border-gray-700">
+                                              <div>
+                                                <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                                                  Откуда идет возврат
+                                                </div>
+                                                <div className="flex flex-wrap gap-x-4 gap-y-2">
+                                                  <Radio
+                                                    id={`return-money-source-today-${order.id}`}
+                                                    name={`return-money-source-${order.id}`}
+                                                    value="today_cash"
+                                                    checked={issueReturnMoneySource === "today_cash"}
+                                                    label="Из сегодняшней кассы"
+                                                    onChange={(_value) =>
+                                                      setIssueReturnMoneySourceByOrder((prev) => ({
+                                                        ...prev,
+                                                        [order.id]: "today_cash",
+                                                      }))
+                                                    }
+                                                  />
+                                                  <Radio
+                                                    id={`return-money-source-order-${order.id}`}
+                                                    name={`return-money-source-${order.id}`}
+                                                    value="order_day_cash"
+                                                    checked={issueReturnMoneySource === "order_day_cash"}
+                                                    label="Из кассы в день принятия заказа"
+                                                    onChange={(_value) =>
+                                                      setIssueReturnMoneySourceByOrder((prev) => ({
+                                                        ...prev,
+                                                        [order.id]: "order_day_cash",
+                                                      }))
+                                                    }
+                                                  />
+                                                </div>
+                                              </div>
+
+                                              {issueReturnMoneySource ? (
+                                                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                                                  <div>
+                                                    <div className="mb-1 text-xs font-medium text-gray-500 dark:text-gray-400">
+                                                      Сумма возврата
+                                                    </div>
+                                                    <input
+                                                      type="number"
+                                                      min="0"
+                                                      step="0.01"
+                                                      value={issueReturnAmountByOrder[order.id] || ""}
+                                                      onChange={(e) =>
+                                                        setIssueReturnAmountByOrder((prev) => ({
+                                                          ...prev,
+                                                          [order.id]: e.target.value,
+                                                        }))
+                                                      }
+                                                      placeholder="Введите сумму"
+                                                      className="h-10 w-full rounded-lg border border-gray-300 px-3 text-sm text-gray-800 outline-none focus:border-brand-500 dark:border-gray-700 dark:bg-gray-900 dark:text-white/90"
+                                                    />
+                                                  </div>
+                                                  <div>
+                                                    <div className="mb-1 text-xs font-medium text-gray-500 dark:text-gray-400">
+                                                      Дата возврата
+                                                    </div>
+                                                    <input
+                                                      type="date"
+                                                      value={issueReturnRefundDate}
+                                                      readOnly
+                                                      className="h-10 w-full rounded-lg border border-gray-300 px-3 text-sm text-gray-800 outline-none dark:border-gray-700 dark:bg-gray-900 dark:text-white/90"
+                                                    />
+                                                  </div>
+                                                </div>
+                                              ) : null}
+                                            </div>
+                                          ) : null}
+                                        </div>
+                                      ) : null}
+                                      {issueDraftKind === "return" ? (
+                                        <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                                          Комментарий
+                                        </div>
+                                      ) : null}
                                       <textarea
                                         value={issueDraftReasonByOrder[order.id] || ""}
                                         onChange={(e) =>
@@ -1552,7 +2640,11 @@ export default function OrdersListPage() {
                                         }
                                         placeholder={
                                           issueDraftKind === "return"
-                                            ? "Укажите причину возврата"
+                                            ? issueReturnType === "repair"
+                                              ? "Введите комментарий по возврату в ремонт"
+                                              : issueReturnType === "money"
+                                              ? "Введите комментарий по возврату денег"
+                                              : "Введите комментарий по возврату"
                                             : "Опишите проблему"
                                         }
                                         rows={3}
@@ -1584,18 +2676,70 @@ export default function OrdersListPage() {
                                   </div>
                                 )}
 
+                                {commentDraftOpenByOrder[order.id] && (
+                                  <div className="flex justify-end">
+                                    <div className="w-[250px] rounded-lg border border-gray-200 bg-white/80 p-3 dark:border-gray-700 dark:bg-white/[0.03]">
+                                      <div className="mb-2 text-sm font-medium text-gray-800 dark:text-white/90">
+                                        Комментарий
+                                      </div>
+                                      <textarea
+                                        value={commentDraftTextByOrder[order.id] || ""}
+                                        onChange={(e) =>
+                                          setCommentDraftTextByOrder((prev) => ({ ...prev, [order.id]: e.target.value }))
+                                        }
+                                        placeholder="Введите комментарий"
+                                        rows={3}
+                                        className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-800 outline-none focus:border-brand-500 dark:border-gray-700 dark:bg-gray-900 dark:text-white/90"
+                                      />
+                                      <div className="mt-2 space-y-2">
+                                        {commentHistoryErrorByOrder[order.id] ? (
+                                          <div className="text-sm text-red-600">Ошибка: {commentHistoryErrorByOrder[order.id]}</div>
+                                        ) : null}
+                                        <div className="flex justify-end gap-2">
+                                          <button
+                                            type="button"
+                                            onClick={() => onCancelComment(order.id)}
+                                            className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                          >
+                                            Отмена
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => void onSaveComment(order.id)}
+                                            disabled={!!commentSavingByOrder[order.id]}
+                                            className="rounded-lg border border-gray-300 bg-gray-100 px-3 py-1.5 text-sm text-gray-800 disabled:opacity-60 dark:border-gray-700 dark:bg-white/10 dark:text-gray-100"
+                                          >
+                                            Сохранить
+                                          </button>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+
                                 {(issueHistoryLoadingByOrder[order.id] ||
+                                  commentHistoryLoadingByOrder[order.id] ||
+                                  photoHistoryLoadingByOrder[order.id] ||
                                   statusHistoryLoadingByOrder[order.id] ||
                                   (issueHistoryErrorByOrder[order.id] && !issueDraftKind) ||
+                                  (commentHistoryErrorByOrder[order.id] && !commentDraftOpenByOrder[order.id]) ||
+                                  photoHistoryErrorByOrder[order.id] ||
                                   statusHistoryErrorByOrder[order.id] ||
                                   buildFeedItems(order.id).length > 0) && (
                                   <div className="flex justify-end">
                                     <div className="w-full max-w-xl space-y-2">
                                       <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Лента</div>
-                                      {issueHistoryLoadingByOrder[order.id] || statusHistoryLoadingByOrder[order.id] ? (
+                                      {issueHistoryLoadingByOrder[order.id] ||
+                                      commentHistoryLoadingByOrder[order.id] ||
+                                      photoHistoryLoadingByOrder[order.id] ||
+                                      statusHistoryLoadingByOrder[order.id] ? (
                                         <div className="text-sm text-gray-500 dark:text-gray-400">Загрузка...</div>
                                       ) : issueHistoryErrorByOrder[order.id] && !issueDraftKind ? (
                                         <div className="text-sm text-red-600">Ошибка: {issueHistoryErrorByOrder[order.id]}</div>
+                                      ) : commentHistoryErrorByOrder[order.id] && !commentDraftOpenByOrder[order.id] ? (
+                                        <div className="text-sm text-red-600">Ошибка: {commentHistoryErrorByOrder[order.id]}</div>
+                                      ) : photoHistoryErrorByOrder[order.id] ? (
+                                        <div className="text-sm text-red-600">Ошибка: {photoHistoryErrorByOrder[order.id]}</div>
                                       ) : statusHistoryErrorByOrder[order.id] ? (
                                         <div className="text-sm text-red-600">Ошибка: {statusHistoryErrorByOrder[order.id]}</div>
                                       ) : (
@@ -1610,17 +2754,39 @@ export default function OrdersListPage() {
                                                   <span className="inline-flex items-center rounded-full bg-red-100 px-2 py-0.5 font-medium text-red-700 dark:bg-red-500/15 dark:text-red-300">
                                                     {entry.title}
                                                   </span>
+                                                ) : entry.kind === "photo" ? (
+                                                  <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 font-medium text-blue-700 dark:bg-blue-500/15 dark:text-blue-300">
+                                                    Фото
+                                                  </span>
+                                                ) : entry.kind === "comment" ? (
+                                                  <span className="inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 font-medium text-gray-700 dark:bg-white/10 dark:text-gray-300">
+                                                    Комментарий
+                                                  </span>
                                                 ) : (
                                                   <span className="inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 font-medium text-gray-700 dark:bg-white/10 dark:text-gray-300">
                                                     Статус
                                                   </span>
                                                 )}
                                                 <span>{new Date(entry.created_at).toLocaleString()}</span>
-                                                {entry.kind === "issue" && entry.created_by_name ? <span>{entry.created_by_name}</span> : null}
+                                                {entry.kind !== "status" && entry.created_by_name ? <span>{entry.created_by_name}</span> : null}
                                               </div>
-                                              <div className="mt-1 text-sm text-gray-800 dark:text-white/90">
-                                                {entry.kind === "issue" ? entry.reason : entry.title}
-                                              </div>
+                                              {entry.kind === "photo" ? (
+                                                <button
+                                                  type="button"
+                                                  onClick={() => setPreviewPhotoUrl(entry.image_url)}
+                                                  className="mt-2 overflow-hidden rounded-lg border border-gray-200 dark:border-gray-700"
+                                                >
+                                                  <img
+                                                    src={entry.image_url}
+                                                    alt="Фото заказа"
+                                                    className="h-[200px] w-[200px] object-cover"
+                                                  />
+                                                </button>
+                                              ) : (
+                                                <div className="mt-1 text-sm text-gray-800 dark:text-white/90">
+                                                  {entry.kind === "issue" ? entry.reason : entry.title}
+                                                </div>
+                                              )}
                                             </div>
                                           ))}
                                         </div>
@@ -1685,6 +2851,60 @@ export default function OrdersListPage() {
           </div>
         )}
       </div>
+
+      <Modal isOpen={!!cameraOrderId} onClose={closeCameraModal} className="mx-4 max-w-3xl p-6">
+        <div className="space-y-4">
+          <div className="text-lg font-semibold text-gray-800 dark:text-white/90">Фото заказа</div>
+          {capturedPhotoDataUrl ? (
+            <img src={capturedPhotoDataUrl} alt="Снимок заказа" className="max-h-[70vh] w-full rounded-xl object-contain" />
+          ) : (
+            <video ref={cameraVideoRef} autoPlay playsInline muted className="max-h-[70vh] w-full rounded-xl bg-black object-contain" />
+          )}
+          <div className="flex flex-wrap justify-end gap-2">
+            {capturedPhotoDataUrl ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => cameraOrderId && void onOpenCamera(cameraOrderId)}
+                  className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                >
+                  Переснять
+                </button>
+                <button
+                  type="button"
+                  onClick={() => cameraOrderId && void onSavePhoto(cameraOrderId)}
+                  disabled={!cameraOrderId || !!photoSavingByOrder[cameraOrderId]}
+                  className="rounded-lg border border-blue-300 bg-blue-100 px-3 py-1.5 text-sm text-blue-700 disabled:opacity-60 dark:border-blue-500/40 dark:bg-blue-500/15 dark:text-blue-300"
+                >
+                  Сохранить
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={onCapturePhoto}
+                className="rounded-lg border border-blue-300 bg-blue-100 px-3 py-1.5 text-sm text-blue-700 dark:border-blue-500/40 dark:bg-blue-500/15 dark:text-blue-300"
+              >
+                Сделать снимок
+              </button>
+            )}
+          </div>
+        </div>
+      </Modal>
+
+      <Modal isOpen={!!previewPhotoUrl} onClose={() => setPreviewPhotoUrl(null)} className="mx-4 max-w-5xl p-6">
+        <div className="space-y-4">
+          <div className="text-lg font-semibold text-gray-800 dark:text-white/90">Фото заказа</div>
+          {previewPhotoUrl ? (
+            <img src={previewPhotoUrl} alt="Фото заказа" className="max-h-[80vh] w-full rounded-xl object-contain" />
+          ) : null}
+        </div>
+      </Modal>
+      {cameraToast ? (
+        <div className="fixed bottom-4 left-4 z-[120] max-w-md rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700 shadow-lg dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-300">
+          Ошибка: {cameraToast}
+        </div>
+      ) : null}
     </div>
   );
 }

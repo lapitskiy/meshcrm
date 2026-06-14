@@ -1,0 +1,19 @@
+{
+  "name": "staff",
+  "bounded_context": "staff",
+  "version": "1.0.0",
+  "events": { "subscribes": [], "publishes": [] },
+  "ui": {
+    "menu": {
+      "title": "Персонал",
+      "items": [
+        { "id": "attendance", "title": "Посещаемость" },
+        { "id": "branches", "title": "Филиалы" },
+        { "id": "schedules", "title": "Графики смен" },
+        { "id": "analytics", "title": "Аналитика" },
+        { "id": "settings", "title": "Настройки" }
+      ]
+    }
+  },
+  "api": { "base_url": "http://staff:8000" }
+}

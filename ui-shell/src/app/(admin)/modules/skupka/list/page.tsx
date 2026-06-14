@@ -1,6 +1,18 @@
 "use client";
 
 import { getGatewayBaseUrl } from "@/lib/gateway";
+import { qzPrintRaw, qzPrintRawHex } from "@/lib/qzTray";
+import {
+  QZ_DEFAULT_PRINTER_NAME,
+  ensureTsplPrintFooter,
+  findUnknownPlaceholderKeys,
+  htmlTo30x20TsplHex,
+  htmlToPlainLinesForTspl,
+  looksLikeTspl,
+  normPrintPlaceholderKey,
+  normalizeTsplPayload,
+  tsplEscapeText as tsplText,
+} from "@/lib/printQzTspl";
 import React, { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import DatePicker from "@/components/form/date-picker";
@@ -53,6 +65,14 @@ type PrintFormListItem = {
   title: string;
   category_id?: string | null;
   category_name?: string;
+  page_width_mm: number;
+  page_height_mm: number;
+  page_margin_mm: number;
+  page_auto_height: boolean;
+  page_offset_x_mm?: number | null;
+  page_offset_y_mm?: number | null;
+  page_rotation_deg?: number | null;
+  qz_enabled: boolean;
   updated_at: string;
 };
 
@@ -63,6 +83,31 @@ type WarehouseOption = {
 
 function getToken(): string {
   return (window as any).__hubcrmAccessToken || "";
+}
+
+function pageSizeMm(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.min(2000, Math.round(parsed)));
+}
+
+function optionalPrintNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.round(parsed);
+}
+
+function printTransformCss(form: any): string {
+  const x = optionalPrintNumber(form?.page_offset_x_mm);
+  const y = optionalPrintNumber(form?.page_offset_y_mm);
+  const rotation = optionalPrintNumber(form?.page_rotation_deg);
+  const parts: string[] = [];
+  if (x !== null || y !== null) parts.push(`translate(${x ?? 0}mm, ${y ?? 0}mm)`);
+  if (rotation === 90) parts.push("rotate(90deg) translateY(-100%)");
+  if (rotation === 180) parts.push("rotate(180deg) translate(-100%, -100%)");
+  if (rotation === 270) parts.push("rotate(270deg) translateX(-100%)");
+  return parts.length ? `transform:${parts.join(" ")};transform-origin:top left;` : "";
 }
 
 function dealTypeLabel(value: string): string {
@@ -129,6 +174,7 @@ export default function SkupkaListPage() {
   const [printFormsError, setPrintFormsError] = useState<string>("");
   const [printFormsLoading, setPrintFormsLoading] = useState(false);
   const [printDropdownDealId, setPrintDropdownDealId] = useState<string | null>(null);
+  const [, setQzBusyDealId] = useState<string | null>(null);
   const [lineByDealId, setLineByDealId] = useState<Record<string, BuybackFinanceLine>>({});
   const [warehouseNameById, setWarehouseNameById] = useState<Record<string, string>>({});
   const [draftFilters, setDraftFilters] = useState<ListFilters>({
@@ -263,9 +309,9 @@ export default function SkupkaListPage() {
   const renderTemplate = (html: string, ctx: Record<string, string>) => {
     const source = String(html || "");
     const ctxLower: Record<string, string> = {};
-    for (const [k, v] of Object.entries(ctx)) ctxLower[k.toLowerCase()] = String(v ?? "");
+    for (const [k, v] of Object.entries(ctx)) ctxLower[normPrintPlaceholderKey(k)] = String(v ?? "");
     return source.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_m, keyRaw: string) => {
-      const key = String(keyRaw || "").trim().toLowerCase();
+      const key = normPrintPlaceholderKey(String(keyRaw || ""));
       return Object.prototype.hasOwnProperty.call(ctxLower, key) ? ctxLower[key] : _m;
     });
   };
@@ -280,9 +326,92 @@ export default function SkupkaListPage() {
     }
   };
 
-  const onPrintWithForm = async (deal: BuybackDeal, formId: string) => {
+  /** Проверка QZ: минимальный TSPL с текстом TEST (сырой «TEST» без команд этикетка не печатает). */
+  const onPrintQzTestRaw = async () => {
+    setError(null);
+    try {
+      await qzPrintRawHex(QZ_DEFAULT_PRINTER_NAME, htmlTo30x20TsplHex("<p style=\"font-size:24px\">ТЕСТ QZ</p><p>Русский текст</p>"));
+    } catch (e: any) {
+      setError(e?.message || "QZ TEST failed");
+    }
+  };
+
+  const onPrintWithForm = async (deal: BuybackDeal, form: PrintFormListItem) => {
     setError(null);
     setPrintDropdownDealId(null);
+    if (form.qz_enabled) {
+      setQzBusyDealId(deal.id);
+      try {
+        const formResp = await fetchWithRetry(
+          `${base}/documents/print/forms/${encodeURIComponent(form.id)}?_cb=${Date.now()}`,
+          {
+            cache: "no-store",
+            headers: authHeaders(),
+          }
+        );
+        if (!formResp.ok) {
+          const body = await formResp.text().catch(() => "");
+          throw new Error(`form load failed: ${formResp.status} ${body}`);
+        }
+        const fullForm = await formResp.json();
+        const financeLine = lineByDealId[deal.id];
+        const creator = creatorOptions.find((item) => item.user_uuid === String(deal.created_by_uuid || "").trim()) || null;
+        const ctx: Record<string, string> = {
+          deal_id: tsplText(deal.id, 64),
+          deal_number: tsplText(deal.deal_number ?? "", 32),
+          deal_type: tsplText(dealTypeLabel(deal.deal_type), 64),
+          realization_status: tsplText(deal.realization_status || "Не реализован", 64),
+          category_name: tsplText(deal.category_name || "-", 64),
+          purchase_object_name: tsplText(deal.purchase_object_name || "-", 64),
+          device_condition_names: tsplText((deal.device_condition_names || []).join(", "), 120),
+          title: tsplText(deal.title || "-", 120),
+          client_name: tsplText(deal.client_name || "-", 64),
+          client_phone: tsplText(deal.client_phone || "-", 32),
+          offered_amount: tsplText(String(deal.offered_amount ?? ""), 32),
+          amount: tsplText(String(financeLine?.amount ?? deal.offered_amount ?? ""), 32),
+          currency: tsplText(String(financeLine?.currency || deal.currency || "RUB"), 8),
+          payment_method: tsplText(paymentMethodLabel(String(financeLine?.payment_method || "")), 32),
+          warehouse_name: tsplText(warehouseNameById[String(deal.warehouse_id || "")] || "-", 64),
+          comment: tsplText(deal.comment || "", 200),
+          user_name: tsplText(creatorDisplayName(creator), 64),
+          user_login: tsplText(String(creator?.username || creator?.email || deal.created_by_uuid || "-"), 64),
+          created_at: tsplText(formatDateTime(deal.created_at), 64),
+        };
+        const tpl = String(fullForm?.content_html || "").trim();
+        if (!tpl) {
+          throw new Error(
+            "QZ: в форме пустое тело печати. Открой форму в «Печать» → режим HTML, вставь TSPL и {{ deal_number }} и т.д., сохрани. Раньше при пустом теле подставлялась запасная этикетка — она отключена."
+          );
+        }
+        const unknownPh = findUnknownPlaceholderKeys(tpl, ctx);
+        if (unknownPh.length > 0) {
+          const allowed = Object.keys(ctx).sort().join(", ");
+          throw new Error(
+            `QZ: в шаблоне неизвестные имена: ${unknownPh.join(", ")}. Для выкупа: ${allowed}. (Часто: {{ order_* }} — только для заказов; нужны deal_number, title, …)`
+          );
+        }
+        const renderedRaw = renderTemplate(tpl, ctx);
+        const rendered = htmlToPlainLinesForTspl(renderedRaw);
+        if (!rendered.trim()) {
+          throw new Error(
+            "QZ: после очистки HTML шаблон пуст. В форме должны быть строки TSPL (не только пустые абзацы редактора)."
+          );
+        }
+        const commands = looksLikeTspl(rendered)
+          ? [ensureTsplPrintFooter(normalizeTsplPayload(rendered))]
+          : null;
+        if (commands) {
+          await qzPrintRaw(QZ_DEFAULT_PRINTER_NAME, commands);
+        } else {
+          await qzPrintRawHex(QZ_DEFAULT_PRINTER_NAME, htmlTo30x20TsplHex(renderedRaw));
+        }
+      } catch (e: any) {
+        setError(e?.message || "QZ print failed");
+      } finally {
+        setQzBusyDealId(null);
+      }
+      return;
+    }
     const w = window.open("about:blank", "_blank");
     try {
       if (!w) throw new Error("popup blocked");
@@ -290,10 +419,13 @@ export default function SkupkaListPage() {
       w.document.write(`<!doctype html><html><head><meta charset="utf-8"/><title>Документ</title></head><body>Loading...</body></html>`);
       w.document.close();
 
-      const formResp = await fetchWithRetry(`${base}/documents/print/forms/${encodeURIComponent(formId)}`, {
-        cache: "no-store",
-        headers: authHeaders(),
-      });
+      const formResp = await fetchWithRetry(
+        `${base}/documents/print/forms/${encodeURIComponent(form.id)}?_cb=${Date.now()}`,
+        {
+          cache: "no-store",
+          headers: authHeaders(),
+        }
+      );
       if (!formResp.ok) {
         const body = await formResp.text().catch(() => "");
         throw new Error(`form load failed: ${formResp.status} ${body}`);
@@ -301,6 +433,11 @@ export default function SkupkaListPage() {
 
       const form = await formResp.json();
       const printTitle = String(form?.title || "Документ").trim() || "Документ";
+      const widthMm = pageSizeMm(form?.page_width_mm, 200);
+      const heightMm = pageSizeMm(form?.page_height_mm, 300);
+      const marginMm = pageSizeMm(form?.page_margin_mm, 0);
+      const autoHeight = Boolean(form?.page_auto_height);
+      const transformCss = printTransformCss(form);
       const financeLine = lineByDealId[deal.id];
       const creator = creatorOptions.find((item) => item.user_uuid === String(deal.created_by_uuid || "").trim()) || null;
       const ctx: Record<string, string> = {
@@ -327,7 +464,19 @@ export default function SkupkaListPage() {
 
       const html = renderTemplate(String(form?.content_html || ""), ctx);
       w.document.open();
-      w.document.write(`<!doctype html><html><head><meta charset="utf-8"/><title>${printTitle}</title></head><body>${html}</body></html>`);
+      w.document.write(`<!doctype html><html><head><meta charset="utf-8"/><title>${printTitle}</title>
+        <style>
+          @page{size:${widthMm}mm ${heightMm}mm;margin:${marginMm}mm;}
+          html,body{width:${widthMm}mm;margin:0;padding:0;}
+          body{font-family:Arial, sans-serif;margin:0;padding:0;}
+          .print-root{width:100%;margin:0;padding:0;${transformCss}}
+          .print-root table{width:100% !important;table-layout:fixed !important;border-collapse:collapse !important;}
+          .print-root td,.print-root th{overflow:hidden;vertical-align:top;word-break:break-word;}
+          .print-root img{display:block;max-width:100%;height:auto;}
+          @media print{html,body{width:${widthMm}mm;margin:0 !important;padding:0 !important;}.print-root{width:100%;margin:0 !important;padding:0 !important;}}
+          @media screen{html,body,.print-root{width:${widthMm}mm;${autoHeight ? "" : `min-height:${heightMm}mm;`}}}
+        </style>
+      </head><body><div class="print-root">${html}</div></body></html>`);
       w.document.close();
       try {
         w.history.replaceState({}, "", "/print-preview");
@@ -498,55 +647,70 @@ export default function SkupkaListPage() {
                               {item.comment ? <div>Комментарий: {item.comment}</div> : null}
                               <div className="pt-2 border-t border-gray-200 dark:border-gray-800">
                                 <div className="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-2">Печать</div>
-                                <div className="relative inline-block">
-                                  <button
-                                    className="dropdown-toggle inline-flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
-                                    onClick={() => setPrintDropdownDealId((prev) => (prev === item.id ? null : item.id))}
-                                  >
-                                    Выбрать форму
-                                    <ChevronDownIcon className="w-4 h-4" />
-                                  </button>
-                                  <Dropdown
-                                    isOpen={printDropdownDealId === item.id}
-                                    onClose={() => setPrintDropdownDealId(null)}
-                                    className="left-0 right-auto w-72 p-2"
-                                  >
-                                    {printFormsLoading ? (
-                                      <div className="px-4 py-2 text-sm text-gray-500 dark:text-gray-400">Загрузка...</div>
-                                    ) : printFormsError ? (
-                                      <div className="px-4 py-2 text-sm text-red-600">Ошибка: {printFormsError}</div>
-                                    ) : !printForms.length ? (
-                                      <div className="px-4 py-2 text-sm text-gray-500 dark:text-gray-400">Форм нет.</div>
-                                    ) : (
-                                      <div className="max-h-96 overflow-auto">
-                                        {Object.entries(
-                                          printForms.reduce<Record<string, PrintFormListItem[]>>((acc, f) => {
-                                            const k = String(f.category_name || "").trim() || "Без категории";
-                                            (acc[k] ||= []).push(f);
-                                            return acc;
-                                          }, {})
-                                        )
-                                          .sort(([a], [b]) => a.localeCompare(b))
-                                          .map(([catName, forms]) => (
-                                            <div key={catName} className="mb-2">
-                                              <div className="px-4 py-1 text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">
-                                                {catName}
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <div className="relative inline-block">
+                                    <button
+                                      className="dropdown-toggle inline-flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-800 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                      onClick={() => setPrintDropdownDealId((prev) => (prev === item.id ? null : item.id))}
+                                    >
+                                      Выбрать форму
+                                      <ChevronDownIcon className="w-4 h-4" />
+                                    </button>
+                                    <Dropdown
+                                      isOpen={printDropdownDealId === item.id}
+                                      onClose={() => setPrintDropdownDealId(null)}
+                                      className="left-0 right-auto w-72 p-2"
+                                    >
+                                      {printFormsLoading ? (
+                                        <div className="px-4 py-2 text-sm text-gray-500 dark:text-gray-400">Загрузка...</div>
+                                      ) : printFormsError ? (
+                                        <div className="px-4 py-2 text-sm text-red-600">Ошибка: {printFormsError}</div>
+                                      ) : !printForms.length ? (
+                                        <div className="px-4 py-2 text-sm text-gray-500 dark:text-gray-400">Форм нет.</div>
+                                      ) : (
+                                        <div className="max-h-96 overflow-auto">
+                                          {Object.entries(
+                                            printForms.reduce<Record<string, PrintFormListItem[]>>((acc, f) => {
+                                              const k = String(f.category_name || "").trim() || "Без категории";
+                                              (acc[k] ||= []).push(f);
+                                              return acc;
+                                            }, {})
+                                          )
+                                            .sort(([a], [b]) => a.localeCompare(b))
+                                            .map(([catName, forms]) => (
+                                              <div key={catName} className="mb-2">
+                                                <div className="px-4 py-1 text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                                                  {catName}
+                                                </div>
+                                                {forms.map((f) => (
+                                                  <DropdownItem
+                                                    key={f.id}
+                                                    onClick={() => void onPrintWithForm(item, f)}
+                                                    className="flex w-full items-center justify-between gap-2 rounded-lg text-left font-normal text-gray-600 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-300 dark:hover:bg-white/5 dark:hover:text-gray-100"
+                                                    onItemClick={() => setPrintDropdownDealId(null)}
+                                                  >
+                                                    <span>{f.title}</span>
+                                                    {f.qz_enabled && (
+                                                      <span className="rounded-full border border-brand-200 bg-brand-50 px-2 py-0.5 text-xs text-brand-700 dark:border-brand-900/40 dark:bg-brand-900/20 dark:text-brand-300">
+                                                        QZ
+                                                      </span>
+                                                    )}
+                                                  </DropdownItem>
+                                                ))}
                                               </div>
-                                              {forms.map((f) => (
-                                                <DropdownItem
-                                                  key={f.id}
-                                                  onClick={() => void onPrintWithForm(item, f.id)}
-                                                  className="flex w-full rounded-lg text-left font-normal text-gray-600 hover:bg-gray-100 hover:text-gray-800 dark:text-gray-300 dark:hover:bg-white/5 dark:hover:text-gray-100"
-                                                  onItemClick={() => setPrintDropdownDealId(null)}
-                                                >
-                                                  {f.title}
-                                                </DropdownItem>
-                                              ))}
-                                            </div>
-                                          ))}
-                                      </div>
-                                    )}
-                                  </Dropdown>
+                                            ))}
+                                        </div>
+                                      )}
+                                    </Dropdown>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    className="inline-flex items-center rounded-lg border border-dashed border-gray-300 px-3 py-1.5 text-sm font-mono text-gray-700 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                                    onClick={() => void onPrintQzTestRaw()}
+                                    title="QZ: TSPL 30×20 мм, текст «30x20 TEST» (forceRaw)"
+                                  >
+                                    TEST
+                                  </button>
                                 </div>
                               </div>
                             </div>

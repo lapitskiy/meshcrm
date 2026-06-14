@@ -2,6 +2,7 @@
   "realm": "hubcrm",
   "enabled": true,
   "displayName": "HubCRM",
+  "loginTheme": "hubcrm-no-autofill",
   "registrationAllowed": false,
   "rememberMe": true,
   "ssoSessionIdleTimeout": 43200,

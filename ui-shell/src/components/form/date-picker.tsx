@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import flatpickr from 'flatpickr';
+import { Russian } from 'flatpickr/dist/l10n/ru.js';
 import 'flatpickr/dist/flatpickr.css';
 import Label from './Label';
 import { CalenderIcon } from '../../icons';
@@ -32,6 +33,7 @@ export default function DatePicker({
       dateFormat: "Y-m-d",
       closeOnSelect: resolvedMode !== "range",
       defaultDate,
+      locale: Russian,
       onChange,
     });
 

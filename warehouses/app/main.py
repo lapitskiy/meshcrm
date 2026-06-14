@@ -25,7 +25,7 @@ KEYCLOAK_REALM = env("KEYCLOAK_REALM", "hubcrm")
 KEYCLOAK_ADMIN_USER = env("KEYCLOAK_ADMIN", "admin")
 KEYCLOAK_ADMIN_PASSWORD = env("KEYCLOAK_ADMIN_PASSWORD", "admin")
 
-ACCESS_ADMIN_ROLES = {"warehouses_access_admin", "superadmin"}
+ACCESS_ADMIN_ROLES = {"warehouses_access_admin", "superadmin", "admin"}
 
 
 def db() -> psycopg.Connection:
@@ -49,7 +49,8 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS warehouses (
               id UUID PRIMARY KEY,
-              name TEXT NOT NULL UNIQUE,
+              tenant_id TEXT,
+              name TEXT NOT NULL,
               address TEXT NOT NULL DEFAULT '',
               point_phone TEXT NOT NULL DEFAULT '',
               qr_site_svg TEXT NOT NULL DEFAULT '',
@@ -67,9 +68,12 @@ def init_db() -> None:
         cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS qr_yandex_svg TEXT NOT NULL DEFAULT ''")
         cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS qr_vk_svg TEXT NOT NULL DEFAULT ''")
         cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS qr_telegram_svg TEXT NOT NULL DEFAULT ''")
+        cur.execute("ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS tenant_id TEXT")
+        cur.execute("ALTER TABLE warehouses DROP CONSTRAINT IF EXISTS warehouses_name_key")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS warehouse_access (
+              tenant_id TEXT,
               warehouse_id UUID NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
               user_uuid TEXT NOT NULL,
               role TEXT NOT NULL DEFAULT 'viewer',
@@ -78,7 +82,13 @@ def init_db() -> None:
             );
             """
         )
+        cur.execute("ALTER TABLE warehouse_access ADD COLUMN IF NOT EXISTS tenant_id TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_warehouse_access_user_uuid ON warehouse_access(user_uuid)")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_warehouse_access_tenant_user_uuid ON warehouse_access(tenant_id, user_uuid)"
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_warehouses_tenant_created_at ON warehouses(tenant_id, created_at)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_warehouses_tenant_name ON warehouses(tenant_id, name)")
 
 
 class WarehouseIn(BaseModel):
@@ -121,6 +131,11 @@ class UserAccessOut(BaseModel):
     warehouse_ids: list[uuid.UUID]
 
 
+class TenantBackfillOut(BaseModel):
+    tenant_id: str
+    updated: dict[str, int]
+
+
 app = FastAPI(title="warehouses", version="0.1.0")
 
 
@@ -129,6 +144,17 @@ def require_user_uuid(request: FastAPIRequest) -> str:
     if not user_uuid:
         raise HTTPException(status_code=401, detail="missing x-user-uuid")
     return user_uuid
+
+
+def require_tenant_id(request: FastAPIRequest) -> str:
+    tenant_id = str(request.headers.get("x-tenant-id", "")).strip()
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="missing x-tenant-id")
+    try:
+        uuid.UUID(tenant_id)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="invalid x-tenant-id") from exc
+    return tenant_id
 
 
 def roles_from_headers(request: FastAPIRequest) -> set[str]:
@@ -192,33 +218,67 @@ def manifest() -> dict:
     return MANIFEST
 
 
+@app.post("/warehouses/tenant/backfill", response_model=TenantBackfillOut)
+def backfill_legacy_warehouses_tenant(request: FastAPIRequest) -> TenantBackfillOut:
+    require_access_admin(request)
+    tenant_id = require_tenant_id(request)
+    with db() as conn, conn.cursor() as cur:
+        updated: dict[str, int] = {}
+        cur.execute(
+            "UPDATE warehouses SET tenant_id = %s WHERE NULLIF(tenant_id, '') IS NULL",
+            (tenant_id,),
+        )
+        updated["warehouses"] = int(cur.rowcount or 0)
+        cur.execute(
+            """
+            UPDATE warehouse_access wa
+            SET tenant_id = w.tenant_id
+            FROM warehouses w
+            WHERE wa.warehouse_id = w.id
+              AND NULLIF(wa.tenant_id, '') IS NULL
+            """
+        )
+        updated["warehouse_access"] = int(cur.rowcount or 0)
+    return TenantBackfillOut(tenant_id=tenant_id, updated=updated)
+
+
 @app.get("/warehouses", response_model=list[WarehouseOut])
 def list_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
     user_uuid = require_user_uuid(request)
+    tenant_id = require_tenant_id(request)
     is_admin = bool(roles_from_headers(request).intersection(ACCESS_ADMIN_ROLES))
     with db() as conn, conn.cursor() as cur:
         if is_admin:
             cur.execute(
-                "SELECT id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at FROM warehouses ORDER BY created_at DESC"
+                """
+                SELECT id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at
+                FROM warehouses
+                WHERE tenant_id = %s
+                ORDER BY created_at DESC
+                """,
+                (tenant_id,),
             )
         else:
             cur.execute(
                 """
                 SELECT w.id, w.name, w.address, w.point_phone, w.qr_site_svg, w.qr_yandex_svg, w.qr_vk_svg, w.qr_telegram_svg, w.created_at, w.updated_at
                 FROM warehouses w
-                WHERE EXISTS (
+                WHERE w.tenant_id = %s
+                  AND (
+                EXISTS (
                   SELECT 1
                   FROM warehouse_access wa
-                  WHERE wa.warehouse_id = w.id AND wa.user_uuid = %s
+                  WHERE wa.tenant_id = %s AND wa.warehouse_id = w.id AND wa.user_uuid = %s
                 )
                 OR NOT EXISTS (
                   SELECT 1
                   FROM warehouse_access wa2
-                  WHERE wa2.warehouse_id = w.id
+                  WHERE wa2.tenant_id = %s AND wa2.warehouse_id = w.id
                 )
+                  )
                 ORDER BY w.created_at DESC
                 """,
-                (user_uuid,),
+                (tenant_id, tenant_id, user_uuid, tenant_id),
             )
         rows = cur.fetchall()
     return [
@@ -241,16 +301,18 @@ def list_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
 @app.get("/warehouses/accessible", response_model=list[WarehouseOut])
 def list_accessible_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
     user_uuid = require_user_uuid(request)
+    tenant_id = require_tenant_id(request)
     with db() as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT w.id, w.name, w.address, w.point_phone, w.qr_site_svg, w.qr_yandex_svg, w.qr_vk_svg, w.qr_telegram_svg, w.created_at, w.updated_at
             FROM warehouses w
-            JOIN warehouse_access wa ON wa.warehouse_id = w.id
-            WHERE wa.user_uuid = %s
+            JOIN warehouse_access wa ON wa.tenant_id = w.tenant_id AND wa.warehouse_id = w.id
+            WHERE w.tenant_id = %s
+              AND wa.user_uuid = %s
             ORDER BY w.created_at DESC
             """,
-            (user_uuid,),
+            (tenant_id, user_uuid),
         )
         rows = cur.fetchall()
     return [
@@ -273,9 +335,16 @@ def list_accessible_warehouses(request: FastAPIRequest) -> list[WarehouseOut]:
 @app.get("/warehouses/admin/all", response_model=list[WarehouseOut])
 def list_warehouses_admin(request: FastAPIRequest) -> list[WarehouseOut]:
     require_access_admin(request)
+    tenant_id = require_tenant_id(request)
     with db() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at FROM warehouses ORDER BY created_at DESC"
+            """
+            SELECT id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at
+            FROM warehouses
+            WHERE tenant_id = %s
+            ORDER BY created_at DESC
+            """,
+            (tenant_id,),
         )
         rows = cur.fetchall()
     return [
@@ -298,6 +367,7 @@ def list_warehouses_admin(request: FastAPIRequest) -> list[WarehouseOut]:
 @app.post("/warehouses", response_model=WarehouseOut, status_code=201)
 def create_warehouse(body: WarehouseIn, request: FastAPIRequest) -> WarehouseOut:
     user_uuid = require_user_uuid(request)
+    tenant_id = require_tenant_id(request)
     name = body.name.strip()
     address = (body.address or "").strip()
     point_phone = (body.point_phone or "").strip()
@@ -312,21 +382,21 @@ def create_warehouse(body: WarehouseIn, request: FastAPIRequest) -> WarehouseOut
             cur.execute(
                 """
                 INSERT INTO warehouses (
-                  id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at
+                  tenant_id, id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                 RETURNING id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at
                 """,
-                (uuid.uuid4(), name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg),
+                (tenant_id, uuid.uuid4(), name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg),
             )
             row = cur.fetchone()
             cur.execute(
                 """
-                INSERT INTO warehouse_access (warehouse_id, user_uuid, role)
-                VALUES (%s, %s, 'owner')
+                INSERT INTO warehouse_access (tenant_id, warehouse_id, user_uuid, role)
+                VALUES (%s, %s, %s, 'owner')
                 ON CONFLICT (warehouse_id, user_uuid) DO UPDATE SET role = EXCLUDED.role
                 """,
-                (row[0], user_uuid),
+                (tenant_id, row[0], user_uuid),
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -347,6 +417,7 @@ def create_warehouse(body: WarehouseIn, request: FastAPIRequest) -> WarehouseOut
 @app.put("/warehouses/{warehouse_id}", response_model=WarehouseOut)
 def update_warehouse(warehouse_id: uuid.UUID, body: WarehouseIn, request: FastAPIRequest) -> WarehouseOut:
     user_uuid = require_user_uuid(request)
+    tenant_id = require_tenant_id(request)
     is_admin = bool(roles_from_headers(request).intersection(ACCESS_ADMIN_ROLES))
     name = body.name.strip()
     address = body.address.strip() if body.address is not None else None
@@ -360,12 +431,15 @@ def update_warehouse(warehouse_id: uuid.UUID, body: WarehouseIn, request: FastAP
     with db() as conn, conn.cursor() as cur:
         if not is_admin:
             cur.execute(
-                "SELECT 1 FROM warehouse_access WHERE warehouse_id=%s AND user_uuid=%s AND role='owner'",
-                (warehouse_id, user_uuid),
+                "SELECT 1 FROM warehouse_access WHERE tenant_id=%s AND warehouse_id=%s AND user_uuid=%s AND role='owner'",
+                (tenant_id, warehouse_id, user_uuid),
             )
             is_owner = cur.fetchone() is not None
             if not is_owner:
-                cur.execute("SELECT 1 FROM warehouse_access WHERE warehouse_id=%s", (warehouse_id,))
+                cur.execute(
+                    "SELECT 1 FROM warehouse_access WHERE tenant_id=%s AND warehouse_id=%s",
+                    (tenant_id, warehouse_id),
+                )
                 has_acl_rows = cur.fetchone() is not None
                 if has_acl_rows:
                     raise HTTPException(status_code=403, detail="forbidden")
@@ -380,10 +454,10 @@ def update_warehouse(warehouse_id: uuid.UUID, body: WarehouseIn, request: FastAP
                 qr_vk_svg=COALESCE(%s, qr_vk_svg),
                 qr_telegram_svg=COALESCE(%s, qr_telegram_svg),
                 updated_at=NOW()
-            WHERE id=%s
+            WHERE id=%s AND tenant_id=%s
             RETURNING id, name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, created_at, updated_at
             """,
-            (name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, warehouse_id),
+            (name, address, point_phone, qr_site_svg, qr_yandex_svg, qr_vk_svg, qr_telegram_svg, warehouse_id, tenant_id),
         )
         row = cur.fetchone()
     if not row:
@@ -405,20 +479,24 @@ def update_warehouse(warehouse_id: uuid.UUID, body: WarehouseIn, request: FastAP
 @app.delete("/warehouses/{warehouse_id}", status_code=204)
 def delete_warehouse(warehouse_id: uuid.UUID, request: FastAPIRequest) -> None:
     user_uuid = require_user_uuid(request)
+    tenant_id = require_tenant_id(request)
     is_admin = bool(roles_from_headers(request).intersection(ACCESS_ADMIN_ROLES))
     with db() as conn, conn.cursor() as cur:
         if not is_admin:
             cur.execute(
-                "SELECT 1 FROM warehouse_access WHERE warehouse_id=%s AND user_uuid=%s AND role='owner'",
-                (warehouse_id, user_uuid),
+                "SELECT 1 FROM warehouse_access WHERE tenant_id=%s AND warehouse_id=%s AND user_uuid=%s AND role='owner'",
+                (tenant_id, warehouse_id, user_uuid),
             )
             is_owner = cur.fetchone() is not None
             if not is_owner:
-                cur.execute("SELECT 1 FROM warehouse_access WHERE warehouse_id=%s", (warehouse_id,))
+                cur.execute(
+                    "SELECT 1 FROM warehouse_access WHERE tenant_id=%s AND warehouse_id=%s",
+                    (tenant_id, warehouse_id),
+                )
                 has_acl_rows = cur.fetchone() is not None
                 if has_acl_rows:
                     raise HTTPException(status_code=403, detail="forbidden")
-        cur.execute("DELETE FROM warehouses WHERE id=%s", (warehouse_id,))
+        cur.execute("DELETE FROM warehouses WHERE id=%s AND tenant_id=%s", (warehouse_id, tenant_id))
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="warehouse not found")
 
@@ -464,10 +542,16 @@ def search_users(q: str, request: FastAPIRequest) -> list[UserLiteOut]:
 @app.get("/warehouses/access/users/{user_uuid}", response_model=UserAccessOut)
 def get_user_access(user_uuid: str, request: FastAPIRequest) -> UserAccessOut:
     require_access_admin(request)
+    tenant_id = require_tenant_id(request)
     with db() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT warehouse_id FROM warehouse_access WHERE user_uuid=%s ORDER BY created_at ASC",
-            (user_uuid,),
+            """
+            SELECT warehouse_id
+            FROM warehouse_access
+            WHERE tenant_id=%s AND user_uuid=%s
+            ORDER BY created_at ASC
+            """,
+            (tenant_id, user_uuid),
         )
         rows = cur.fetchall()
     return UserAccessOut(user_uuid=user_uuid, warehouse_ids=[row[0] for row in rows])
@@ -476,25 +560,29 @@ def get_user_access(user_uuid: str, request: FastAPIRequest) -> UserAccessOut:
 @app.put("/warehouses/access/users/{user_uuid}", response_model=UserAccessOut)
 def replace_user_access(user_uuid: str, body: UserAccessReplaceIn, request: FastAPIRequest) -> UserAccessOut:
     require_access_admin(request)
+    tenant_id = require_tenant_id(request)
     role = body.role.strip().lower()
     if not role:
         raise HTTPException(status_code=400, detail="role must not be empty")
     warehouse_ids = list(dict.fromkeys(body.warehouse_ids))
     with db() as conn, conn.cursor() as cur:
         if warehouse_ids:
-            cur.execute("SELECT id FROM warehouses WHERE id = ANY(%s)", (warehouse_ids,))
+            cur.execute(
+                "SELECT id FROM warehouses WHERE tenant_id = %s AND id = ANY(%s)",
+                (tenant_id, warehouse_ids),
+            )
             existing_ids = {row[0] for row in cur.fetchall()}
             if len(existing_ids) != len(warehouse_ids):
                 raise HTTPException(status_code=400, detail="some warehouse_ids do not exist")
-        cur.execute("DELETE FROM warehouse_access WHERE user_uuid=%s", (user_uuid,))
+        cur.execute("DELETE FROM warehouse_access WHERE tenant_id=%s AND user_uuid=%s", (tenant_id, user_uuid))
         for warehouse_id in warehouse_ids:
             cur.execute(
                 """
-                INSERT INTO warehouse_access (warehouse_id, user_uuid, role)
-                VALUES (%s, %s, %s)
+                INSERT INTO warehouse_access (tenant_id, warehouse_id, user_uuid, role)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (warehouse_id, user_uuid) DO UPDATE SET role=EXCLUDED.role
                 """,
-                (warehouse_id, user_uuid, role),
+                (tenant_id, warehouse_id, user_uuid, role),
             )
     return UserAccessOut(user_uuid=user_uuid, warehouse_ids=warehouse_ids)
 

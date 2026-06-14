@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Button from "@/components/ui/button/Button";
 import { getGatewayBaseUrl } from "@/lib/gateway";
 
@@ -11,6 +11,7 @@ type VkConversation = {
   last_from_name: string;
   last_message_ts: number;
   messages_count: number;
+  needs_reply?: boolean;
 };
 
 type VkGroupItem = {
@@ -49,6 +50,11 @@ export default function SocialVkMessagesPage() {
   const [offset, setOffset] = useState(0);
   const [replyText, setReplyText] = useState("");
   const [sending, setSending] = useState(false);
+  const [dismissingPeerId, setDismissingPeerId] = useState<string>("");
+  const [previewImage, setPreviewImage] = useState<{ url: string; title: string } | null>(null);
+  const groupsRef = useRef<VkGroupItem[]>([]);
+  const selectedSettingsIdRef = useRef(0);
+  const selectedPeerIdRef = useRef("");
 
   const authHeaders = () => {
     const token = (window as any).__hubcrmAccessToken || "";
@@ -64,6 +70,7 @@ export default function SocialVkMessagesPage() {
     const data = (await resp.json()) as VkGroupItem[];
     const list = Array.isArray(data) ? data : [];
     setGroups(list);
+    groupsRef.current = list;
     return list;
   };
 
@@ -94,7 +101,7 @@ export default function SocialVkMessagesPage() {
     }
     const data = (await resp.json()) as VkConversation[];
     setConversations(data || []);
-    if (!selectedPeerId && (data || []).length) {
+    if (!selectedPeerIdRef.current && (data || []).length) {
       setSelectedPeerId(String(data[0].peer_id));
     }
   };
@@ -131,9 +138,12 @@ export default function SocialVkMessagesPage() {
     setRefreshing(true);
     setError(null);
     try {
-      const list = groups.length ? groups : await loadGroups();
+      const list = groupsRef.current.length ? groupsRef.current : await loadGroups();
       const settingsId =
-        forcedSettingsId || selectedSettingsId || list.find((x) => x.is_default)?.id || (list[0] ? Number(list[0].id) : 0);
+        forcedSettingsId ||
+        selectedSettingsIdRef.current ||
+        list.find((x) => x.is_default)?.id ||
+        (list[0] ? Number(list[0].id) : 0);
       if (!settingsId) {
         setConversations([]);
         setMessages([]);
@@ -141,9 +151,12 @@ export default function SocialVkMessagesPage() {
         setStatus("Нет VK групп");
         return;
       }
-      if (!selectedSettingsId) setSelectedSettingsId(settingsId);
+      if (!selectedSettingsIdRef.current) setSelectedSettingsId(settingsId);
       await pullLongPoll(settingsId);
       await loadConversations(settingsId);
+      if (selectedPeerIdRef.current) {
+        await loadThread(selectedPeerIdRef.current, settingsId, 0, false);
+      }
     } catch (e: any) {
       setError(e?.message || "failed to load messages");
     } finally {
@@ -151,6 +164,31 @@ export default function SocialVkMessagesPage() {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    groupsRef.current = groups;
+  }, [groups]);
+
+  useEffect(() => {
+    selectedSettingsIdRef.current = selectedSettingsId;
+  }, [selectedSettingsId]);
+
+  useEffect(() => {
+    selectedPeerIdRef.current = selectedPeerId;
+  }, [selectedPeerId]);
+
+  useEffect(() => {
+    if (!previewImage) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPreviewImage(null);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [previewImage]);
 
   useEffect(() => {
     void refreshAll();
@@ -207,6 +245,30 @@ export default function SocialVkMessagesPage() {
     await refreshAll(settingsId);
   };
 
+  const dismissReplyNeed = async (peerId: string) => {
+    if (!selectedSettingsId) return;
+    setDismissingPeerId(peerId);
+    setError(null);
+    try {
+      const resp = await fetch(
+        `${base}/social/vk/conversations/${encodeURIComponent(peerId)}/dismiss-reply?settings_id=${selectedSettingsId}`,
+        {
+          method: "POST",
+          headers: authHeaders(),
+        }
+      );
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`dismiss reply failed: ${resp.status} ${body}`);
+      }
+      await loadConversations(selectedSettingsId);
+    } catch (e: any) {
+      setError(e?.message || "failed to dismiss reply marker");
+    } finally {
+      setDismissingPeerId("");
+    }
+  };
+
   const selectedGroup = groups.find((x) => x.id === selectedSettingsId);
 
   return (
@@ -255,24 +317,52 @@ export default function SocialVkMessagesPage() {
               ) : (
                 <div className="space-y-2">
                   {conversations.map((conv) => (
-                    <button
+                    <div
                       key={conv.peer_id}
-                      type="button"
                       onClick={() => setSelectedPeerId(conv.peer_id)}
-                      className={`w-full text-left rounded-lg border px-3 py-2 ${
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setSelectedPeerId(conv.peer_id);
+                        }
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      className={`w-full cursor-pointer text-left rounded-lg border px-3 py-2 ${
                         selectedPeerId === conv.peer_id
                           ? "border-brand-500 bg-brand-50 dark:bg-brand-500/10"
                           : "border-gray-100 dark:border-gray-800"
                       }`}
                     >
-                      <div className="text-sm text-gray-800 dark:text-white/90">peer {conv.peer_id}</div>
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-sm text-gray-800 dark:text-white/90">peer {conv.peer_id}</div>
+                        {conv.needs_reply ? (
+                          <div className="flex items-center gap-1">
+                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-500/15 dark:text-amber-300">
+                              Ждет ответа
+                            </span>
+                            <button
+                              type="button"
+                              className="rounded-full border border-gray-200 px-1.5 py-0.5 text-[10px] text-gray-500 hover:text-red-600 dark:border-gray-700 dark:text-gray-400"
+                              disabled={dismissingPeerId === conv.peer_id}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void dismissReplyNeed(conv.peer_id);
+                              }}
+                              title="Ответ не нужен"
+                            >
+                              {dismissingPeerId === conv.peer_id ? "..." : "×"}
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
                       <div className="text-xs text-gray-500 dark:text-gray-400 mt-1 line-clamp-2">
                         {conv.last_message_text || "[без текста]"}
                       </div>
                       <div className="text-[11px] text-gray-400 mt-1">
                         {conv.last_from_name || conv.last_from_id || "-"} · сообщений: {conv.messages_count}
                       </div>
-                    </button>
+                    </div>
                   ))}
                 </div>
               )}
@@ -319,15 +409,19 @@ export default function SocialVkMessagesPage() {
                             {item.attachments.map((att, idx) => (
                               <div key={`${item.event_id}-att-${idx}`} className="text-xs">
                                 {att.type === "photo" && att.url ? (
-                                  <a href={att.url} target="_blank" rel="noreferrer" className="inline-block">
+                                  <button
+                                    type="button"
+                                    className="inline-block"
+                                    onClick={() => setPreviewImage({ url: att.url, title: att.title || "Фото" })}
+                                  >
                                     <img
                                       src={att.url}
                                       alt={att.title || "Фото"}
-                                      className="rounded-lg border border-gray-200 dark:border-gray-700 object-cover"
+                                      className="rounded-lg border border-gray-200 dark:border-gray-700 object-cover cursor-zoom-in"
                                       style={{ width: 300, height: 300, maxWidth: "100%", maxHeight: "100%" }}
                                       loading="lazy"
                                     />
-                                  </a>
+                                  </button>
                                 ) : att.url ? (
                                   <a
                                     href={att.url}
@@ -371,6 +465,28 @@ export default function SocialVkMessagesPage() {
           </div>
         ) : null}
       </div>
+      {previewImage ? (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-4"
+          onClick={() => setPreviewImage(null)}
+          role="presentation"
+        >
+          <button
+            type="button"
+            onClick={() => setPreviewImage(null)}
+            className="absolute right-4 top-4 rounded-full bg-white/10 px-3 py-1 text-2xl leading-none text-white hover:bg-white/20"
+            aria-label="Закрыть"
+          >
+            x
+          </button>
+          <img
+            src={previewImage.url}
+            alt={previewImage.title}
+            className="max-h-[90vh] max-w-[90vw] rounded-xl object-contain"
+            onClick={(e) => e.stopPropagation()}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }

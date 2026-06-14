@@ -5,6 +5,7 @@ import Label from "@/components/form/Label";
 import Button from "@/components/ui/button/Button";
 import { PencilIcon, TrashBinIcon } from "@/icons/index";
 import { getGatewayBaseUrl } from "@/lib/gateway";
+import { getKeycloak } from "@/lib/keycloak";
 import React, { useEffect, useMemo, useState } from "react";
 
 type BuybackCategory = {
@@ -13,8 +14,40 @@ type BuybackCategory = {
   created_at: string;
 };
 
+type UserLite = {
+  user_uuid: string;
+  username: string;
+  email: string;
+  full_name: string;
+};
+
 function getToken(): string {
-  return (window as any).__hubcrmAccessToken || "";
+  const raw = (window as any).__hubcrmAccessToken;
+  if (!raw) return "";
+  const token = String(raw).trim();
+  if (!token || token === "undefined" || token === "null") return "";
+  return token;
+}
+
+function parseJwtPayload(token: string): any {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const pad = payload.length % 4 ? "=".repeat(4 - (payload.length % 4)) : "";
+    return JSON.parse(atob(payload + pad));
+  } catch {
+    return null;
+  }
+}
+
+function isSuperadminToken(token: string): boolean {
+  const payload = parseJwtPayload(token);
+  if (!payload) return false;
+  const realmRoles = Array.isArray(payload?.realm_access?.roles) ? payload.realm_access.roles : [];
+  if (realmRoles.includes("superadmin")) return true;
+  const resourceAccess = payload?.resource_access || {};
+  return Object.values(resourceAccess).some((obj: any) => Array.isArray(obj?.roles) && obj.roles.includes("superadmin"));
 }
 
 export default function SkupkaSettingsCategoriesPage() {
@@ -26,22 +59,166 @@ export default function SkupkaSettingsCategoriesPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [isSuperadmin, setIsSuperadmin] = useState(false);
+  const [accessQuery, setAccessQuery] = useState("");
+  const [accessUsers, setAccessUsers] = useState<UserLite[]>([]);
+  const [selectedAccessUser, setSelectedAccessUser] = useState<UserLite | null>(null);
+  const [selectedCategoryIds, setSelectedCategoryIds] = useState<Record<string, boolean>>({});
+  const [accessBusy, setAccessBusy] = useState(false);
+  const [accessMessage, setAccessMessage] = useState<string | null>(null);
 
-  const authHeaders = () => {
-    const token = getToken();
+  const authHeaders = async (forceRefresh = false) => {
+    let token = getToken();
+    if (!token || forceRefresh) {
+      try {
+        const kc = await getKeycloak();
+        try {
+          await kc.updateToken(forceRefresh ? 0 : 30);
+        } catch {
+          // Ignore refresh error here; fallback to current token if any.
+        }
+        token = kc.token || "";
+        if (token) {
+          (window as any).__hubcrmAccessToken = token;
+        }
+      } catch {
+        // Keep token empty; backend will return 401 with explicit detail.
+      }
+    }
     return token ? { authorization: `Bearer ${token}` } : {};
   };
 
+  const withAuth = async (init: RequestInit = {}, forceRefresh = false): Promise<RequestInit> => {
+    return {
+      ...init,
+      headers: {
+        ...(init.headers as Record<string, string> | undefined),
+        ...(await authHeaders(forceRefresh)),
+      },
+    };
+  };
+
+  const authedFetch = async (url: string, init: RequestInit = {}) => {
+    let resp = await fetch(url, await withAuth(init, false));
+    if (resp.status === 401) {
+      // Retry once after forced token refresh to avoid transient auth races.
+      resp = await fetch(url, await withAuth(init, true));
+    }
+    return resp;
+  };
+
   const load = async () => {
-    const resp = await fetch(`${base}/skupka/settings/categories`, {
+    const resp = await authedFetch(`${base}/skupka/settings/categories`, {
       cache: "no-store",
-      headers: authHeaders(),
     });
     if (!resp.ok) {
       const body = await resp.text().catch(() => "");
       throw new Error(`load failed: ${resp.status} ${body}`);
     }
     setItems((await resp.json()) as BuybackCategory[]);
+  };
+
+  useEffect(() => {
+    const token = getToken();
+    setIsSuperadmin(isSuperadminToken(token));
+    (async () => {
+      try {
+        await load();
+      } catch (e: any) {
+        setError(e?.message || "failed to load categories");
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!isSuperadmin) return;
+    setAccessMessage(null);
+    setError(null);
+    if (accessQuery.trim().length < 2) {
+      setAccessUsers([]);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      (async () => {
+        try {
+          const resp = await authedFetch(
+            `${base}/skupka/settings/categories/access/users/search?q=${encodeURIComponent(accessQuery.trim())}`,
+            {
+              cache: "no-store",
+            }
+          );
+          if (!resp.ok) {
+            const body = await resp.text().catch(() => "");
+            throw new Error(`users search failed: ${resp.status} ${body}`);
+          }
+          setAccessUsers((await resp.json()) as UserLite[]);
+        } catch (e: any) {
+          setError(e?.message || "users search failed");
+          setAccessUsers([]);
+        }
+      })();
+    }, 300);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accessQuery, isSuperadmin]);
+
+  const onPickAccessUser = async (user: UserLite) => {
+    setSelectedAccessUser(user);
+    setAccessUsers([]);
+    setAccessQuery(user.email || user.username || user.full_name);
+    setAccessMessage(null);
+    setError(null);
+    try {
+      const resp = await authedFetch(
+        `${base}/skupka/settings/categories/access/users/${encodeURIComponent(user.user_uuid)}`,
+        {
+          cache: "no-store",
+        }
+      );
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`load access failed: ${resp.status} ${body}`);
+      }
+      const data = (await resp.json()) as { category_ids: string[] };
+      const next: Record<string, boolean> = {};
+      for (const id of data.category_ids || []) next[id] = true;
+      setSelectedCategoryIds(next);
+    } catch (e: any) {
+      setError(e?.message || "failed to load category access");
+      setSelectedCategoryIds({});
+    }
+  };
+
+  const onToggleCategoryAccess = (id: string) => {
+    setSelectedCategoryIds((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const onSaveCategoryAccess = async () => {
+    if (!selectedAccessUser) return;
+    setAccessBusy(true);
+    setAccessMessage(null);
+    setError(null);
+    try {
+      const categoryIds = Object.keys(selectedCategoryIds).filter((id) => selectedCategoryIds[id]);
+      const resp = await authedFetch(
+        `${base}/skupka/settings/categories/access/users/${encodeURIComponent(selectedAccessUser.user_uuid)}`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ category_ids: categoryIds }),
+        }
+      );
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`save access failed: ${resp.status} ${body}`);
+      }
+      setAccessMessage("Права по категориям сохранены");
+    } catch (e: any) {
+      setError(e?.message || "failed to save category access");
+    } finally {
+      setAccessBusy(false);
+    }
   };
 
   useEffect(() => {
@@ -52,15 +229,16 @@ export default function SkupkaSettingsCategoriesPage() {
         setError(e?.message || "failed to load categories");
       }
     })();
-  }, [base]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedAccessUser?.user_uuid]);
 
   const onCreate = async () => {
     setBusy(true);
     setError(null);
     try {
-      const resp = await fetch(`${base}/skupka/settings/categories`, {
+      const resp = await authedFetch(`${base}/skupka/settings/categories`, {
         method: "POST",
-        headers: { "content-type": "application/json", ...authHeaders() },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ name }),
       });
       if (!resp.ok) {
@@ -91,9 +269,9 @@ export default function SkupkaSettingsCategoriesPage() {
     setActionBusy(true);
     setError(null);
     try {
-      const resp = await fetch(`${base}/skupka/settings/categories/${editingId}`, {
+      const resp = await authedFetch(`${base}/skupka/settings/categories/${editingId}`, {
         method: "PUT",
-        headers: { "content-type": "application/json", ...authHeaders() },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ name: editingName }),
       });
       if (!resp.ok) {
@@ -113,9 +291,8 @@ export default function SkupkaSettingsCategoriesPage() {
     setActionBusy(true);
     setError(null);
     try {
-      const resp = await fetch(`${base}/skupka/settings/categories/${id}`, {
+      const resp = await authedFetch(`${base}/skupka/settings/categories/${id}`, {
         method: "DELETE",
-        headers: authHeaders(),
       });
       if (!resp.ok) {
         const body = await resp.text().catch(() => "");
@@ -194,6 +371,67 @@ export default function SkupkaSettingsCategoriesPage() {
           </ul>
         )}
       </div>
+
+      {isSuperadmin && (
+        <div className="rounded-2xl border border-gray-200 bg-white px-5 py-6 dark:border-gray-800 dark:bg-white/[0.03]">
+          <h3 className="mb-4 font-semibold text-gray-800 text-theme-xl dark:text-white/90">
+            Права доступа к категориям
+          </h3>
+          {accessMessage && <div className="text-sm text-green-600 mb-3">{accessMessage}</div>}
+          <div className="rounded-lg border border-gray-100 dark:border-gray-800 p-4 mb-4">
+            <div className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              Пользователь (поиск по email/username)
+            </div>
+            <input
+              className="w-full rounded-lg border border-gray-300 bg-transparent px-3 py-2 text-sm outline-none focus:border-brand-500 dark:border-gray-700"
+              value={accessQuery}
+              onChange={(e) => setAccessQuery(e.target.value)}
+              placeholder="Введите минимум 2 символа"
+            />
+            {!!accessUsers.length && (
+              <div className="mt-2 rounded-lg border border-gray-200 dark:border-gray-700 max-h-56 overflow-y-auto">
+                {accessUsers.map((u) => (
+                  <button
+                    key={u.user_uuid}
+                    type="button"
+                    className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800"
+                    onClick={() => void onPickAccessUser(u)}
+                  >
+                    {u.full_name} {u.email ? `(${u.email})` : ""} [{u.user_uuid}]
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {selectedAccessUser && (
+            <div className="rounded-lg border border-gray-100 dark:border-gray-800 p-4">
+              <div className="text-sm mb-3 text-gray-700 dark:text-gray-300">
+                Выбран пользователь: {selectedAccessUser.full_name} ({selectedAccessUser.user_uuid})
+              </div>
+
+              <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
+                {items.map((item) => (
+                  <label key={item.id} className="flex items-center gap-2 text-sm text-gray-800 dark:text-white/90">
+                    <input
+                      type="checkbox"
+                      checked={!!selectedCategoryIds[item.id]}
+                      onChange={() => onToggleCategoryAccess(item.id)}
+                    />
+                    <span>{item.name}</span>
+                  </label>
+                ))}
+              </div>
+
+              <div className="mt-4">
+                <Button size="sm" disabled={accessBusy} onClick={onSaveCategoryAccess}>
+                  Сохранить права
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -17,6 +17,8 @@ import httpx
 import jwt
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 from pydantic import BaseModel, Field
 
 
@@ -37,6 +39,8 @@ USER_ADMIN_ROLES = {"superadmin", "admin"}
 SMTP_CONFIG_PATH = Path("/app/app/config/smtp.json")
 PROFILE_AVATAR_DIR = Path("/app/app/uploads/avatars")
 PROFILE_AVATAR_MAX_BYTES = 200 * 1024
+QZ_CERT_PATH = Path(os.getenv("QZ_CERT_PATH", "/app/app/config/qz/qz-cert.pem"))
+QZ_PRIVATE_KEY_PATH = Path(os.getenv("QZ_PRIVATE_KEY_PATH", "/app/app/config/qz/qz-private.pem"))
 
 OIDC_ISSUER_RAW = env("OIDC_ISSUER", "http://localhost:8081/realms/hubcrm")
 OIDC_ISSUERS = [x.strip() for x in OIDC_ISSUER_RAW.split(",") if x.strip()]
@@ -57,11 +61,12 @@ DOCUMENTS_URL = env("DOCUMENTS_BASE_URL", os.getenv("DOCUMENTS_URL", "http://doc
 CONTACTS_URL = env("CONTACTS_BASE_URL", os.getenv("CONTACTS_URL", "http://contacts:8000"))
 ORDERS_URL = env("ORDERS_BASE_URL", os.getenv("ORDERS_URL", "http://orders:8000"))
 AI_MEMORY_URL = env("AI_MEMORY_BASE_URL", os.getenv("AI_MEMORY_URL", "http://ai-memory:8000"))
-MARKETPLACES_URL = env("MARKETPLACES_BASE_URL", os.getenv("MARKETPLACES_URL", "http://marketplaces:8000"))
 FINANCE_URL = env("FINANCE_BASE_URL", os.getenv("FINANCE_URL", "http://finance:8000"))
 WAREHOUSES_URL = env("WAREHOUSES_BASE_URL", os.getenv("WAREHOUSES_URL", "http://warehouses:8000"))
 SKUPKA_URL = env("SKUPKA_BASE_URL", os.getenv("SKUPKA_URL", "http://skupka:8000"))
 SOCIAL_URL = env("SOCIAL_BASE_URL", os.getenv("SOCIAL_URL", "http://social:8000"))
+STAFF_URL = env("STAFF_BASE_URL", os.getenv("STAFF_URL", "http://staff:8000"))
+COMMUNICATIONS_URL = env("COMMUNICATIONS_BASE_URL", os.getenv("COMMUNICATIONS_URL", "http://communications:8000"))
 
 
 HOP_BY_HOP_HEADERS = {
@@ -257,6 +262,24 @@ def avatar_bytes_to_data_url(raw: bytes) -> str:
     return f"data:image/jpeg;base64,{base64.b64encode(raw).decode('ascii')}"
 
 
+def load_qz_certificate() -> str:
+    try:
+        return QZ_CERT_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail="qz certificate is not configured") from exc
+
+
+def sign_qz_payload(value: str) -> str:
+    if not value:
+        raise HTTPException(status_code=400, detail="qz sign payload is required")
+    try:
+        private_key = serialization.load_pem_private_key(QZ_PRIVATE_KEY_PATH.read_bytes(), password=None)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail="qz private key is not configured") from exc
+    signature = private_key.sign(value.encode("utf-8"), padding.PKCS1v15(), hashes.SHA512())
+    return base64.b64encode(signature).decode("ascii")
+
+
 def parse_avatar_data_url(data_url: Any) -> bytes:
     value = str(data_url or "").strip()
     prefix = "data:image/jpeg;base64,"
@@ -328,6 +351,12 @@ class ProfileAvatarIn(BaseModel):
 
 class ProfileAvatarOut(BaseModel):
     avatar_data_url: str = ""
+
+
+class QzSignIn(BaseModel):
+    request: str | None = None
+    data: str | None = None
+    to_sign: str | None = None
 
 
 def load_smtp_config() -> dict[str, Any]:
@@ -591,19 +620,49 @@ def filtered_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
             continue
         if lk == "content-length":
             continue
+        if lk.startswith("x-user-") or lk.startswith("x-tenant-") or lk == "x-active-tenant-id":
+            continue
         out[k] = v
     return out
+
+
+async def resolve_tenant_context(request: Request, user_uuid: str, user_roles: list[str]) -> dict[str, Any]:
+    headers = {
+        "x-user-uuid": user_uuid,
+        "x-user-roles": ",".join(user_roles),
+    }
+    requested_tenant_id = normalize_text(
+        request.headers.get("x-tenant-id") or request.headers.get("x-active-tenant-id"),
+        255,
+    )
+    if requested_tenant_id:
+        headers["x-tenant-id"] = requested_tenant_id
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(f"{REGISTRY_URL}/plugins/tenants/current", headers=headers)
+    if not is_success_response(resp):
+        raise HTTPException(status_code=502, detail=f"failed to resolve tenant context: {resp.status_code}")
+    payload = resp.json() or {}
+    tenant_id = normalize_text(payload.get("tenant_id"), 255)
+    if not tenant_id:
+        raise HTTPException(status_code=502, detail="tenant context is empty")
+    return payload
 
 
 async def proxy(request: Request, upstream_base: str, upstream_path: str) -> Response:
     user_uuid = None
     user_roles: list[str] = []
+    tenant_id = None
+    tenant_role = None
     auth = request.headers.get("authorization", "")
     should_attach_user = (not is_public(request)) or auth.lower().startswith("bearer ")
     if should_attach_user:
         payload = verify_jwt(request)
         user_uuid = str(payload.get("sub"))
         user_roles = extract_roles(payload)
+        tenant_context = await resolve_tenant_context(request, user_uuid, user_roles)
+        tenant_id = normalize_text(tenant_context.get("tenant_id"), 255)
+        tenant_role = normalize_text(tenant_context.get("role"), 255)
 
     url = f"{upstream_base}{upstream_path}"
     headers = filtered_headers(request.headers.items())
@@ -611,6 +670,10 @@ async def proxy(request: Request, upstream_base: str, upstream_path: str) -> Res
         headers["x-user-uuid"] = user_uuid
     if user_roles:
         headers["x-user-roles"] = ",".join(user_roles)
+    if tenant_id:
+        headers["x-tenant-id"] = tenant_id
+    if tenant_role:
+        headers["x-tenant-role"] = tenant_role
 
     body = await request.body()
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -640,6 +703,19 @@ app.add_middleware(
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/qz/cert")
+async def qz_certificate(request: Request) -> Response:
+    verify_jwt(request)
+    return Response(content=load_qz_certificate(), media_type="text/plain")
+
+
+@app.post("/qz/sign")
+async def qz_sign(body: QzSignIn, request: Request) -> Response:
+    verify_jwt(request)
+    value = body.request or body.data or body.to_sign or ""
+    return Response(content=sign_qz_payload(value), media_type="text/plain")
 
 
 @app.post("/auth/token")
@@ -936,9 +1012,11 @@ async def ai_memory_proxy(request: Request, rest: str) -> Response:
 
 
 @app.api_route("/marketplaces{rest:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
-async def marketplaces_proxy(request: Request, rest: str) -> Response:
-    upstream_path = rest if rest else "/"
-    return await proxy(request, MARKETPLACES_URL, upstream_path)
+async def marketplaces_disabled(request: Request, rest: str):
+    raise HTTPException(
+        status_code=503,
+        detail="marketplaces module is disabled on this deployment (moved to a separate host)",
+    )
 
 
 @app.api_route("/finance{rest:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
@@ -963,3 +1041,15 @@ async def skupka_proxy(request: Request, rest: str) -> Response:
 async def social_proxy(request: Request, rest: str) -> Response:
     upstream_path = rest if rest else "/"
     return await proxy(request, SOCIAL_URL, upstream_path)
+
+
+@app.api_route("/staff{rest:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
+async def staff_proxy(request: Request, rest: str) -> Response:
+    upstream_path = rest if rest else "/"
+    return await proxy(request, STAFF_URL, upstream_path)
+
+
+@app.api_route("/communications{rest:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
+async def communications_proxy(request: Request, rest: str) -> Response:
+    upstream_path = rest if rest else "/"
+    return await proxy(request, COMMUNICATIONS_URL, upstream_path)

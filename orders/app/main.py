@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 
+from app.interfaces.http.recommended_prices_router import router as recommended_prices_router
+from app.interfaces.http.report_router import router as report_router
 from app.interfaces.http.service_categories_router import router as service_categories_router
 from app.interfaces.http.orders_router import router as orders_router
+from app.interfaces.http.supply_router import router as supply_router
 from app.interfaces.http.service_objects_router import router as service_objects_router
 from app.interfaces.http.statuses_router import router as statuses_router
 from app.interfaces.http.work_types_router import router as work_types_router
@@ -18,6 +21,7 @@ MANIFEST = {
             "items": [
                 {"id": "create", "title": "Создать заказ"},
                 {"id": "list", "title": "Список заказов"},
+                {"id": "prices", "title": "Цены"},
                 {"id": "settings", "title": "Настройки"},
             ],
         }
@@ -38,6 +42,9 @@ def manifest() -> dict:
 
 app.include_router(service_categories_router)
 app.include_router(orders_router)
+app.include_router(supply_router)
+app.include_router(recommended_prices_router)
+app.include_router(report_router)
 app.include_router(work_types_router)
 app.include_router(service_objects_router)
 app.include_router(statuses_router)

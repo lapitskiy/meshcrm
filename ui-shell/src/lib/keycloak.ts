@@ -4,6 +4,8 @@ let _kc: Keycloak | null = null;
 let _KeycloakFactory: ((cfg: any) => Keycloak) | null = null;
 let _KeycloakFactoryPromise: Promise<(cfg: any) => Keycloak> | null = null;
 
+export const KC_TOKENS_STORAGE_KEY = "hubcrm.keycloak.tokens";
+
 export type KeycloakConfig = {
   url: string;
   realm: string;
@@ -69,6 +71,16 @@ export async function getKeycloak(): Promise<Keycloak> {
   const factory = await getKeycloakFactory();
   _kc = factory(cfg);
   return _kc;
+}
+
+export function clearPersistedKeycloakTokens() {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(KC_TOKENS_STORAGE_KEY);
+    (window as any).__hubcrmAccessToken = undefined;
+  } catch {
+    // no-op
+  }
 }
 
 

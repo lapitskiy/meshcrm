@@ -17,6 +17,7 @@ type WorkType = {
   service_category_id: string;
   service_category_name: string;
   name: string;
+  usage_count: number;
   created_at: string;
 };
 
@@ -146,6 +147,7 @@ export default function OrdersSettingsWorkTypesPage() {
   };
 
   const onStartEdit = (item: WorkType) => {
+    if (!isSuperadmin) return;
     setEditingId(item.id);
     setEditingName(item.name);
     setEditingCategoryId(item.service_category_id);
@@ -158,6 +160,7 @@ export default function OrdersSettingsWorkTypesPage() {
   };
 
   const onSaveEdit = async () => {
+    if (!isSuperadmin) return;
     if (!editingId) return;
     setActionBusy(true);
     setError(null);
@@ -181,6 +184,7 @@ export default function OrdersSettingsWorkTypesPage() {
   };
 
   const onDelete = async (id: string) => {
+    if (!isSuperadmin) return;
     setActionBusy(true);
     setError(null);
     try {
@@ -287,41 +291,45 @@ export default function OrdersSettingsWorkTypesPage() {
                 ) : (
                   <div className="flex flex-col">
                     <span className="text-sm text-gray-800 dark:text-white/90">{item.name}</span>
-                    <span className="text-xs text-gray-500 dark:text-gray-400">{item.service_category_name}</span>
+                    <span className="text-xs text-gray-500 dark:text-gray-400">
+                      {item.service_category_name} · использований: {item.usage_count}
+                    </span>
                   </div>
                 )}
 
-                <div className="flex items-center gap-2">
-                  {editingId === item.id ? (
-                    <>
-                      <Button size="sm" disabled={actionBusy} onClick={onSaveEdit}>
-                        Сохранить
-                      </Button>
-                      <Button size="sm" variant="outline" disabled={actionBusy} onClick={onCancelEdit}>
-                        Отмена
-                      </Button>
-                    </>
-                  ) : (
+                {isSuperadmin ? (
+                  <div className="flex items-center gap-2">
+                    {editingId === item.id ? (
+                      <>
+                        <Button size="sm" disabled={actionBusy} onClick={onSaveEdit}>
+                          Сохранить
+                        </Button>
+                        <Button size="sm" variant="outline" disabled={actionBusy} onClick={onCancelEdit}>
+                          Отмена
+                        </Button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="text-brand-600 hover:text-brand-700 dark:text-brand-400"
+                        disabled={actionBusy}
+                        onClick={() => onStartEdit(item)}
+                        title="Редактировать"
+                      >
+                        <PencilIcon className="size-5" />
+                      </button>
+                    )}
                     <button
                       type="button"
-                      className="text-brand-600 hover:text-brand-700 dark:text-brand-400"
+                      className="text-red-600 hover:text-red-700 dark:text-red-400"
                       disabled={actionBusy}
-                      onClick={() => onStartEdit(item)}
-                      title="Редактировать"
+                      onClick={() => onDelete(item.id)}
+                      title="Удалить"
                     >
-                      <PencilIcon className="size-5" />
+                      <TrashBinIcon className="size-5" />
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    className="text-red-600 hover:text-red-700 dark:text-red-400"
-                    disabled={actionBusy}
-                    onClick={() => onDelete(item.id)}
-                    title="Удалить"
-                  >
-                    <TrashBinIcon className="size-5" />
-                  </button>
-                </div>
+                  </div>
+                ) : null}
               </li>
             ))}
           </ul>
